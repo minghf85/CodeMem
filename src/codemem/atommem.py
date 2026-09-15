@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
+import openai
 import yaml
 
 from .prompts import ATOM_EXTRACTION_SYSTEM_PROMPT, ATOM_EXTRACTION_USER_PROMPT
@@ -256,9 +256,16 @@ def extract_json(text: str) -> dict:
     raise ValueError(f"unexpected JSON root type {type(parsed).__name__}: {text[:200]!r}")
 
 
-def _retry_after_seconds(exc: httpx.HTTPStatusError) -> float | None:
+def _status_code(exc: Exception) -> int | None:
+    """取出异常对应的 HTTP 状态码（openai.APIStatusError 及其子类）。"""
+    code = getattr(exc, "status_code", None)
+    return code if isinstance(code, int) else None
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
     """解析响应头里的 Retry-After（秒数或 HTTP-date）。"""
-    raw = exc.response.headers.get("Retry-After")
+    response = getattr(exc, "response", None)
+    raw = response.headers.get("Retry-After") if response is not None else None
     if not raw:
         return None
     try:
@@ -288,11 +295,10 @@ def _backoff_seconds(exc: Exception, attempt: int, config: dict) -> float:
     cap = float(config.get("max_backoff", 120.0))
     jitter = float(config.get("backoff_jitter", 0.5))
 
-    http_error = exc if isinstance(exc, httpx.HTTPStatusError) else None
-    status = http_error.response.status_code if http_error is not None else None
+    status = _status_code(exc)
 
-    if status == 429 and http_error is not None:
-        retry_after = _retry_after_seconds(http_error)
+    if status == 429:
+        retry_after = _retry_after_seconds(exc)
         if retry_after is not None:
             delay = min(retry_after, cap)
         else:
@@ -308,9 +314,9 @@ def _backoff_seconds(exc: Exception, attempt: int, config: dict) -> float:
 
 
 async def chat_completion(
-    client: httpx.AsyncClient, config: dict, messages: list[dict]
+    client: openai.AsyncOpenAI, config: dict, messages: list[dict]
 ) -> str:
-    payload: dict[str, Any] = {
+    kwargs: dict[str, Any] = {
         "model": config["model"],
         "messages": messages,
         "temperature": config["temperature"],
@@ -322,7 +328,7 @@ async def chat_completion(
     base_url = str(config.get("base_url", ""))
     is_ollama = "11434" in base_url or "ollama" in base_url.lower()
     if is_ollama and config.get("enable_thinking") is False:
-        payload["chat_template_kwargs"] = {"enable_thinking": False}
+        kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
 
     # 不可重试的客户端错误（除 429 外），直接抛出
     non_retryable = {400, 401, 403, 404, 422}
@@ -330,24 +336,21 @@ async def chat_completion(
     last_error: Exception | None = None
     for attempt in range(1, int(config["max_retries"]) + 1):
         try:
-            resp = await client.post("/chat/completions", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            message = data["choices"][0]["message"]
-            content = message.get("content") or ""
+            response = await client.chat.completions.create(**kwargs)
+            message = response.choices[0].message
+            content = message.content or ""
             if not content.strip():
                 # 小模型偶发空回复（尤其关思考后）：补上 reasoning 兜底，仍为空则当瞬时错误重试
-                content = (message.get("reasoning") or "").strip()
+                content = (getattr(message, "reasoning", None) or "").strip()
             if not content:
                 raise RuntimeError("empty completion content")
             return content
-        except httpx.HTTPStatusError as exc:
+        except openai.APIStatusError as exc:
             last_error = exc
-            if exc.response.status_code in non_retryable:
+            if exc.status_code in non_retryable:
                 raise
             if attempt < int(config["max_retries"]):
-                delay = _backoff_seconds(exc, attempt, config)
-                await asyncio.sleep(delay)
+                await asyncio.sleep(_backoff_seconds(exc, attempt, config))
         except Exception as exc:  # noqa: BLE001 - 连接/超时/解析等瞬时错误
             last_error = exc
             if attempt < int(config["max_retries"]):
@@ -434,7 +437,7 @@ def finalize_atom(atom: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 async def process_index(
-    client: httpx.AsyncClient,
+    client: openai.AsyncOpenAI,
     config: dict,
     semaphore: asyncio.Semaphore,
     system_prompt: str,
@@ -469,7 +472,7 @@ def resolve_dir(target: str) -> Path:
     return path
 
 
-async def process_dir(client: httpx.AsyncClient, config: dict, dir_name: str, limit: int | None) -> None:
+async def process_dir(client: openai.AsyncOpenAI, config: dict, dir_name: str, limit: int | None) -> None:
     directory = resolve_dir(dir_name)
     label = directory.name
     memory_file = directory / "memory.jsonl"
@@ -547,15 +550,17 @@ async def run(config: dict, targets: list[str], limit: int | None) -> None:
     else:
         dir_names = sorted(p.name for p in DATA_DIR.iterdir() if (p / "memory.jsonl").exists())
 
-    timeout = httpx.Timeout(float(config["timeout"]), connect=30.0)
-    headers = {"Content-Type": "application/json"}
-    if config.get("api_key"):
-        headers["Authorization"] = f"Bearer {config['api_key']}"
-    async with httpx.AsyncClient(
-        base_url=config["base_url"], timeout=timeout, headers=headers
-    ) as client:
+    client = openai.AsyncOpenAI(
+        base_url=config["base_url"],
+        api_key=config.get("api_key") or "not-needed",
+        timeout=float(config["timeout"]),
+        max_retries=0,  # 重试由本模块的 _backoff_seconds 统一处理
+    )
+    try:
         for dir_name in dir_names:
             await process_dir(client, config, dir_name, limit)
+    finally:
+        await client.close()
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
