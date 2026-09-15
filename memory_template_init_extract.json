@@ -1,0 +1,31 @@
+{
+  "memory": {
+    "description": "[YOU] Core content of this memory atom. Exactly ONE fact: an event, a preference, an intention, a personal attribute, or a temporal detail. Self-contained and understandable when retrieved alone: explicitly name the subject speaker (third person, start with the name) and resolve all pronouns to concrete entities. Use exact source words; only rephrase for pronoun resolution. <= 20 words; if longer, split. NEVER merge multiple events, timeframes, motivations, or reflections into one atom. NEVER store bare dialogue acts (asks, says hello, thanks) without a durable personal fact.",
+    "type": "string"
+  },
+  "metadata": {
+    "type": {
+      "description": "[YOU] inner: fundamental, long-term identity/life facts, including presupposed roles (parent, employee, student, spouse), core relationships, occupation, residence, values, major life events. outer: transient facts, actions, preferences, plans, intentions, emotions, states. Past events and intentions/goals MUST be separate atoms.",
+      "type": "enum",
+      "values": ["inner", "outer"]
+    },
+    "time": {
+      "description": "[YOU] Temporal scope. Always include temporal information if present in the fact; do NOT drop dates, durations, or relative times. Prefer absolute time when resolvable from context (e.g. 'in 2018' not 'five years ago' if the session year is known). Use ISO 8601. For ranges, use 'YYYY-MM-DD/YYYY-MM-DD'. If completely unknown or no need to use time to describe, use empty string ''. Only to the exact unit of time that can be confirmed.",
+      "type": "string",
+      "examples": [
+        "2026-09-14",
+        "2026-09-14T10:30:00Z",
+        "2026-09-01/2026-09-15",
+        ""
+      ]
+    },
+    "tag": {
+      "description": "[YOU] Array of key-value labels. MUST include at least one 'speaker:<name>'. Other tags from Tag Taxonomy: topic, entity, sentiment, action, state, relation, other. Format: 'key:value'.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z]+:[a-zA-Z0-9_\\-]+$"
+      }
+    }
+  }
+}
