@@ -2,17 +2,20 @@
 生成原子记忆抽取模型的 DPO 训练数据。
 
 每个 raw message memory 构造一对偏好数据：
-    - chosen   : 由较强的模型（configs/model.yaml 里的 dpo.strong）按 atommem 的 prompt 生成
-    - rejected : 由待训练的小模型（dpo.weak）按同一 prompt 生成
-两者使用完全相同的 system/user prompt，只有模型不同，保证 DPO 的对比只来自模型能力差异。
+    - chosen   : 由较强的模型（configs/model.yaml 里的 dpo.strong）+ 完整 prompt 生成
+    - rejected : 由待训练的小模型（dpo.weak）+ 简化 prompt 生成；若重试后仍无法解析出
+                 合法 JSON，则保留其原始输出作为负样本（这正是 DPO 要抑制的行为）
+    - messages : 存小模型实际使用的简化 prompt，使训练分布与部署时一致
+强模型用完整 prompt，小模型用简化 prompt（prompts.WEAK_ATOM_EXTRACTION_SYSTEM_PROMPT）。
 
 输出 JSONL，每行一条（TRL / LLaMA-Factory 兼容的 messages 格式）：
 
     {
       "messages": [{"role": "system", ...}, {"role": "user", ...}],
       "chosen":   "<强模型输出的 JSON 字符串>",
-      "rejected": "<小模型输出的 JSON 字符串>",
-      "meta": {"id": "session_1_2", "dir": "Caroline_Melanie", "chosen_model": ..., "rejected_model": ...}
+      "rejected": "<小模型输出的 JSON 字符串，解析失败时为原始错误输出>",
+      "meta": {"id": "session_1_2", "dir": "Caroline_Melanie",
+               "chosen_model": ..., "rejected_model": ..., "rejected_parse_failed": false}
     }
 
 用法：
@@ -33,7 +36,7 @@ import openai
 import yaml
 
 from . import atommem
-from .prompts import ATOM_EXTRACTION_SYSTEM_PROMPT
+from .prompts import ATOM_EXTRACTION_SYSTEM_PROMPT, WEAK_ATOM_EXTRACTION_SYSTEM_PROMPT
 
 PROJECT_ROOT = atommem.PROJECT_ROOT
 DATA_DIR = atommem.DATA_DIR
@@ -114,34 +117,45 @@ async def build_pair(
     strong_config: dict,
     weak_config: dict,
     semaphore: asyncio.Semaphore,
-    system_prompt: str,
+    strong_prompt: str,
+    weak_prompt: str,
     raws: list[dict],
     index: int,
     window: int,
 ) -> tuple[dict | None, str | None]:
-    """生成一条 (样本, 错误信息)。chosen 来自强模型，rejected 来自小模型。"""
+    """生成一条 (样本, 错误信息)。
+
+    - chosen  : 强模型 + 完整 prompt
+    - rejected: 小模型 + 简化 prompt；若重试后仍解析失败，保留其原始输出作为负样本
+    - messages: 存小模型实际使用的简化 prompt（与部署时一致）
+    """
     raw_id = raws[index]["metadata"]["id"]
-    messages = atommem.build_messages(system_prompt, raws, index, window)
+    strong_messages = atommem.build_messages(strong_prompt, raws, index, window)
+    weak_messages = atommem.build_messages(weak_prompt, raws, index, window)
 
     async with semaphore:
         chosen, rejected = await asyncio.gather(
-            _generate_one(strong_client, strong_config, messages),
-            _generate_one(weak_client, weak_config, messages),
+            _generate_one(strong_client, strong_config, strong_messages),
+            _generate_one(weak_client, weak_config, weak_messages),
         )
 
+    # 强模型必须产出合法 JSON，否则这条没有可靠的正样本
     if chosen is None or not _valid_json(chosen):
         return None, f"{raw_id}: strong model produced invalid JSON"
-    if rejected is None or not _valid_json(rejected):
-        return None, f"{raw_id}: weak model produced invalid JSON"
+
+    # 小模型失败（空输出 / JSON 无法解析）时，原始输出本身就是一个有效的 rejected 负样本
+    weak_failed = rejected is None or not _valid_json(rejected)
 
     return {
-        "messages": messages,
+        "messages": weak_messages,
         "chosen": chosen.strip(),
-        "rejected": rejected.strip(),
+        "rejected": (rejected or "").strip(),
         "meta": {
             "id": raw_id,
             "chosen_model": strong_config["model"],
             "rejected_model": weak_config["model"],
+            # 标记该 rejected 是解析失败的原始输出（DPO 中正是要抑制的行为）
+            "rejected_parse_failed": weak_failed,
         },
     }, None
 
@@ -175,9 +189,9 @@ async def process_dir(
         return [], []
 
     window = int(base_config["context_window"])
-    system_prompt = ATOM_EXTRACTION_SYSTEM_PROMPT.replace(
-        "{{SCHEMA}}", atommem.build_schema_prompt(atommem.load_template())
-    )
+    schema = atommem.build_schema_prompt(atommem.load_template())
+    strong_prompt = ATOM_EXTRACTION_SYSTEM_PROMPT.replace("{{SCHEMA}}", schema)
+    weak_prompt = WEAK_ATOM_EXTRACTION_SYSTEM_PROMPT.replace("{{SCHEMA}}", schema)
     semaphore = asyncio.Semaphore(int(base_config["concurrency"]))
 
     print(f"[run ] {label}: {len(raws)} raw messages, concurrency={base_config['concurrency']}, window={window}")
@@ -186,7 +200,7 @@ async def process_dir(
         asyncio.create_task(
             build_pair(
                 strong_client, weak_client, strong_config, weak_config,
-                semaphore, system_prompt, raws, i, window,
+                semaphore, strong_prompt, weak_prompt, raws, i, window,
             )
         )
         for i in range(len(raws))
@@ -265,12 +279,14 @@ async def run(base_config: dict, dpo_config: dict, targets: list[str], limit: in
         await strong_client.close()
         await weak_client.close()
 
-    # 过滤 chosen == rejected 的样本（没有偏好信号）
+    # 过滤 chosen == rejected 的样本（没有偏好信号）；解析失败的 rejected 天然不同，不会被丢弃
     kept = all_samples
     dropped = 0
     if not include_identical:
         kept = [s for s in all_samples if _normalize_text(s["chosen"]) != _normalize_text(s["rejected"])]
         dropped = len(all_samples) - len(kept)
+
+    parse_failed = sum(1 for s in kept if s["meta"].get("rejected_parse_failed"))
 
     output = PROJECT_ROOT / dpo_config["output"]
     _write_jsonl(output, kept)
@@ -278,6 +294,8 @@ async def run(base_config: dict, dpo_config: dict, targets: list[str], limit: in
         f"\n[done] {len(kept)} DPO pairs -> {output}"
         + (f"（丢弃 {dropped} 条 chosen==rejected）" if dropped else "")
     )
+    if parse_failed:
+        print(f"[info] 其中 {parse_failed} 条的 rejected 是小模型解析失败的原始输出（负样本）")
 
     if all_errors:
         error_file = PROJECT_ROOT / dpo_config["error_log"]

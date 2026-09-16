@@ -313,6 +313,10 @@ def _backoff_seconds(exc: Exception, attempt: int, config: dict) -> float:
     return delay + random.uniform(0, jitter * delay)
 
 
+class TruncatedCompletion(RuntimeError):
+    """模型输出因达到 max_tokens 而被截断（finish_reason == 'length'）。"""
+
+
 async def chat_completion(
     client: openai.AsyncOpenAI, config: dict, messages: list[dict]
 ) -> str:
@@ -337,13 +341,20 @@ async def chat_completion(
     for attempt in range(1, int(config["max_retries"]) + 1):
         try:
             response = await client.chat.completions.create(**kwargs)
-            message = response.choices[0].message
+            choice = response.choices[0]
+            message = choice.message
             content = message.content or ""
             if not content.strip():
                 # 小模型偶发空回复（尤其关思考后）：补上 reasoning 兜底，仍为空则当瞬时错误重试
                 content = (getattr(message, "reasoning", None) or "").strip()
             if not content:
                 raise RuntimeError("empty completion content")
+            # 被 max_tokens 截断：内容必然是不完整的 JSON，重试（思考长度会波动，重试常能成功）
+            if getattr(choice, "finish_reason", None) == "length":
+                raise TruncatedCompletion(
+                    "completion truncated by max_tokens"
+                    f" (alignment: {content[-80:]!r})"
+                )
             return content
         except openai.APIStatusError as exc:
             last_error = exc
@@ -356,6 +367,9 @@ async def chat_completion(
             if attempt < int(config["max_retries"]):
                 await asyncio.sleep(_backoff_seconds(exc, attempt, config))
 
+    # 保留截断这一具体原因，便于定位（max_tokens 不足）
+    if isinstance(last_error, TruncatedCompletion):
+        raise TruncatedCompletion(f"chat completion failed after retries: {last_error}")
     raise RuntimeError(f"chat completion failed after retries: {last_error}")
 
 

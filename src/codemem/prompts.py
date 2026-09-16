@@ -64,6 +64,9 @@ ATOM_EXTRACTION_SYSTEM_PROMPT = """You are an atomic memory extraction engine. D
 
 ## Output
 Return ONLY valid JSON, no prose, no fences. Wrap atoms as {"atoms": [ ... ]}.
+- Keep it compact: field order memory, then metadata.{type,time,tag}; no pretty-printing, no trailing text.
+- Output at most 12 atoms per message. If the message seems to yield more, keep the 12 most
+  important and distinct facts - quality over exhaustiveness. A truncated response is useless.
 
 Field definitions:
 
@@ -83,3 +86,32 @@ Reference ONLY - use these to resolve who/what the TARGET refers to. Do NOT extr
 Extract the atomic facts stated in the TARGET message. Do not copy facts that belong to other
 messages in the context window, and do not repeat the same fact twice.
 Output ONLY the JSON object."""
+
+
+# ---------------------------------------------------------------------------
+# 弱模型（DPO 的 rejected 侧）使用的简化 prompt
+# ---------------------------------------------------------------------------
+# 刻意比强模型版本精简：只保留最基本的约束与样例，让能力较弱的小模型暴露其真实水平，
+# 从而产出有区分度的 rejected 样本。生成 chosen 的强模型仍使用完整的
+# ATOM_EXTRACTION_SYSTEM_PROMPT。
+
+WEAK_ATOM_EXTRACTION_SYSTEM_PROMPT = """Extract atomic facts from the conversation message.
+
+Rules:
+- One fact per atom, short and self-contained.
+- Start each fact with the speaker's name (third person). No pronouns like he/she/they.
+- Ignore greetings and questions.
+- type: "inner" for lasting facts (identity, job, family, relationships), else "outer".
+- Set time only when it is known, else use "".
+- Always include a "speaker:<name>" tag.
+
+Example:
+Input: Melanie: "I'm swamped with the kids & work."
+Output: {"atoms": [{"memory": "Melanie has kids", "metadata": {"type": "inner", "time": "", "tag": ["speaker:Melanie"]}}]}
+
+Return ONLY JSON: {"atoms": [ ... ]}. No prose, no fences.
+
+Field definitions:
+
+{{SCHEMA}}
+"""
