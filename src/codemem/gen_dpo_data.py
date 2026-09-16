@@ -22,6 +22,7 @@
     python -m codemem.gen_dpo_data                      # 处理 data/ 下全部 speaker 目录
     python -m codemem.gen_dpo_data Caroline_Melanie     # 只处理指定目录
     python -m codemem.gen_dpo_data --limit 50           # 每个目录只取前 50 条 raw（调试）
+    python -m codemem.gen_dpo_data --resume             # 跳过已生成过的样本，追加到已有输出
     python -m codemem.gen_dpo_data --include-identical  # 保留 chosen==rejected 的样本
 """
 
@@ -40,13 +41,21 @@ from .prompts import ATOM_EXTRACTION_SYSTEM_PROMPT, WEAK_ATOM_EXTRACTION_SYSTEM_
 
 PROJECT_ROOT = atommem.PROJECT_ROOT
 DATA_DIR = atommem.DATA_DIR
-CONFIG_FILE = atommem.CONFIG_FILE
+DPO_CONFIG_FILE = PROJECT_ROOT / "configs" / "dpo_data.yaml"
 
 DEFAULT_DPO_CONFIG: dict[str, Any] = {
+    "strong": {"base_url": "", "api_key": "", "model": "", "temperature": 0.2, "concurrency": 4},
+    "weak": {"base_url": "", "api_key": "", "model": "", "temperature": 0.7, "concurrency": 1},
+    "max_tokens": 8192,
+    "timeout": 300,
+    "max_retries": 6,
+    "backoff_base": 2.0,
+    "rate_limit_backoff": 10.0,
+    "max_backoff": 120.0,
+    "backoff_jitter": 0.5,
+    "context_window": 4,
     "output": "data/dpo/atom_dpo.jsonl",
     "error_log": "data/dpo/atom_dpo_errors.log",
-    "strong": {"base_url": "", "api_key": "", "model": "", "temperature": 0.2},
-    "weak": {"base_url": "", "api_key": "", "model": "", "temperature": 0.7},
 }
 
 
@@ -54,27 +63,31 @@ DEFAULT_DPO_CONFIG: dict[str, Any] = {
 # 配置
 # ---------------------------------------------------------------------------
 
-def load_dpo_config() -> tuple[dict, dict]:
-    """返回 (base 配置, dpo 配置)。base 用于并发/超时/重试等通用参数。"""
-    base = atommem.load_config()
-    dpo = json.loads(json.dumps(DEFAULT_DPO_CONFIG))  # 深拷贝
-    if CONFIG_FILE.exists():
-        loaded = yaml.safe_load(CONFIG_FILE.read_text(encoding="utf-8")) or {}
-        user_dpo = loaded.get("dpo") or {}
-        for key, value in user_dpo.items():
+def load_dpo_config() -> dict:
+    """读取 configs/dpo_data.yaml，缺失字段用 DEFAULT_DPO_CONFIG 补齐。"""
+    config = json.loads(json.dumps(DEFAULT_DPO_CONFIG))  # 深拷贝
+    if DPO_CONFIG_FILE.exists():
+        loaded = yaml.safe_load(DPO_CONFIG_FILE.read_text(encoding="utf-8")) or {}
+        for key, value in loaded.items():
             if key in ("strong", "weak") and isinstance(value, dict):
-                dpo[key].update(value)
+                config[key].update(value)
             else:
-                dpo[key] = value
-    return base, dpo
+                config[key] = value
+    return config
 
 
-def _profile_config(base: dict, profile: dict) -> dict:
-    """把某个模型 profile 合并进 base 配置，得到 atommem.chat_completion 可用的 config。"""
-    config = dict(base)
-    for key in ("base_url", "api_key", "model", "temperature"):
-        if profile.get(key) not in (None, ""):
-            config[key] = profile[key]
+def _model_config(dpo_config: dict, which: str) -> dict:
+    """把某个模型 profile + 通用参数组装成 atommem.chat_completion 可用的 config。"""
+    profile = dpo_config[which]
+    config = {
+        "base_url": profile.get("base_url", ""),
+        "api_key": profile.get("api_key", ""),
+        "model": profile.get("model", ""),
+        "temperature": profile.get("temperature", 0.2),
+    }
+    for key in ("max_tokens", "timeout", "max_retries", "backoff_base",
+                "rate_limit_backoff", "max_backoff", "backoff_jitter"):
+        config[key] = dpo_config[key]
     return config
 
 
@@ -116,7 +129,8 @@ async def build_pair(
     weak_client: openai.AsyncOpenAI,
     strong_config: dict,
     weak_config: dict,
-    semaphore: asyncio.Semaphore,
+    strong_semaphore: asyncio.Semaphore,
+    weak_semaphore: asyncio.Semaphore,
     strong_prompt: str,
     weak_prompt: str,
     raws: list[dict],
@@ -128,16 +142,21 @@ async def build_pair(
     - chosen  : 强模型 + 完整 prompt
     - rejected: 小模型 + 简化 prompt；若重试后仍解析失败，保留其原始输出作为负样本
     - messages: 存小模型实际使用的简化 prompt（与部署时一致）
+    强/弱模型各自用自己的并发信号量。
     """
     raw_id = raws[index]["metadata"]["id"]
     strong_messages = atommem.build_messages(strong_prompt, raws, index, window)
     weak_messages = atommem.build_messages(weak_prompt, raws, index, window)
 
-    async with semaphore:
-        chosen, rejected = await asyncio.gather(
-            _generate_one(strong_client, strong_config, strong_messages),
-            _generate_one(weak_client, weak_config, weak_messages),
-        )
+    async def _strong():
+        async with strong_semaphore:
+            return await _generate_one(strong_client, strong_config, strong_messages)
+
+    async def _weak():
+        async with weak_semaphore:
+            return await _generate_one(weak_client, weak_config, weak_messages)
+
+    chosen, rejected = await asyncio.gather(_strong(), _weak())
 
     # 强模型必须产出合法 JSON，否则这条没有可靠的正样本
     if chosen is None or not _valid_json(chosen):
@@ -167,11 +186,12 @@ async def build_pair(
 async def process_dir(
     strong_client: openai.AsyncOpenAI,
     weak_client: openai.AsyncOpenAI,
-    base_config: dict,
+    dpo_config: dict,
     strong_config: dict,
     weak_config: dict,
     dir_name: str,
     limit: int | None,
+    done_keys: set[tuple[str, str]],
 ) -> tuple[list[dict], list[str]]:
     directory = atommem.resolve_dir(dir_name)
     label = directory.name
@@ -188,22 +208,37 @@ async def process_dir(
         print(f"[skip] {label}: no raw memory")
         return [], []
 
-    window = int(base_config["context_window"])
+    # resume：跳过已经生成过的样本
+    pending = [(i, r) for i, r in enumerate(raws) if (label, r["metadata"]["id"]) not in done_keys]
+    skipped = len(raws) - len(pending)
+    if skipped:
+        print(f"[skip] {label}: {skipped} 条已在输出中，跳过")
+    if not pending:
+        print(f"[skip] {label}: 全部已生成")
+        return [], []
+
+    window = int(dpo_config["context_window"])
     schema = atommem.build_schema_prompt(atommem.load_template())
     strong_prompt = ATOM_EXTRACTION_SYSTEM_PROMPT.replace("{{SCHEMA}}", schema)
     weak_prompt = WEAK_ATOM_EXTRACTION_SYSTEM_PROMPT.replace("{{SCHEMA}}", schema)
-    semaphore = asyncio.Semaphore(int(base_config["concurrency"]))
+    strong_semaphore = asyncio.Semaphore(int(dpo_config["strong"].get("concurrency", 4)))
+    weak_semaphore = asyncio.Semaphore(int(dpo_config["weak"].get("concurrency", 1)))
 
-    print(f"[run ] {label}: {len(raws)} raw messages, concurrency={base_config['concurrency']}, window={window}")
+    print(
+        f"[run ] {label}: {len(pending)} raw messages "
+        f"(strong并发={dpo_config['strong'].get('concurrency', 4)}, "
+        f"weak并发={dpo_config['weak'].get('concurrency', 1)}, window={window})"
+    )
 
     tasks = [
         asyncio.create_task(
             build_pair(
                 strong_client, weak_client, strong_config, weak_config,
-                semaphore, strong_prompt, weak_prompt, raws, i, window,
+                strong_semaphore, weak_semaphore, strong_prompt, weak_prompt,
+                raws, i, window,
             )
         )
-        for i in range(len(raws))
+        for i, _ in pending
     ]
 
     samples: list[dict] = []
@@ -217,8 +252,8 @@ async def process_dir(
         elif sample:
             sample["meta"]["dir"] = label
             samples.append(sample)
-        if done % 20 == 0 or done == len(raws):
-            print(f"        {done}/{len(raws)} pairs processed")
+        if done % 20 == 0 or done == len(pending):
+            print(f"        {done}/{len(pending)} pairs processed")
 
     # 保持原始顺序
     order = {r["metadata"]["id"]: i for i, r in enumerate(raws)}
@@ -230,38 +265,79 @@ async def process_dir(
 # 入口
 # ---------------------------------------------------------------------------
 
-def _write_jsonl(path: Path, items: list[dict]) -> None:
+def _append_jsonl(path: Path, items: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+    with path.open("a", encoding="utf-8") as f:
         for item in items:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
-async def run(base_config: dict, dpo_config: dict, targets: list[str], limit: int | None,
-              include_identical: bool) -> None:
+def _load_done_keys(path: Path) -> tuple[set[tuple[str, str]], list[dict]]:
+    """读取已有输出，返回 (已生成样本的 (dir, id) 集合, 已有样本列表)。
+
+    注意：message id 只在单个 speaker 目录内唯一（不同目录都有 session_1_1），
+    因此 resume 去重必须以 (dir, id) 为键。
+    """
+    if not path.exists():
+        return set(), []
+    existing = []
+    keys: set[tuple[str, str]] = set()
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            existing.append(item)
+            meta = item.get("meta") or {}
+            sid = meta.get("id")
+            sdir = meta.get("dir")
+            if sid and sdir:
+                keys.add((sdir, sid))
+    return keys, existing
+
+
+async def run(dpo_config: dict, targets: list[str], limit: int | None,
+              include_identical: bool, resume: bool) -> None:
     if targets:
         dir_names = targets
     else:
         dir_names = sorted(p.name for p in DATA_DIR.iterdir() if (p / "memory.jsonl").exists())
 
-    strong_config = _profile_config(base_config, dpo_config["strong"])
-    weak_config = _profile_config(base_config, dpo_config["weak"])
+    strong_config = _model_config(dpo_config, "strong")
+    weak_config = _model_config(dpo_config, "weak")
     if not strong_config.get("model") or not weak_config.get("model"):
-        raise SystemExit("dpo.strong / dpo.weak 未配置 model，请检查 configs/model.yaml")
+        raise SystemExit("dpo_data.yaml 里的 strong/weak 未配置 model")
 
+    output = PROJECT_ROOT / dpo_config["output"]
     print(f"strong: {strong_config['model']} @ {strong_config['base_url']}")
     print(f"weak  : {weak_config['model']} @ {weak_config['base_url']}")
+    print(f"output: {output}")
+
+    # resume：载入已生成的 (dir, id)，跳过重复生成
+    done_keys: set[tuple[str, str]] = set()
+    existing_samples: list[dict] = []
+    if resume:
+        done_keys, existing_samples = _load_done_keys(output)
+        print(f"[resume] 已有 {len(done_keys)} 条样本，将跳过这些 message")
+    else:
+        # 非 resume 模式：清空旧输出，从头生成
+        if output.exists():
+            output.unlink()
 
     strong_client = openai.AsyncOpenAI(
         base_url=strong_config["base_url"],
         api_key=strong_config.get("api_key") or "not-needed",
-        timeout=float(base_config["timeout"]),
+        timeout=float(dpo_config["timeout"]),
         max_retries=0,
     )
     weak_client = openai.AsyncOpenAI(
         base_url=weak_config["base_url"],
         api_key=weak_config.get("api_key") or "not-needed",
-        timeout=float(base_config["timeout"]),
+        timeout=float(dpo_config["timeout"]),
         max_retries=0,
     )
 
@@ -270,32 +346,26 @@ async def run(base_config: dict, dpo_config: dict, targets: list[str], limit: in
     try:
         for dir_name in dir_names:
             samples, errors = await process_dir(
-                strong_client, weak_client, base_config,
-                strong_config, weak_config, dir_name, limit,
+                strong_client, weak_client, dpo_config,
+                strong_config, weak_config, dir_name, limit, done_keys,
             )
             all_samples.extend(samples)
             all_errors.extend(errors)
+            # 增量落盘：每个目录处理后立即追加，中断也不丢已生成的数据
+            if samples:
+                kept = _filter_identical(samples, include_identical)
+                _append_jsonl(output, kept)
+                for s in samples:
+                    done_keys.add((s["meta"]["dir"], s["meta"]["id"]))
     finally:
         await strong_client.close()
         await weak_client.close()
 
-    # 过滤 chosen == rejected 的样本（没有偏好信号）；解析失败的 rejected 天然不同，不会被丢弃
-    kept = all_samples
-    dropped = 0
-    if not include_identical:
-        kept = [s for s in all_samples if _normalize_text(s["chosen"]) != _normalize_text(s["rejected"])]
-        dropped = len(all_samples) - len(kept)
-
-    parse_failed = sum(1 for s in kept if s["meta"].get("rejected_parse_failed"))
-
-    output = PROJECT_ROOT / dpo_config["output"]
-    _write_jsonl(output, kept)
-    print(
-        f"\n[done] {len(kept)} DPO pairs -> {output}"
-        + (f"（丢弃 {dropped} 条 chosen==rejected）" if dropped else "")
-    )
-    if parse_failed:
-        print(f"[info] 其中 {parse_failed} 条的 rejected 是小模型解析失败的原始输出（负样本）")
+    # 统计：已有 + 本次新增
+    total = len(existing_samples) + len(all_samples)
+    print(f"\n[done] 本次新增 {len(all_samples)} 条，输出共 {total} 条 -> {output}")
+    if resume and existing_samples:
+        print(f"[resume] 其中已有 {len(existing_samples)} 条")
 
     if all_errors:
         error_file = PROJECT_ROOT / dpo_config["error_log"]
@@ -304,28 +374,39 @@ async def run(base_config: dict, dpo_config: dict, targets: list[str], limit: in
         print(f"[warn] {len(all_errors)} failed pair(s) -> {error_file}")
 
 
+def _filter_identical(samples: list[dict], include_identical: bool) -> list[dict]:
+    """过滤 chosen == rejected 的样本（没有偏好信号）。"""
+    if include_identical:
+        return samples
+    return [s for s in samples if _normalize_text(s["chosen"]) != _normalize_text(s["rejected"])]
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="生成原子记忆抽取的 DPO 偏好数据")
     parser.add_argument("dirs", nargs="*", help="speaker 目录名；缺省处理全部")
     parser.add_argument("--limit", type=int, default=None, help="每个目录只处理前 N 条 raw（调试用）")
-    parser.add_argument("--concurrency", type=int, default=None, help="覆盖配置里的并发数")
+    parser.add_argument("--strong-concurrency", type=int, default=None, help="覆盖强模型并发数")
+    parser.add_argument("--weak-concurrency", type=int, default=None, help="覆盖小模型并发数")
     parser.add_argument("--context-window", type=int, default=None, help="覆盖配置里的上下文窗口大小")
     parser.add_argument("--output", type=str, default=None, help="覆盖输出文件路径")
+    parser.add_argument("--resume", action="store_true", help="跳过已生成过的样本，追加到已有输出")
     parser.add_argument("--include-identical", action="store_true", help="保留 chosen==rejected 的样本")
     return parser.parse_args(argv)
 
 
 def main() -> None:
     args = parse_args(sys.argv[1:])
-    base_config, dpo_config = load_dpo_config()
-    if args.concurrency is not None:
-        base_config["concurrency"] = args.concurrency
+    dpo_config = load_dpo_config()
+    if args.strong_concurrency is not None:
+        dpo_config["strong"]["concurrency"] = args.strong_concurrency
+    if args.weak_concurrency is not None:
+        dpo_config["weak"]["concurrency"] = args.weak_concurrency
     if args.context_window is not None:
-        base_config["context_window"] = args.context_window
+        dpo_config["context_window"] = args.context_window
     if args.output is not None:
         dpo_config["output"] = args.output
     asyncio.run(
-        run(base_config, dpo_config, args.dirs, args.limit, args.include_identical)
+        run(dpo_config, args.dirs, args.limit, args.include_identical, args.resume)
     )
 
 
