@@ -194,6 +194,8 @@ async def process_dir(
     dir_name: str,
     limit: int | None,
     done_keys: set[tuple[str, str]],
+    output: Path,
+    include_identical: bool,
 ) -> tuple[list[dict], list[str]]:
     directory = atommem.resolve_dir(dir_name)
     label = directory.name
@@ -254,10 +256,15 @@ async def process_dir(
         elif sample:
             sample["meta"]["dir"] = label
             samples.append(sample)
+            # 实时追加：每生成一条就立即写入到 output
+            kept = _filter_identical([sample], include_identical)
+            if kept:
+                _append_jsonl(output, kept)
+                done_keys.add((sample["meta"]["dir"], sample["meta"]["id"]))
         if done % 20 == 0 or done == len(pending):
-            print(f"        {done}/{len(pending)} pairs processed")
+            print(f"        {done}/{len(pending)} pairs processed, {len(samples)} written")
 
-    # 保持原始顺序
+    # 保持原始顺序（用于返回统计信息）
     order = {r["metadata"]["id"]: i for i, r in enumerate(raws)}
     samples.sort(key=lambda s: order.get(s["meta"]["id"], 0))
     return samples, errors
@@ -318,6 +325,7 @@ async def run(dpo_config: dict, targets: list[str], limit: int | None,
     print(f"strong: {strong_config['model']} @ {strong_config['base_url']}")
     print(f"weak  : {weak_config['model']} @ {weak_config['base_url']}")
     print(f"output: {output}")
+    print(f"[info] 实时追加模式：每生成一条样本立即写入 {output}")
 
     # resume：载入已生成的 (dir, id)，跳过重复生成
     done_keys: set[tuple[str, str]] = set()
@@ -350,15 +358,10 @@ async def run(dpo_config: dict, targets: list[str], limit: int | None,
             samples, errors = await process_dir(
                 strong_client, weak_client, dpo_config,
                 strong_config, weak_config, dir_name, limit, done_keys,
+                output, include_identical,
             )
             all_samples.extend(samples)
             all_errors.extend(errors)
-            # 增量落盘：每个目录处理后立即追加，中断也不丢已生成的数据
-            if samples:
-                kept = _filter_identical(samples, include_identical)
-                _append_jsonl(output, kept)
-                for s in samples:
-                    done_keys.add((s["meta"]["dir"], s["meta"]["id"]))
     finally:
         await strong_client.close()
         await weak_client.close()

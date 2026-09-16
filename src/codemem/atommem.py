@@ -540,6 +540,7 @@ async def process_dir(client: openai.AsyncOpenAI, config: dict, dir_name: str, l
     semaphore = asyncio.Semaphore(int(config["concurrency"]))
 
     print(f"[run ] {label}: {len(raws)} raw messages, concurrency={config['concurrency']}, window={window}")
+    print(f"[info] 实时追加到 {memory_file}")
 
     tasks = [
         asyncio.create_task(
@@ -550,6 +551,7 @@ async def process_dir(client: openai.AsyncOpenAI, config: dict, dir_name: str, l
 
     results: dict[int, list[dict]] = {}
     errors: list[str] = []
+    atom_count = 0
     done = 0
     for coro in asyncio.as_completed(tasks):
         index, atoms, error = await coro
@@ -558,25 +560,23 @@ async def process_dir(client: openai.AsyncOpenAI, config: dict, dir_name: str, l
             errors.append(f"{raws[index]['metadata']['id']}: {error}")
         else:
             results[index] = atoms
+            # 实时处理并追加这条 raw 的原子记忆到 memory.jsonl
+            raw = raws[index]
+            raw_id = raw["metadata"]["id"]
+            normalized = [normalize_atom(a, raw) for a in atoms]
+            normalized = [a for a in normalized if a]
+            assign_ids(normalized, raw_id, 0)
+            finalized = [finalize_atom(a) for a in normalized]
+            # 实时追加到 memory.jsonl
+            with memory_file.open("a", encoding="utf-8") as f:
+                for atom in finalized:
+                    f.write(json.dumps(atom, ensure_ascii=False) + "\n")
+            atom_count += len(finalized)
         if done % 20 == 0 or done == len(raws):
-            print(f"        {done}/{len(raws)} target messages processed")
-
-    # 按原始顺序组装原子记忆，并分配 id
-    atoms_out: list[dict] = []
-    for index in range(len(raws)):
-        raw = raws[index]
-        raw_id = raw["metadata"]["id"]
-        normalized = [normalize_atom(a, raw) for a in results.get(index, [])]
-        normalized = [a for a in normalized if a]
-        assign_ids(normalized, raw_id, 0)
-        atoms_out.extend(finalize_atom(a) for a in normalized)
-
-    # 备份文件里的 raw + 全部原始 raw + 新生成的原子记忆
-    kept_raw = [item for item in existing if item["metadata"].get("type") == "raw"]
-    write_jsonl(memory_file, kept_raw + atoms_out)
+            print(f"        {done}/{len(raws)} messages processed, {atom_count} atoms written")
 
     print(
-        f"[done] {label}: {len(atoms_out)} atoms from {len(raws)} messages; "
+        f"[done] {label}: {atom_count} atoms from {len(raws)} messages; "
         f"raw backup -> {backup_file.name}"
     )
     if errors:
