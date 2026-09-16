@@ -366,8 +366,8 @@ async def chat_completion(
 def normalize_atom(atom: dict, source_raw: dict) -> dict | None:
     """把模型输出的原子记忆补全为完整的 memory item。
 
-    模型负责 memory / type / time / tag / source；
-    系统负责 id / target（初始为空）/ changelog。
+    模型只负责 memory / type / time / tag；
+    系统负责 id / source（固定为源 message 的 id）/ target（初始为空）/ changelog。
     """
     memory = (atom.get("memory") or "").strip()
     if not memory:
@@ -382,11 +382,9 @@ def normalize_atom(atom: dict, source_raw: dict) -> dict | None:
         # 兜底：继承源 raw memory 的 speaker 标签
         tags = [t for t in source_raw["metadata"].get("tag", []) if t.startswith("speaker:")] + tags
 
-    # source 至少包含源 raw memory 的 id
+    # source 由系统固定为源 message 的 id，不采用模型输出
     raw_id = source_raw["metadata"]["id"]
-    source = [s for s in (meta.get("source") or []) if isinstance(s, str)]
-    if raw_id not in source:
-        source.insert(0, raw_id)
+    source = [raw_id]
 
     time_value = meta.get("time")
     if time_value is None or (isinstance(time_value, str) and not time_value.strip()):
