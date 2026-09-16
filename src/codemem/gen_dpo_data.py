@@ -110,9 +110,10 @@ def _valid_json(text: str | None) -> bool:
         return False
     try:
         parsed = atommem.extract_json(text)
+        # 确保 atoms 字段存在且为列表（可以为空列表）
+        return isinstance(parsed.get("atoms"), list)
     except Exception:  # noqa: BLE001
         return False
-    return isinstance(parsed.get("atoms"), list)
 
 
 def _normalize_text(text: str) -> str:
@@ -160,7 +161,8 @@ async def build_pair(
 
     # 强模型必须产出合法 JSON，否则这条没有可靠的正样本
     if chosen is None or not _valid_json(chosen):
-        return None, f"{raw_id}: strong model produced invalid JSON"
+        error_detail = f"chosen output: {(chosen or '')[:300]!r}" if chosen else "chosen is None"
+        return None, f"{raw_id}: strong model produced invalid JSON ({error_detail})"
 
     # 小模型失败（空输出 / JSON 无法解析）时，原始输出本身就是一个有效的 rejected 负样本
     weak_failed = rejected is None or not _valid_json(rejected)

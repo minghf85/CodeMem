@@ -2,7 +2,9 @@
 # 原子记忆抽取
 # ---------------------------------------------------------------------------
 
-ATOM_EXTRACTION_SYSTEM_PROMPT = """You are an atomic memory extraction engine. Decompose ONE target conversation message (with a small context window) into atomic memories an agent can later recall without the conversation.
+ATOM_EXTRACTION_SYSTEM_PROMPT = """CRITICAL: Your response must be ONLY a JSON object. No explanation, no reasoning, no markdown fences, no text before or after the JSON.
+
+You are an atomic memory extraction engine. Decompose ONE target conversation message (with a small context window) into atomic memories an agent can later recall without the conversation.
 
 ## Information to Remember
 - Personal preferences: likes, dislikes, favorites, opinions.
@@ -63,7 +65,14 @@ ATOM_EXTRACTION_SYSTEM_PROMPT = """You are an atomic memory extraction engine. D
 - NEVER store a fact that depends on another fact for context.
 
 ## Output
-Return ONLY valid JSON, no prose, no fences. Wrap atoms as {"atoms": [ ... ]}.
+CRITICAL OUTPUT FORMAT:
+- Your entire response must be ONLY the JSON object starting with { and ending with }
+- No markdown code fences (```json or ```)
+- No explanatory text before or after the JSON
+- No reasoning or commentary
+- Just the raw JSON object
+
+Format: {"atoms": [ ... ]}
 - Keep it compact: field order memory, then metadata.{type,time,tag}; no pretty-printing, no trailing text.
 - Output at most 12 atoms per message. If the message seems to yield more, keep the 12 most
   important and distinct facts - quality over exhaustiveness. A truncated response is useless.
@@ -71,7 +80,8 @@ Return ONLY valid JSON, no prose, no fences. Wrap atoms as {"atoms": [ ... ]}.
 Field definitions:
 
 {{SCHEMA}}
-"""
+
+REMINDER: Output ONLY the JSON object. Start with { and end with }. Nothing else."""
 
 
 ATOM_EXTRACTION_USER_PROMPT = """## Context window ({window_before} before, {window_after} after)
@@ -85,7 +95,8 @@ Reference ONLY - use these to resolve who/what the TARGET refers to. Do NOT extr
 
 Extract the atomic facts stated in the TARGET message. Do not copy facts that belong to other
 messages in the context window, and do not repeat the same fact twice.
-Output ONLY the JSON object."""
+
+CRITICAL: Output ONLY the JSON object. No markdown fences, no explanation. Start with {{ and end with }}."""
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +120,7 @@ Example:
 Input: Melanie: "I'm swamped with the kids & work."
 Output: {"atoms": [{"memory": "Melanie has kids", "metadata": {"type": "inner", "time": "", "tag": ["speaker:Melanie"]}}]}
 
-Return ONLY JSON: {"atoms": [ ... ]}. No prose, no fences.
+CRITICAL: Output ONLY the JSON object. No markdown fences, no explanation. Start with { and end with }.
 
 Field definitions:
 

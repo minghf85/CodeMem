@@ -235,25 +235,54 @@ def extract_json(text: str) -> dict:
     """从模型输出里取出 JSON，统一成 dict。
 
     兼容两种形态：{"atoms": [...]} 与裸数组 [...]（小模型常省略外层包装）。
+    强模型有时会在 JSON 前后加说明文字，需要更激进的提取策略。
     """
     text = text.strip()
+
+    # 1. 去除 markdown 代码块标记
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
 
+    # 2. 先尝试直接解析整个文本
     parsed = _parse_any(text)
-    if parsed is None:
-        match = JSON_RE.search(text)
-        if match:
-            parsed = _parse_any(match.group(0))
-    if parsed is None:
-        raise ValueError(f"no valid JSON in model output: {text[:200]!r}")
+    if parsed is not None:
+        if isinstance(parsed, list):
+            return {"atoms": parsed}
+        if isinstance(parsed, dict):
+            return parsed
 
-    if isinstance(parsed, list):
-        return {"atoms": parsed}
-    if isinstance(parsed, dict):
-        return parsed
-    raise ValueError(f"unexpected JSON root type {type(parsed).__name__}: {text[:200]!r}")
+    # 3. 尝试提取最大的 JSON 对象（从第一个 { 到最后一个 }）
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        candidate = text[first_brace:last_brace + 1]
+        parsed = _parse_any(candidate)
+        if parsed is not None and isinstance(parsed, dict):
+            return parsed
+
+    # 4. 尝试提取最大的 JSON 数组（从第一个 [ 到最后一个 ]）
+    first_bracket = text.find("[")
+    last_bracket = text.rfind("]")
+    if first_bracket != -1 and last_bracket != -1 and last_bracket > first_bracket:
+        candidate = text[first_bracket:last_bracket + 1]
+        parsed = _parse_any(candidate)
+        if parsed is not None and isinstance(parsed, list):
+            return {"atoms": parsed}
+
+    # 5. 使用正则提取任意 JSON 结构（最后手段）
+    match = JSON_RE.search(text)
+    if match:
+        parsed = _parse_any(match.group(0))
+        if parsed is not None:
+            if isinstance(parsed, list):
+                return {"atoms": parsed}
+            if isinstance(parsed, dict):
+                return parsed
+
+    # 6. 全部失败，抛出详细错误
+    raise ValueError(f"no valid JSON in model output: {text[:500]!r}")
 
 
 def _status_code(exc: Exception) -> int | None:
