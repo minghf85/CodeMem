@@ -100,7 +100,7 @@ def convert_sample(sample: dict) -> tuple[str, list[dict]]:
 def write_memory_jsonl(dir_name: str, items: list[dict]) -> Path:
     out_dir = DATA_DIR / dir_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "memory.jsonl"
+    out_path = out_dir / "msgmem.jsonl"
     with out_path.open("w", encoding="utf-8") as f:
         for item in items:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")

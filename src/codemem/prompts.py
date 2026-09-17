@@ -102,27 +102,33 @@ CRITICAL: Output ONLY the JSON object. No markdown fences, no explanation. Start
 # ---------------------------------------------------------------------------
 # 弱模型（DPO 的 rejected 侧）使用的简化 prompt
 # ---------------------------------------------------------------------------
-# 刻意比强模型版本精简：只保留最基本的约束与样例，让能力较弱的小模型暴露其真实水平，
-# 从而产出有区分度的 rejected 样本。生成 chosen 的强模型仍使用完整的
-# ATOM_EXTRACTION_SYSTEM_PROMPT。
+# 刻意保留几类常见但可学习的抽取错误，让能力较弱的小模型产出有区分度的 rejected
+# 样本。仍要求输出可解析 JSON，避免所有 rejected 都退化成请求失败文本。
 
-WEAK_ATOM_EXTRACTION_SYSTEM_PROMPT = """Extract atomic facts from the conversation message.
+WEAK_ATOM_EXTRACTION_SYSTEM_PROMPT = """Extract facts from the conversation.
 
 Rules:
-- One fact per atom, short and self-contained.
-- Start each fact with the speaker's name (third person). No pronouns like he/she/they.
-- Ignore greetings and questions.
+- Return a few facts that seem relevant; do not try to be exhaustive.
+- It is acceptable to copy a useful fact from the context when resolving the target.
+- It is acceptable to combine closely related facts into one atom.
+- You may keep simple pronouns or vague references when the meaning is obvious.
+- Do not always split conjunctions into separate atoms.
+- It is acceptable to miss implied roles, relationships, or secondary facts.
+- It is acceptable to repeat an important fact if it appears more than once.
+- Treat questions, greetings, and opinions as facts when they contain personal-sounding content.
 - type: "inner" for lasting facts (identity, job, family, relationships), else "outer".
-- Set time only when it is known, else use "".
-- Always include a "speaker:<name>" tag.
+- time may be omitted or left as "" even when the message contains relative time.
+- Include a speaker tag when convenient, but do not spend effort resolving every speaker.
 
 Example:
 Input: Melanie: "I'm swamped with the kids & work."
-Output: {"atoms": [{"memory": "Melanie has kids", "metadata": {"type": "inner", "time": "", "tag": ["speaker:Melanie"]}}]}
+Output: {"atoms": [{"memory": "Melanie is swamped with the kids and work", "metadata": {"type": "outer", "time": "", "tag": ["speaker:Melanie"]}}]}
 
 CRITICAL: Output ONLY the JSON object. No markdown fences, no explanation. Start with { and end with }.
 
 Field definitions:
 
 {{SCHEMA}}
+
+IMPORTANT: Sometimes you will receive input that is confusing, contradictory, or has missing information. In those cases, do your best to still extract atoms. If you cannot extract any reasonable atoms, output a single atom with memory set to "No clear facts extracted." and metadata type "outer". Never refuse to output JSON. Never ask clarifying questions. Always produce a valid JSON object.
 """

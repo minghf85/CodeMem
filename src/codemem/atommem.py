@@ -3,18 +3,18 @@
 时间需要准确，只有在确定的时候才写入确定性地时间，当比较模糊不确定的时候写入相对时间描述等。每次处理一个message memory，但是需要给一定上下文窗口的信息，可以通过设置上下文窗口的大小来控制，默认是前后各3条message memory。上下文窗口内的message memory可以作为当前message memory的上下文信息，帮助提取原子记忆。
 
 流程：
-    1. 读取 data/{speaker_a}_{speaker_b}/memory.jsonl，取出所有 type == "raw" 的 message memory（按文件顺序，即会话顺序）。
+    1. 读取 data/{speaker_a}_{speaker_b}/msgmem.jsonl 中的原始 message（按文件顺序，即会话顺序）。
     2. 对每条 message memory，截取前后各 N 条（N = context_window，默认 3）作为上下文窗口。
     3. 并行调用大模型（OpenAI 兼容 /v1/chat/completions），一次处理一个 message memory，
        要求其参考 memory_template.json 的定义，把该 message 拆成若干原子记忆。
-    4. 为原子记忆补全系统字段（id / target / changelog），写回 memory.jsonl 末尾；
-       raw 记录在原文件被覆盖前先备份为 raw_memory.jsonl。
+    4. 原始 msgmem.jsonl 保持不变，原子记忆单独写入 atommem.jsonl。
 
 用法：
     python -m codemem.atommem                      # 处理全部 speaker 目录
     python -m codemem.atommem Caroline_Melanie     # 只处理指定目录
     python -m codemem.atommem --limit 50           # 每个目录只处理前 50 条 raw（调试用）
     python -m codemem.atommem --concurrency 4 --context-window 3
+    python -m codemem.atommem --resume Caroline_Melanie  # 跳过已完成，只重试失败项
 """
 
 import argparse
@@ -22,7 +22,6 @@ import asyncio
 import json
 import random
 import re
-import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -128,12 +127,28 @@ def _now() -> str:
 
 
 def read_jsonl(path: Path) -> list[dict]:
-    items = []
+    items: list[dict] = []
+    decoder = json.JSONDecoder()
     with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                items.append(json.loads(line))
+        for line_number, line in enumerate(f, 1):
+            position = 0
+            while position < len(line):
+                while position < len(line) and line[position].isspace():
+                    position += 1
+                if position >= len(line):
+                    break
+                try:
+                    item, end = decoder.raw_decode(line, position)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"{path}:{line_number}:{exc.colno}: invalid JSON"
+                    ) from exc
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        f"{path}:{line_number}:{position + 1}: expected a JSON object"
+                    )
+                items.append(item)
+                position = end
     return items
 
 
@@ -141,6 +156,59 @@ def write_jsonl(path: Path, items: list[dict]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for item in items:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+def append_jsonl(path: Path, items: list[dict]) -> None:
+    """追加 JSONL 记录，兼容已有文件末尾缺少换行的情况。"""
+    if not items:
+        return
+    with path.open("a+", encoding="utf-8") as f:
+        f.seek(0, 2)
+        if f.tell() > 0:
+            f.seek(f.tell() - 1)
+            if f.read(1) != "\n":
+                f.write("\n")
+        f.seek(0, 2)
+        for item in items:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+def sort_memory_records(records: list[dict], raw_order: list[str]) -> list[dict]:
+    """按 raw 会话顺序排列记录，atom 在其源 raw 后按 id 排列。"""
+    raw_positions = {raw_id: position for position, raw_id in enumerate(raw_order)}
+    fallback_position = len(raw_order)
+
+    def sort_key(item: dict) -> tuple[int, int, str]:
+        metadata = item.get("metadata") or {}
+        record_type = metadata.get("type")
+        record_id = metadata.get("id")
+        record_id = record_id if isinstance(record_id, str) else ""
+        if record_type == "raw":
+            return raw_positions.get(record_id, fallback_position), 0, ""
+
+        sources = metadata.get("source") or []
+        source_id = sources[0] if sources and isinstance(sources[0], str) else ""
+        source_position = raw_positions.get(source_id, fallback_position)
+        return source_position, 1, record_id
+
+    return sorted(records, key=sort_key)
+
+
+def _source_ids(record: dict) -> set[str]:
+    sources = (record.get("metadata") or {}).get("source") or []
+    return {source for source in sources if isinstance(source, str)}
+
+
+def split_memory_records(records: list[dict]) -> tuple[list[dict], list[dict]]:
+    """将混合 memory 文件拆成 raw 消息和 atom 记录。"""
+    raws: list[dict] = []
+    atoms: list[dict] = []
+    for record in records:
+        if (record.get("metadata") or {}).get("type") == "raw":
+            raws.append(record)
+        else:
+            atoms.append(record)
+    return raws, atoms
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +282,10 @@ def _repair_json(text: str) -> str:
     # 去掉对象/数组之间的多余逗号（会自动补回）
     text = re.sub(r"\}\s*\{", "},{", text)
     text = re.sub(r"\]\s*\[", "],[", text)
+    # 小模型偶尔漏掉最后一个 atom 的对象闭合，并多写一个数组闭合：... ]}]]}
+    text = re.sub(r"}\s*\]\s*\]}\s*$", "}}]}" , text)
+    # 另一种变体只是多写一个数组闭合：... ] ]}
+    text = re.sub(r"\]\s*\]\s*}", "]}", text)
     # 去掉尾随逗号： {"a":1,}  /  [1,]
     text = re.sub(r",\s*([}\]])", r"\1", text)
     # 去掉字符串内的裸控制字符
@@ -356,13 +428,18 @@ async def chat_completion(
         "max_tokens": config["max_tokens"],
         "stream": False,
     }
-    # ollama / qwen3 专用：chat_template_kwargs 用来关闭思考过程。
-    # 注意：OpenAI 及其它托管服务会因未知参数直接返回 400，所以只在 ollama 端点才发送。
-    base_url = str(config.get("base_url", ""))
-    is_ollama = "11434" in base_url or "ollama" in base_url.lower()
-    if is_ollama and config.get("enable_thinking") is False:
-        kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+    # # ollama / qwen3 专用：chat_template_kwargs 用来关闭思考过程。
+    # # 注意：OpenAI 及其它托管服务会因未知参数直接返回 400，所以只在 ollama 端点才发送。
+    # base_url = str(config.get("base_url", ""))
+    # is_ollama = "11434" in base_url or "ollama" in base_url.lower()
+    # if is_ollama and config.get("enable_thinking") is False:
+    #     kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+    # 模型名称里有 qwen3 就关闭思考过程
+    model_name = config.get("model", "")
+    is_qwen3 = "qwen3" in model_name.lower()
 
+    if is_qwen3 and config.get("enable_thinking") is False:
+        kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
     # 不可重试的客户端错误（除 429 外），直接抛出
     non_retryable = {400, 401, 403, 404, 422}
 
@@ -420,7 +497,14 @@ def normalize_atom(atom: dict, source_raw: dict) -> dict | None:
     if mem_type not in ("inner", "outer"):
         mem_type = "outer"
 
-    tags = [t for t in (meta.get("tag") or []) if isinstance(t, str) and t.strip()]
+    tags: list[str] = []
+    for tag in meta.get("tag") or []:
+        if isinstance(tag, str) and tag.strip():
+            tags.append(tag)
+        elif isinstance(tag, dict):
+            key, value = tag.get("key"), tag.get("value")
+            if isinstance(key, str) and isinstance(value, str) and key and value:
+                tags.append(f"{key}:{value}")
     if not any(t.startswith("speaker:") for t in tags):
         # 兜底：继承源 raw memory 的 speaker 标签
         tags = [t for t in source_raw["metadata"].get("tag", []) if t.startswith("speaker:")] + tags
@@ -450,6 +534,28 @@ def assign_ids(atoms: list[dict], raw_id: str, counter: int) -> int:
         counter += 1
         atom["metadata"]["id"] = f"{raw_id}_{counter}"
     return counter
+
+
+def deduplicate_atoms(atoms: list[dict]) -> list[dict]:
+    """移除同一 raw 输出中的重复原子记忆，保留首次出现的记录。"""
+    unique: list[dict] = []
+    seen: set[str] = set()
+    for atom in atoms:
+        metadata = atom["metadata"]
+        key = json.dumps(
+            {
+                "memory": atom["memory"],
+                "type": metadata.get("type"),
+                "time": metadata.get("time"),
+                "tag": metadata.get("tag", []),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(atom)
+    return unique
 
 
 def finalize_atom(atom: dict) -> dict:
@@ -505,7 +611,7 @@ async def process_index(
 def resolve_dir(target: str) -> Path:
     """把参数解析为 speaker 目录，兼容裸目录名、相对路径与绝对路径。"""
     path = Path(target)
-    if path.is_dir() and (path / "memory.jsonl").exists():
+    if path.is_dir() and ((path / "msgmem.jsonl").exists() or (path / "memory.jsonl").exists()):
         return path
     candidate = DATA_DIR / target
     if candidate.is_dir():
@@ -513,26 +619,74 @@ def resolve_dir(target: str) -> Path:
     return path
 
 
-async def process_dir(client: openai.AsyncOpenAI, config: dict, dir_name: str, limit: int | None) -> None:
+async def process_dir(
+    client: openai.AsyncOpenAI,
+    config: dict,
+    dir_name: str,
+    limit: int | None,
+    resume: bool,
+) -> None:
     directory = resolve_dir(dir_name)
     label = directory.name
-    memory_file = directory / "memory.jsonl"
-    backup_file = directory / "raw_memory.jsonl"
-    if not memory_file.exists():
-        print(f"[skip] {label}: no memory.jsonl")
+    msgmem_file = directory / "msgmem.jsonl"
+    atom_file = directory / "atommem.jsonl"
+    done_file = directory / "atommem.done.json"
+    source_file = msgmem_file if msgmem_file.exists() else directory / "memory.jsonl"
+    if not source_file.exists():
+        print(f"[skip] {label}: no msgmem.jsonl")
         return
 
-    existing = read_jsonl(memory_file)
-    raws = [item for item in existing if item["metadata"].get("type") == "raw"]
+    source_records = read_jsonl(source_file)
+    all_raws, embedded_atoms = split_memory_records(source_records)
+    if not all_raws:
+        print(f"[skip] {label}: no raw memory in msgmem.jsonl")
+        return
+
+    # 兼容之前写入 memory.jsonl 的 atom：读取但不再修改原始 memory.jsonl。
+    existing_atoms: list[dict] = list(embedded_atoms)
+    if atom_file.exists():
+        _, stored_atoms = split_memory_records(read_jsonl(atom_file))
+        existing_atoms.extend(stored_atoms)
+
+    raw_order = [raw["metadata"]["id"] for raw in all_raws]
+    raws = all_raws
     if limit is not None:
         raws = raws[:limit]
     if not raws:
         print(f"[skip] {label}: no raw memory")
         return
 
-    # 备份原始 raw 记录（只在首次覆盖前备份）
-    if not backup_file.exists():
-        shutil.copy2(memory_file, backup_file)
+    completed_ids: set[str] = set()
+    completed_ids.update(
+        source_id
+        for atom in existing_atoms
+        for source_id in _source_ids(atom)
+    )
+    if resume and done_file.exists():
+        try:
+            saved_ids = json.loads(done_file.read_text(encoding="utf-8"))
+            if isinstance(saved_ids, list):
+                completed_ids.update(item for item in saved_ids if isinstance(item, str))
+        except (OSError, json.JSONDecodeError):
+            print(f"[warn] {label}: invalid {done_file.name}, rebuilding resume state")
+
+    # 非 resume 模式重跑指定 raw 时先移除旧 atom，避免重复累积。
+    selected_ids = {raw["metadata"]["id"] for raw in raws}
+    if not resume:
+        existing_atoms = [atom for atom in existing_atoms if not _source_ids(atom) & selected_ids]
+        completed_ids.difference_update(selected_ids)
+    write_jsonl(atom_file, existing_atoms)
+
+    pending_indices = [
+        index for index, raw in enumerate(raws)
+        if raw["metadata"]["id"] not in completed_ids
+    ]
+    skipped = len(raws) - len(pending_indices)
+    if resume:
+        print(f"[resume] {skipped} 条已完成，{len(pending_indices)} 条待处理")
+    if not pending_indices:
+        print(f"[skip] {label}: 全部 raw 已完成")
+        return
 
     window = int(config["context_window"])
     system_prompt = ATOM_EXTRACTION_SYSTEM_PROMPT.replace("{{SCHEMA}}", build_schema_prompt(load_template()))
@@ -540,14 +694,15 @@ async def process_dir(client: openai.AsyncOpenAI, config: dict, dir_name: str, l
     semaphore = asyncio.Semaphore(int(config["concurrency"]))
 
     print(f"[run ] {label}: {len(raws)} raw messages, concurrency={config['concurrency']}, window={window}")
-    print(f"[info] 实时追加到 {memory_file}")
+    print(f"[info] 实时追加到 {atom_file}")
 
     tasks = [
         asyncio.create_task(
             process_index(client, config, semaphore, system_prompt, raws, i, window)
         )
-        for i in range(len(raws))
+        for i in pending_indices
     ]
+    print(f"[info] submitted {len(tasks)} requests to {config['model']}")
 
     results: dict[int, list[dict]] = {}
     errors: list[str] = []
@@ -558,26 +713,38 @@ async def process_dir(client: openai.AsyncOpenAI, config: dict, dir_name: str, l
         done += 1
         if error:
             errors.append(f"{raws[index]['metadata']['id']}: {error}")
+            print(f"[error] {raws[index]['metadata']['id']}: {error}")
         else:
             results[index] = atoms
-            # 实时处理并追加这条 raw 的原子记忆到 memory.jsonl
+            # 实时处理并追加这条 raw 的原子记忆到 atommem.jsonl
             raw = raws[index]
             raw_id = raw["metadata"]["id"]
             normalized = [normalize_atom(a, raw) for a in atoms]
             normalized = [a for a in normalized if a]
+            normalized = deduplicate_atoms(normalized)
             assign_ids(normalized, raw_id, 0)
             finalized = [finalize_atom(a) for a in normalized]
-            # 实时追加到 memory.jsonl
-            with memory_file.open("a", encoding="utf-8") as f:
-                for atom in finalized:
-                    f.write(json.dumps(atom, ensure_ascii=False) + "\n")
+            # 实时追加到 atommem.jsonl
+            append_jsonl(atom_file, finalized)
             atom_count += len(finalized)
+            completed_ids.add(raw_id)
+            done_file.write_text(
+                json.dumps(sorted(completed_ids), ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            if not finalized:
+                print(f"[empty] {raws[index]['metadata']['id']}: no atom extracted")
         if done % 20 == 0 or done == len(raws):
             print(f"        {done}/{len(raws)} messages processed, {atom_count} atoms written")
 
+    # 并发请求按完成顺序追加，全部完成后恢复会话顺序。
+    sorted_records = sort_memory_records(read_jsonl(atom_file), raw_order)
+    write_jsonl(atom_file, sorted_records)
+    print(f"[sort] {label}: {len(sorted_records)} atom records ordered by raw conversation")
+
     print(
         f"[done] {label}: {atom_count} atoms from {len(raws)} messages; "
-        f"raw backup -> {backup_file.name}"
+        f"atom output -> {atom_file.name}"
     )
     if errors:
         error_file = directory / "atom_errors.log"
@@ -585,11 +752,15 @@ async def process_dir(client: openai.AsyncOpenAI, config: dict, dir_name: str, l
         print(f"[warn] {label}: {len(errors)} failed message(s) -> {error_file.name}")
 
 
-async def run(config: dict, targets: list[str], limit: int | None) -> None:
+async def run(config: dict, targets: list[str], limit: int | None, resume: bool) -> None:
     if targets:
         dir_names = targets
     else:
-        dir_names = sorted(p.name for p in DATA_DIR.iterdir() if (p / "memory.jsonl").exists())
+        dir_names = sorted(
+            p.name
+            for p in DATA_DIR.iterdir()
+            if (p / "msgmem.jsonl").exists() or (p / "memory.jsonl").exists()
+        )
 
     client = openai.AsyncOpenAI(
         base_url=config["base_url"],
@@ -599,7 +770,7 @@ async def run(config: dict, targets: list[str], limit: int | None) -> None:
     )
     try:
         for dir_name in dir_names:
-            await process_dir(client, config, dir_name, limit)
+            await process_dir(client, config, dir_name, limit, resume)
     finally:
         await client.close()
 
@@ -610,6 +781,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None, help="每个目录只处理前 N 条 raw（调试用）")
     parser.add_argument("--concurrency", type=int, default=None, help="覆盖配置里的并发数")
     parser.add_argument("--context-window", type=int, default=None, help="覆盖配置里的上下文窗口大小")
+    parser.add_argument("--resume", action="store_true", help="跳过已完成的 raw，只重试失败或未完成项")
     return parser.parse_args(argv)
 
 
@@ -620,7 +792,7 @@ def main() -> None:
         config["concurrency"] = args.concurrency
     if args.context_window is not None:
         config["context_window"] = args.context_window
-    asyncio.run(run(config, args.dirs, args.limit))
+    asyncio.run(run(config, args.dirs, args.limit, args.resume))
 
 
 if __name__ == "__main__":

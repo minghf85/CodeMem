@@ -5,7 +5,7 @@
     - chosen   : 由较强的模型（configs/model.yaml 里的 dpo.strong）+ 完整 prompt 生成
     - rejected : 由待训练的小模型（dpo.weak）+ 简化 prompt 生成；若重试后仍无法解析出
                  合法 JSON，则保留其原始输出作为负样本（这正是 DPO 要抑制的行为）
-    - messages : 存小模型实际使用的简化 prompt，使训练分布与部署时一致
+    - messages : 存强模型使用的完整 prompt，使训练输入遵循部署时的完整规则
 强模型用完整 prompt，小模型用简化 prompt（prompts.WEAK_ATOM_EXTRACTION_SYSTEM_PROMPT）。
 
 输出 JSONL，每行一条（TRL / LLaMA-Factory 兼容的 messages 格式）：
@@ -54,6 +54,7 @@ DEFAULT_DPO_CONFIG: dict[str, Any] = {
     "max_backoff": 120.0,
     "backoff_jitter": 0.5,
     "context_window": 4,
+    "enable_thinking": False,
     "output": "data/dpo/atom_dpo.jsonl",
     "error_log": "data/dpo/atom_dpo_errors.log",
 }
@@ -84,6 +85,7 @@ def _model_config(dpo_config: dict, which: str) -> dict:
         "api_key": profile.get("api_key", ""),
         "model": profile.get("model", ""),
         "temperature": profile.get("temperature", 0.2),
+        "enable_thinking": dpo_config.get("enable_thinking", False),
     }
     for key in ("max_tokens", "timeout", "max_retries", "backoff_base",
                 "rate_limit_backoff", "max_backoff", "backoff_jitter"):
@@ -142,7 +144,7 @@ async def build_pair(
 
     - chosen  : 强模型 + 完整 prompt
     - rejected: 小模型 + 简化 prompt；若重试后仍解析失败，保留其原始输出作为负样本
-    - messages: 存小模型实际使用的简化 prompt（与部署时一致）
+    - messages: 存强模型使用的完整 prompt，作为训练时的输入 prompt
     强/弱模型各自用自己的并发信号量。
     """
     raw_id = raws[index]["metadata"]["id"]
@@ -168,7 +170,7 @@ async def build_pair(
     weak_failed = rejected is None or not _valid_json(rejected)
 
     return {
-        "messages": weak_messages,
+        "messages": strong_messages,
         "chosen": chosen.strip(),
         "rejected": (rejected or "").strip(),
         "meta": {
@@ -199,12 +201,14 @@ async def process_dir(
 ) -> tuple[list[dict], list[str]]:
     directory = atommem.resolve_dir(dir_name)
     label = directory.name
-    memory_file = directory / "memory.jsonl"
-    if not memory_file.exists():
-        print(f"[skip] {label}: no memory.jsonl")
+    msgmem_file = directory / "msgmem.jsonl"
+    legacy_memory_file = directory / "memory.jsonl"
+    source_file = msgmem_file if msgmem_file.exists() else legacy_memory_file
+    if not source_file.exists():
+        print(f"[skip] {label}: no msgmem.jsonl")
         return [], []
 
-    existing = atommem.read_jsonl(memory_file)
+    existing = atommem.read_jsonl(source_file)
     raws = [item for item in existing if item["metadata"].get("type") == "raw"]
     if limit is not None:
         raws = raws[:limit]
@@ -247,6 +251,7 @@ async def process_dir(
 
     samples: list[dict] = []
     errors: list[str] = []
+    filtered_identical = 0
     done = 0
     for coro in asyncio.as_completed(tasks):
         sample, error = await coro
@@ -255,14 +260,22 @@ async def process_dir(
             errors.append(error)
         elif sample:
             sample["meta"]["dir"] = label
-            samples.append(sample)
             # 实时追加：每生成一条就立即写入到 output
             kept = _filter_identical([sample], include_identical)
             if kept:
+                samples.append(sample)
                 _append_jsonl(output, kept)
                 done_keys.add((sample["meta"]["dir"], sample["meta"]["id"]))
+            else:
+                filtered_identical += 1
         if done % 20 == 0 or done == len(pending):
             print(f"        {done}/{len(pending)} pairs processed, {len(samples)} written")
+
+    if filtered_identical:
+        print(
+            f"[skip] {label}: {filtered_identical} 条 chosen/rejected 相同，"
+            "未写入（如需保留请使用 --include-identical）"
+        )
 
     # 保持原始顺序（用于返回统计信息）
     order = {r["metadata"]["id"]: i for i, r in enumerate(raws)}
@@ -281,11 +294,14 @@ def _append_jsonl(path: Path, items: list[dict]) -> None:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
-def _load_done_keys(path: Path) -> tuple[set[tuple[str, str]], list[dict]]:
+def _load_done_keys(
+    path: Path, expected_models: tuple[str, str] | None = None
+) -> tuple[set[tuple[str, str]], list[dict]]:
     """读取已有输出，返回 (已生成样本的 (dir, id) 集合, 已有样本列表)。
 
     注意：message id 只在单个 speaker 目录内唯一（不同目录都有 session_1_1），
     因此 resume 去重必须以 (dir, id) 为键。
+    如果提供 expected_models，则要求已有样本全部由同一 strong/weak 模型对生成。
     """
     if not path.exists():
         return set(), []
@@ -306,6 +322,15 @@ def _load_done_keys(path: Path) -> tuple[set[tuple[str, str]], list[dict]]:
             sdir = meta.get("dir")
             if sid and sdir:
                 keys.add((sdir, sid))
+            if expected_models is not None:
+                actual_models = (meta.get("chosen_model"), meta.get("rejected_model"))
+                if actual_models != expected_models:
+                    raise ValueError(
+                        "已有 DPO 数据的模型与当前配置不一致："
+                        f"已有 strong={actual_models[0]!r}, weak={actual_models[1]!r}; "
+                        f"当前 strong={expected_models[0]!r}, weak={expected_models[1]!r}。"
+                        "请更换输出文件，或使用与已有数据一致的模型配置。"
+                    )
     return keys, existing
 
 
@@ -314,7 +339,11 @@ async def run(dpo_config: dict, targets: list[str], limit: int | None,
     if targets:
         dir_names = targets
     else:
-        dir_names = sorted(p.name for p in DATA_DIR.iterdir() if (p / "memory.jsonl").exists())
+        dir_names = sorted(
+            p.name
+            for p in DATA_DIR.iterdir()
+            if (p / "msgmem.jsonl").exists() or (p / "memory.jsonl").exists()
+        )
 
     strong_config = _model_config(dpo_config, "strong")
     weak_config = _model_config(dpo_config, "weak")
@@ -331,7 +360,8 @@ async def run(dpo_config: dict, targets: list[str], limit: int | None,
     done_keys: set[tuple[str, str]] = set()
     existing_samples: list[dict] = []
     if resume:
-        done_keys, existing_samples = _load_done_keys(output)
+        expected_models = (strong_config["model"], weak_config["model"])
+        done_keys, existing_samples = _load_done_keys(output, expected_models)
         print(f"[resume] 已有 {len(done_keys)} 条样本，将跳过这些 message")
     else:
         # 非 resume 模式：清空旧输出，从头生成
