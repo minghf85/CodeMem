@@ -132,3 +132,152 @@ Field definitions:
 
 IMPORTANT: Sometimes you will receive input that is confusing, contradictory, or has missing information. In those cases, do your best to still extract atoms. If you cannot extract any reasonable atoms, output a single atom with memory set to "No clear facts extracted." and metadata type "outer". Never refuse to output JSON. Never ask clarifying questions. Always produce a valid JSON object.
 """
+
+ANSWER_PROMPT = """
+Prompt template: memory-grounded question answering
+
+You are an intelligent memory assistant tasked with retrieving accurate information from conversation memories.
+
+# CONTEXT:
+You have access to memories from two speakers in a conversation. These memories contain timestamped information that may be relevant to answering the question.
+
+# INSTRUCTIONS:
+1. Carefully analyze all provided memories from both speakers
+2. Pay special attention to the timestamps to determine the answer
+3. If the question asks about a specific event or fact, look for direct evidence in the memories
+4. If the memories contain contradictory information, prioritize the most recent memory
+5. If there is a question about time references (like "last year", "two months ago", etc.), calculate the actual date based on the memory timestamp. For example, if a memory from 4 May 2022 mentions "went to India last year," then the trip occurred in 2021.
+6. Always convert relative time references to specific dates, months, or years. For example, convert "last year" to "2022" or "two months ago" to "March 2023" based on the memory timestamp. Ignore the reference while answering the question.
+7. Focus only on the content of the memories from both speakers. Do not confuse character names mentioned in memories with the actual users who created those memories.
+8. If memories are insufficient and the question is about a general world fact, you may use reliable general world knowledge.
+9. Keep the final answer concise, typically no more than 10-12 words; do not omit essential entities or dates.
+
+# APPROACH (Think step by step):
+1. First, examine all memories that contain information related to the question
+2. Examine the timestamps and content of these memories carefully
+3. Look for explicit mentions of dates, times, locations, or events that answer the question
+4. If the answer requires calculation (e.g., converting relative time references), show your work
+5. Formulate a precise, concise answer based on the evidence in the memories, using general world knowledge only if memories are insufficient
+6. Double-check that your answer directly addresses the question asked
+7. Ensure your final answer is specific and avoids vague time references
+8. Output the final answer only in this format, with no extra text:
+   <answer>YOUR_FINAL_ANSWER</answer>
+
+Memories:
+{context}
+
+Question: {question}
+
+Answer step by step, and output the final answer in this format, with no extra text: <answer>YOUR_FINAL_ANSWER</answer>
+"""
+
+BASELINE_ANSWER_PROMPT = """
+You are an intelligent memory assistant answering a question from the complete conversation memory of two speakers.
+
+Current Date: {current_date}
+
+Instructions:
+- Analyze all supplied memories and use direct evidence whenever available.
+- Each memory includes a timestamp (YYYY-MM-DD HH:MM:SS) and speaker information - use these carefully.
+- If the question asks "when" (about time), you MUST provide a specific date, year, or time period (e.g., "2022", "May 2022", "2021-03-15"). NEVER answer with relative terms like "yesterday", "last year", "recently", "two months ago".
+- If the question asks "who" (about people), you MUST provide the specific person's name from the speaker or memory content.
+- Convert any relative time references in the memories to absolute dates using the memory timestamp and current date.
+- If memories conflict, prefer the most recent directly relevant memory.
+- Do not invent facts, infer beyond what is stated, or add extra information not present in the memories.
+- Answer concisely, normally in no more than 10-12 words, without omitting essential names, dates, or entities.
+- If the memories do not contain enough information, answer briefly that it is unknown. Use general knowledge only for genuinely general facts.
+- Output only the final answer in exactly this format: <answer>YOUR_FINAL_ANSWER</answer>
+
+Complete conversation memories (with timestamps and speakers):
+{context}
+
+Question: {question}
+"""
+
+JUDGE_PROMPT = """You are an evaluator judging whether a predicted answer correctly answers the question based on the reference answer.
+
+Question: {question}
+Reference Answer: {reference}
+Predicted Answer: {prediction}
+
+Evaluation Criteria:
+
+1. TEMPORAL ACCURACY:
+   - If the question asks "when", check if the prediction conveys the SAME point in time as the reference
+   - Absolute dates (e.g., "2022", "7 May 2023") are preferred, but relative time expressions CAN be accepted IF they can be reasonably inferred from context
+   - Example: In a conversation dated June 2023, "last year" = "2022" → ACCEPTABLE
+   - However, if NO conversation date context is available, relative times should be marked INCORRECT
+   - Key test: Would someone reading both answers agree they refer to the same time?
+
+2. CORE FACTUAL ACCURACY:
+   - The main factual claim of the prediction must match the reference
+   - Minor additions (e.g., "for vacation" added to "went to India") are ACCEPTABLE if they don't change the core fact
+   - Major additions that introduce new claims NOT in reference → INCORRECT
+   - Omission of key information from reference → INCORRECT
+
+3. ENTITY HANDLING:
+   - Pronouns (he/she/they) are ACCEPTABLE if the entity is clear from context or the question itself
+   - Naming the wrong person → INCORRECT
+   - Adding extra people not mentioned in reference → INCORRECT if it changes the answer
+
+4. SEMANTIC EQUIVALENCE:
+   - Accept reasonable paraphrasing and rephrasing
+   - Different word order, synonyms, or grammatical variations are OK
+   - The meaning must be substantially the same
+   - "studies psychology" ≈ "is studying psychology" ≈ "pursues a degree in psychology" → ACCEPTABLE
+
+5. COMPLETENESS:
+   - The prediction must cover all ESSENTIAL parts of the reference answer
+   - Non-essential elaborations or stylistic differences are acceptable
+   - A prediction that is a SUBSET of the reference (missing key facts) → INCORRECT
+
+Decision Rules:
+- When in doubt about temporal alignment, mark INCORRECT
+- For all other criteria, lean towards ACCEPTANCE if the core answer is clearly present
+- A prediction that adds reasonable, non-contradictory context around the correct answer should generally be accepted
+
+Examples:
+- Q: "When did Melanie paint a sunrise?" | Ref: "2022" | Pred: "last year" 
+  → Depends on context. With conversation date=2023: CORRECT. Without context: INCORRECT
+
+- Q: "When did Melanie paint a sunrise?" | Ref: "2022" | Pred: "Melanie painted the sunrise last year."
+  → Same as above. Context-dependent.
+
+- Q: "When did Melanie paint a sunrise?" | Ref: "2022" | Pred: "In 2022" → CORRECT
+
+- Q: "What did Caroline research?" | Ref: "Adoption agencies" | Pred: "Adoption agencies and career options"
+  → INCORRECT if "career options" is not supported by evidence. But if evidence supports both, could be CORRECT.
+
+- Q: "Where did they go?" | Ref: "Paris" | Pred: "They went to Paris for vacation"
+  → CORRECT. Core fact preserved, minor addition doesn't contradict.
+
+- Q: "Who went to Paris?" | Ref: "John" | Pred: "He went there" 
+  → CORRECT if question context makes clear "he" refers to John. INCORRECT if ambiguous.
+
+- Q: "Where has Melanie camped?" | Ref: "beach, mountains, forest" | Pred: "beach and mountains"
+  → INCORRECT. Missing "forest" is a key omission.
+
+Output format:
+<judgement>CORRECT</judgement> or <judgement>INCORRECT</judgement>
+<reason>Brief explanation of why, referencing specific criteria</reason>"""
+RAG_ANSWER_PROMPT = """
+You are an intelligent memory assistant answering a question from retrieved conversation memories.
+
+Current Date: {current_date}
+
+Instructions:
+- Treat the retrieved memories below as the only evidence for the answer.
+- Each memory includes a timestamp (YYYY-MM-DD HH:MM:SS) and speaker information - use these carefully.
+- If the question asks "when" (about time), you MUST provide a specific date, year, or time period (e.g., "2022", "May 2022", "2021-03-15"). NEVER answer with relative terms like "yesterday", "last year", "recently", "two months ago".
+- If the question asks "who" (about people), you MUST provide the specific person's name from the speaker or memory content.
+- Convert any relative time references in the memories to absolute dates using the memory timestamp and current date.
+- Do not invent facts, infer beyond what is stated, or add extra information not present in the memories.
+- Answer concisely, normally in no more than 10-12 words, without omitting essential names, dates, or entities.
+- If the retrieved memories do not support an answer, answer briefly that it is unknown.
+- Output only the final answer in exactly this format: <answer>YOUR_FINAL_ANSWER</answer>
+
+Retrieved memories (with timestamps and speakers):
+{context}
+
+Question: {question}
+"""
