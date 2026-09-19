@@ -10,12 +10,13 @@
       "values": ["inner", "outer"]
     },
     "time": {
-      "description": "[YOU] Temporal scope. Always include temporal information if present in the fact; do NOT drop dates, durations, or relative times. Prefer absolute time when resolvable from context (e.g. 'in 2018' not 'five years ago' if the session year is known). Use ISO 8601. For ranges, use 'YYYY-MM-DD/YYYY-MM-DD'. If completely unknown or no need to use time to describe, use empty string ''. Only to the exact unit of time that can be confirmed.",
+      "description": "[YOU] Temporal scope. Always include temporal information if present in the fact; do NOT drop dates, durations, or relative times. Prefer absolute time when resolvable from context (e.g. 'in 2018' not 'five years ago' if the session year is known). Use ISO 8601. For ranges, use 'YYYY-MM-DD/YYYY-MM-DD'.If can not solve, use original descrptio like 'two day before Alan was born'. If completely unknown or no need to use time to describe, use empty string ''. Only to the exact unit of time that can be confirmed.",
       "type": "string",
       "examples": [
         "2026-09-14",
         "2026-09-14T10:30:00Z",
         "2026-09-01/2026-09-15",
+        "two day before Alan was born",
         ""
       ]
     },

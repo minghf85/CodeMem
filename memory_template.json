@@ -14,20 +14,23 @@
       "values": ["inner", "outer", "raw"]
     },
     "time": {
-      "description": "[YOU] Temporal scope. Single point, range, recurring pattern, or relative reference. Only to the exact unit of time that can be confirmed.",
-      "type": "string or object",
+      "description": "[YOU] Temporal scope. Always include temporal information if present in the fact; do NOT drop dates, durations, or relative times. Prefer absolute time when resolvable from context (e.g. 'in 2018' not 'five years ago' if the session year is known). Use ISO 8601. For ranges, use 'YYYY-MM-DD/YYYY-MM-DD'.If can not solve, use original descrptio like 'two day before Alan was born'. If completely unknown or no need to use time to describe, use empty string ''. Only to the exact unit of time that can be confirmed.",
+      "type": "string",
       "examples": [
+        "2026-09-14",
         "2026-09-14T10:30:00Z",
-        {"start": "2026-09-14", "end": "2026-09-16"},
-        "every weekday 9am-5pm",
-        "last_session",
-        "2026-09-14"
+        "2026-09-01/2026-09-15",
+        "two day before Alan was born",
+        ""
       ]
     },
     "tag": {
-      "description": "[YOU] Key-value labels using format 'attribute:value'. Examples: speaker:Wang, topic:work, location:London, sentiment:positive.",
+      "description": "[YOU] Array of key-value labels. MUST include at least one 'speaker:<name>'. Other tags from Tag Taxonomy: topic, entity, sentiment, action, state, relation, other. Format: 'key:value'.",
       "type": "array",
-      "items": { "type": "string", "pattern": "^[^:]+:.+$" }
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z]+:[a-zA-Z0-9_\\-]+$"
+      }
     },
     "source": {
       "description": "[YOU] IDs of source memories for provenance tracing. Empty for raw type.",
