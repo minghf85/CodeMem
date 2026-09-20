@@ -147,10 +147,23 @@ You have access to memories from two speakers in a conversation. These memories 
 3. If the question asks about a specific event or fact, look for direct evidence in the memories
 4. If the memories contain contradictory information, prioritize the most recent memory
 5. If there is a question about time references (like "last year", "two months ago", etc.), calculate the actual date based on the memory timestamp. For example, if a memory from 4 May 2022 mentions "went to India last year," then the trip occurred in 2021.
-6. Always convert relative time references to specific dates, months, or years. For example, convert "last year" to "2022" or "two months ago" to "March 2023" based on the memory timestamp. Ignore the reference while answering the question.
+6. NEVER leave a relative time expression in the final answer. Replace every relative time with the concrete date, month, or year it resolves to, computed from the timestamp of the memory that states it. For example, a memory dated 2023-05-08 saying "last year" resolves to "2022"; a memory dated 2023-05-08 saying "two months ago" resolves to "March 2023".
 7. Focus only on the content of the memories from both speakers. Do not confuse character names mentioned in memories with the actual users who created those memories.
 8. If memories are insufficient and the question is about a general world fact, you may use reliable general world knowledge.
 9. Keep the final answer concise, typically no more than 10-12 words; do not omit essential entities or dates.
+
+# GROUNDING RULES (CRITICAL):
+- Use ONLY facts stated in the memories, or clear logical consequences of them. Never invent a date, number, name, place, or detail.
+- If the memories partially support an answer, give the part that is supported and mark the missing part as unknown rather than guessing.
+- If the memories do not support an answer at all, set "answer" to null and "unsupported": true.
+
+# SPECIFICITY RULES (CRITICAL):
+- Resolve every relative time indicator into an absolute date, month, or year.
+- Resolve every pronoun and deictic reference (he, she, they, it, this, that, here, there, the other day, that time) into the concrete entity, place, or date it refers to.
+- Name every person, place, organization, and event explicitly instead of referring to them indirectly.
+- Prefer the most specific form the memories actually support, e.g. "2022" over "a couple of years ago", "Melanie" over "she", "Paris" over "there".
+- Make the answer understandable on its own, without the question or the memories.
+- If a detail cannot be resolved from the memories, do NOT invent it; either omit it or mark it unknown.
 
 # APPROACH (Think step by step):
 1. First, examine all memories that contain information related to the question
@@ -160,15 +173,26 @@ You have access to memories from two speakers in a conversation. These memories 
 5. Formulate a precise, concise answer based on the evidence in the memories, using general world knowledge only if memories are insufficient
 6. Double-check that your answer directly addresses the question asked
 7. Ensure your final answer is specific and avoids vague time references
-8. Output the final answer only in this format, with no extra text:
-   <answer>YOUR_FINAL_ANSWER</answer>
 
 Memories:
 {context}
 
 Question: {question}
 
-Answer step by step, and output the final answer in this format, with no extra text: <answer>YOUR_FINAL_ANSWER</answer>
+# OUTPUT
+CRITICAL: Your entire response must be ONLY a JSON object. No markdown fences, no explanation, no text before or after the JSON.
+
+Format:
+{{"answer": "<final answer, or null if the memories do not support one>", "unsupported": <true|false>, "reasoning": "<brief: evidence used, and how relative times/pronouns were resolved>"}}
+
+- "answer": concise and specific (normally <= 10-12 words); resolve all relative times and pronouns as described above.
+- "unsupported": true only when the memories do not support any answer; then "answer" must be null.
+- "reasoning": one or two short sentences, used for auditing only.
+
+Example (memory dated 2023-05-08: "Melanie went to India last year"):
+{{"answer": "2022", "unsupported": false, "reasoning": "Memory dated 2023-05-08 says Melanie went to India last year, which resolves to 2022."}}
+
+REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing else.
 """
 
 BASELINE_ANSWER_PROMPT = """
@@ -182,16 +206,83 @@ Instructions:
 - If the question asks "when" (about time), you MUST provide a specific date, year, or time period (e.g., "2022", "May 2022", "2021-03-15"). NEVER answer with relative terms like "yesterday", "last year", "recently", "two months ago".
 - If the question asks "who" (about people), you MUST provide the specific person's name from the speaker or memory content.
 - Convert any relative time references in the memories to absolute dates using the memory timestamp and current date.
-- If memories conflict, prefer the most recent directly relevant memory.
 - Do not invent facts, infer beyond what is stated, or add extra information not present in the memories.
 - Answer concisely, normally in no more than 10-12 words, without omitting essential names, dates, or entities.
 - If the memories do not contain enough information, answer briefly that it is unknown. Use general knowledge only for genuinely general facts.
-- Output only the final answer in exactly this format: <answer>YOUR_FINAL_ANSWER</answer>
+
+# GROUNDING RULES (CRITICAL):
+- Use ONLY facts stated in the memories, or clear logical consequences of them. Never invent a date, number, name, place, or detail.
+- If the memories partially support an answer, give the supported part and mark the missing part as unknown.
+- If the memories do not support an answer at all, set "answer" to null and "unsupported": true.
+
+# SPECIFICITY RULES (CRITICAL):
+- Replace every relative time expression (yesterday, last year, recently, two months ago, the other day) with the absolute date, month, or year it resolves to from the memory timestamp and current date.
+- Replace every pronoun and deictic reference (he, she, they, it, this, that, here, there) with the concrete entity, place, or date it refers to.
+- Name every person, place, organization, and event explicitly.
+- Make the answer understandable on its own, without the question or the memories.
+- Prefer the most specific form the memories actually support; if a detail cannot be resolved, do NOT invent it.
 
 Complete conversation memories (with timestamps and speakers):
 {context}
 
 Question: {question}
+
+# OUTPUT
+CRITICAL: Your entire response must be ONLY a JSON object. No markdown fences, no explanation, no text before or after the JSON.
+
+Format:
+{{"answer": "<final answer, or null if the memories do not support one>", "unsupported": <true|false>, "reasoning": "<brief: evidence used, and how relative times/pronouns were resolved>"}}
+
+- "answer": concise and specific (normally <= 10-12 words); resolve all relative times and pronouns as described above.
+- "unsupported": true only when the memories do not contain enough information; then "answer" must be null.
+- "reasoning": one or two short sentences, used for auditing only.
+
+REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing else.
+"""
+
+RAG_ANSWER_PROMPT = """
+You are an intelligent memory assistant answering a question from retrieved conversation memories.
+
+Current Date: {current_date}
+
+Instructions:
+- Treat the retrieved memories below as the only evidence for the answer.
+- Each memory includes a timestamp (YYYY-MM-DD HH:MM:SS) and speaker information - use these carefully.
+- If the question asks "when" (about time), you MUST provide a specific date, year, or time period (e.g., "2022", "May 2022", "2021-03-15"). NEVER answer with relative terms like "yesterday", "last year", "recently", "two months ago".
+- If the question asks "who" (about people), you MUST provide the specific person's name from the speaker or memory content.
+- Convert any relative time references in the memories to absolute dates using the memory timestamp and current date.
+- Do not invent facts, infer beyond what is stated, or add extra information not present in the memories.
+- Answer concisely, normally in no more than 10-12 words, without omitting essential names, dates, or entities.
+- If the retrieved memories do not support an answer, answer briefly that it is unknown.
+
+# GROUNDING RULES (CRITICAL):
+- Use ONLY facts stated in the retrieved memories, or clear logical consequences of them. Never invent a date, number, name, place, or detail.
+- If the retrieved memories partially support an answer, give the supported part and mark the missing part as unknown.
+- If the retrieved memories do not support an answer at all, set "answer" to null and "unsupported": true.
+
+# SPECIFICITY RULES (CRITICAL):
+- Replace every relative time expression (yesterday, last year, recently, two months ago, the other day) with the absolute date, month, or year it resolves to from the memory timestamp and current date.
+- Replace every pronoun and deictic reference (he, she, they, it, this, that, here, there) with the concrete entity, place, or date it refers to.
+- Name every person, place, organization, and event explicitly.
+- Make the answer understandable on its own, without the question or the retrieved memories.
+- Prefer the most specific form the memories actually support; if a detail cannot be resolved, do NOT invent it.
+
+Retrieved memories (with timestamps and speakers):
+{context}
+
+Question: {question}
+
+# OUTPUT
+CRITICAL: Your entire response must be ONLY a JSON object. No markdown fences, no explanation, no text before or after the JSON.
+
+Format:
+{{"answer": "<final answer, or null if the retrieved memories do not support one>", "unsupported": <true|false>, "reasoning": "<brief: evidence used, and how relative times/pronouns were resolved>"}}
+
+- "answer": concise and specific (normally <= 10-12 words); resolve all relative times and pronouns as described above.
+- "unsupported": true only when the retrieved memories do not support an answer; then "answer" must be null.
+- "reasoning": one or two short sentences, used for auditing only.
+
+REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing else.
 """
 
 JUDGE_PROMPT = """You are an evaluator judging whether a predicted answer correctly answers the question based on the reference answer.
@@ -237,7 +328,7 @@ Decision Rules:
 - A prediction that adds reasonable, non-contradictory context around the correct answer should generally be accepted
 
 Examples:
-- Q: "When did Melanie paint a sunrise?" | Ref: "2022" | Pred: "last year" 
+- Q: "When did Melanie paint a sunrise?" | Ref: "2022" | Pred: "last year"
   → Depends on context. With conversation date=2023: CORRECT. Without context: INCORRECT
 
 - Q: "When did Melanie paint a sunrise?" | Ref: "2022" | Pred: "Melanie painted the sunrise last year."
@@ -251,33 +342,20 @@ Examples:
 - Q: "Where did they go?" | Ref: "Paris" | Pred: "They went to Paris for vacation"
   → CORRECT. Core fact preserved, minor addition doesn't contradict.
 
-- Q: "Who went to Paris?" | Ref: "John" | Pred: "He went there" 
+- Q: "Who went to Paris?" | Ref: "John" | Pred: "He went there"
   → CORRECT if question context makes clear "he" refers to John. INCORRECT if ambiguous.
 
 - Q: "Where has Melanie camped?" | Ref: "beach, mountains, forest" | Pred: "beach and mountains"
   → INCORRECT. Missing "forest" is a key omission.
 
-Output format:
-<judgement>CORRECT</judgement> or <judgement>INCORRECT</judgement>
-<reason>Brief explanation of why, referencing specific criteria</reason>"""
-RAG_ANSWER_PROMPT = """
-You are an intelligent memory assistant answering a question from retrieved conversation memories.
+# OUTPUT
+CRITICAL: Your entire response must be ONLY a JSON object. No markdown fences, no explanation, no text before or after the JSON.
 
-Current Date: {current_date}
+Format:
+{{"label": "CORRECT" | "INCORRECT", "reason": "<brief explanation, referencing the specific criteria above>"}}
 
-Instructions:
-- Treat the retrieved memories below as the only evidence for the answer.
-- Each memory includes a timestamp (YYYY-MM-DD HH:MM:SS) and speaker information - use these carefully.
-- If the question asks "when" (about time), you MUST provide a specific date, year, or time period (e.g., "2022", "May 2022", "2021-03-15"). NEVER answer with relative terms like "yesterday", "last year", "recently", "two months ago".
-- If the question asks "who" (about people), you MUST provide the specific person's name from the speaker or memory content.
-- Convert any relative time references in the memories to absolute dates using the memory timestamp and current date.
-- Do not invent facts, infer beyond what is stated, or add extra information not present in the memories.
-- Answer concisely, normally in no more than 10-12 words, without omitting essential names, dates, or entities.
-- If the retrieved memories do not support an answer, answer briefly that it is unknown.
-- Output only the final answer in exactly this format: <answer>YOUR_FINAL_ANSWER</answer>
+- "label" must be exactly "CORRECT" or "INCORRECT" (uppercase).
+- When the prediction is a JSON object, judge its "answer" field; a null answer with "unsupported": true counts as "unknown" and is INCORRECT when the reference answer is known.
+- "reason": one or two short sentences naming the criteria that decided the verdict.
 
-Retrieved memories (with timestamps and speakers):
-{context}
-
-Question: {question}
-"""
+REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing else."""

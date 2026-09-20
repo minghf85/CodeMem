@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -66,7 +67,11 @@ def load_msgmem(sample: dict[str, Any]) -> list[dict[str, Any]]:
     Returns list of memory items from msgmem.jsonl file.
     """
     dir_name = sample_dir(sample)
-    msgmem_path = PROJECT_ROOT / "data" / dir_name / "msgmem.jsonl"
+    directory = PROJECT_ROOT / "data" / dir_name
+    msgmem_path = directory / "msgmem.jsonl"
+    if not msgmem_path.exists():
+        # 兼容旧命名：部分目录仍是 memory.jsonl
+        msgmem_path = directory / "memory.jsonl"
 
     if not msgmem_path.exists():
         # Fallback: return empty list if file doesn't exist
@@ -313,8 +318,99 @@ def build_answer_messages(
             "role": "system",
             "content": prompt.format(question=question, context=context, current_date=current_date),
         },
-        {"role": "user", "content": "Return the answer now."},
+        {"role": "user", "content": "Return the answer now, as the JSON object described above."},
     ]
+
+
+def build_answer_prompt(
+    question: str,
+    context: str,
+    prompt: str = ANSWER_PROMPT,
+    current_date: str | None = None,
+) -> str:
+    """Render the answer prompt into a single string (for logging or debugging)."""
+    if current_date is None:
+        current_date = datetime.now().strftime("%Y-%m-%d")
+    return prompt.format(question=question, context=context, current_date=current_date)
+
+
+def parse_answer_output(text: str) -> dict[str, Any]:
+    """Parse a model answer response into a unified dict.
+
+    The answer prompts emit ``{"answer": ..., "unsupported": ..., "reasoning": ...}``.
+    Older or fallback responses may instead use ``<answer>...</answer>`` tags, or plain
+    prose. Returns a dict with at least:
+    - answer: str | None (None means the memories did not support an answer)
+    - unsupported: bool
+    - reasoning: str
+    - raw: the original model output
+    """
+    raw = text or ""
+    parsed = _parse_answer_json(raw)
+    if parsed is not None:
+        return _normalize_answer_dict(parsed, raw)
+
+    # Fallback 1: legacy <answer>...</answer> tag
+    tag_match = re.search(r"<answer>\s*(.*?)\s*</answer>", raw, re.DOTALL | re.IGNORECASE)
+    if tag_match:
+        answer = tag_match.group(1).strip()
+        return _normalize_answer_dict({"answer": answer}, raw)
+
+    # Fallback 2: treated as plain text; strip any stray tags/fences
+    cleaned = raw.strip().strip("`").strip()
+    return _normalize_answer_dict({"answer": cleaned}, raw)
+
+
+def _parse_answer_json(raw: str) -> dict[str, Any] | None:
+    """Best-effort extraction of the answer JSON object from a model response."""
+    if not raw.strip():
+        return None
+    candidate = raw.strip()
+    # Strip markdown fences.
+    fence = re.match(r"^```[a-zA-Z]*\s*(.*?)\s*```$", candidate, re.DOTALL)
+    if fence:
+        candidate = fence.group(1).strip()
+    for text in (candidate, atommem._repair_json(candidate)):
+        try:
+            value = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            return {"answer": value}
+    # Last resort: grab the outermost {...} block.
+    start, end = candidate.find("{"), candidate.rfind("}")
+    if 0 <= start < end:
+        block = candidate[start : end + 1]
+        for text in (block, atommem._repair_json(block)):
+            try:
+                value = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(value, dict):
+                return value
+    return None
+
+
+def _normalize_answer_dict(parsed: dict[str, Any], raw: str) -> dict[str, Any]:
+    answer = parsed.get("answer", parsed.get("prediction", parsed.get("final_answer")))
+    if isinstance(answer, str):
+        answer = answer.strip()
+    if answer == "":
+        answer = None
+    unsupported = parsed.get("unsupported")
+    if not isinstance(unsupported, bool):
+        unsupported = answer is None
+    reasoning = parsed.get("reasoning", parsed.get("reason", parsed.get("explanation", "")))
+    if not isinstance(reasoning, str):
+        reasoning = str(reasoning)
+    return {
+        "answer": answer,
+        "unsupported": bool(unsupported),
+        "reasoning": reasoning.strip(),
+        "raw": raw,
+    }
 
 
 async def complete(messages: list[dict[str, str]], config: dict[str, Any]) -> str:
@@ -381,6 +477,24 @@ def retrieve_by_embedding(
     return [item for _, item in sorted(scored, key=lambda pair: pair[0], reverse=True)[:top_k]]
 
 
+def interleave_retrieved(
+    first: list[dict[str, Any]], second: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Merge two similarity-sorted retrieval lists into one, preserving rank order.
+
+    Both inputs are assumed to be ordered best-first. Interleaving keeps each list's
+    own ranking intact while avoiding a positional bias that concatenating (all of A
+    then all of B) would introduce in the merged context.
+    """
+    merged: list[dict[str, Any]] = []
+    for index in range(max(len(first), len(second))):
+        if index < len(first):
+            merged.append(first[index])
+        if index < len(second):
+            merged.append(second[index])
+    return merged
+
+
 async def retrieve_by_embedding_async(
     query: str,
     memories: list[dict[str, Any]],
@@ -388,18 +502,6 @@ async def retrieve_by_embedding_async(
     top_k: int,
     embedding_client: Any,
 ) -> list[dict[str, Any]]:
-    """Retrieve top-k memories by embedding similarity.
-
-    Args:
-        query: The query string
-        memories: List of memory objects (from msgmem.jsonl or message dicts)
-        model_name: Embedding model name
-        top_k: Number of top results to return
-        embedding_client: OpenAI client for embeddings
-
-    Returns:
-        List of top-k memory objects sorted by similarity
-    """
     # Extract text from memory objects - handle both memory format and message format
     texts = []
     for item in memories:

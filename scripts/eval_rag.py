@@ -20,7 +20,7 @@ if str(SRC_DIR) not in sys.path:
 from codemem.eval_utils import (  # type: ignore[import-not-found]  # noqa: E402
     DATA_FILE, DEFAULT_LLM_CONFIG, build_answer_messages, complete_with_client,
     evidence_to_ids, format_memories_with_metadata, get_conversation_date_context,
-    load_msgmem, load_samples, load_yaml_config, reference_answer,
+    load_msgmem, load_samples, load_yaml_config, parse_answer_output, reference_answer,
     retrieve_by_embedding_async, sample_dir, resolve_run_paths,
 )
 from codemem.judge import judge_answer_async  # type: ignore[import-not-found]  # noqa: E402
@@ -145,11 +145,12 @@ async def async_main(args: argparse.Namespace) -> None:
         # Format retrieved memories with metadata
         retrieved_context, _ = format_memories_with_metadata(retrieved)
         async with generation_sem:
-            candidate = await complete_with_client(
+            raw_candidate = await complete_with_client(
                 generator, build_answer_messages(
                     qa["question"], retrieved_context, RAG_ANSWER_PROMPT, conversation_date
                 ), answer_config
             )
+        candidate = parse_answer_output(raw_candidate)
         reference = reference_answer(qa)
         expected_ids = evidence_to_ids(qa.get("evidence"))
         # Extract IDs from retrieved memories
@@ -162,7 +163,12 @@ async def async_main(args: argparse.Namespace) -> None:
             "sample_id": sample["sample_id"], "dir": sample_dir(sample),
             "question": qa["question"], "category": qa.get("category"), "reference": reference,
             "reference_field": "answer" if "answer" in qa else "adversarial_answer",
-            "prediction": candidate, "evidence": qa.get("evidence", []),
+            "prediction": candidate,
+            "prediction_answer": candidate["answer"],
+            "prediction_unsupported": candidate["unsupported"],
+            "prediction_reasoning": candidate["reasoning"],
+            "prediction_raw": candidate["raw"],
+            "evidence": qa.get("evidence", []),
             "evidence_ids": sorted(expected_ids), "retrieved_ids": sorted(retrieved_ids),
             "evidence_recall": evidence_recall(expected_ids, retrieved_ids),
             "exact_match": exact_match(reference, candidate), "token_f1": token_f1(reference, candidate),
@@ -172,7 +178,9 @@ async def async_main(args: argparse.Namespace) -> None:
         else:
             async with judge_sem:
                 try:
-                    result["judge"] = await judge_answer_async(judge_client, qa["question"], reference, candidate)
+                    result["judge"] = await judge_answer_async(
+                        judge_client, qa["question"], reference, candidate["answer"], candidate["unsupported"]
+                    )
                 except Exception as exc:  # noqa: BLE001
                     result["judge"] = {"label": "INCORRECT", "reason": f"judge failed: {exc}"}
         return result

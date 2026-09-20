@@ -28,6 +28,7 @@ from codemem.eval_utils import (  # type: ignore[import-not-found]  # noqa: E402
     load_msgmem,
     load_samples,
     load_yaml_config,
+    parse_answer_output,
     reference_answer,
     resolve_run_paths,
     sample_dir,
@@ -63,9 +64,10 @@ def load_existing_results(path: Path) -> tuple[list[dict], set[tuple[str, str]]]
 async def run_job(job, generator, judge, config, judge_sem, max_context_tokens):
     sample, qa, context, truncation_info, conversation_date = job
     reference = reference_answer(qa)
-    candidate = await complete_with_client(
+    raw_candidate = await complete_with_client(
         generator, build_answer_messages(qa["question"], context, BASELINE_ANSWER_PROMPT, conversation_date), config
     )
+    candidate = parse_answer_output(raw_candidate)
     result = {
         "sample_id": sample["sample_id"],
         "dir": sample_dir(sample),
@@ -74,6 +76,10 @@ async def run_job(job, generator, judge, config, judge_sem, max_context_tokens):
         "reference": reference,
         "reference_field": "answer" if "answer" in qa else "adversarial_answer",
         "prediction": candidate,
+        "prediction_answer": candidate["answer"],
+        "prediction_unsupported": candidate["unsupported"],
+        "prediction_reasoning": candidate["reasoning"],
+        "prediction_raw": candidate["raw"],
         "evidence": qa.get("evidence", []),
         "evidence_ids": sorted(evidence_to_ids(qa.get("evidence"))),
         "retrieved_ids": [],
@@ -91,7 +97,7 @@ async def run_job(job, generator, judge, config, judge_sem, max_context_tokens):
         async with judge_sem:
             try:
                 result["judge"] = await judge_answer_async(
-                    judge, qa["question"], reference, candidate
+                    judge, qa["question"], reference, candidate["answer"], candidate["unsupported"]
                 )
             except Exception as exc:  # noqa: BLE001
                 result["judge"] = {"label": "INCORRECT", "reason": f"judge failed: {exc}"}

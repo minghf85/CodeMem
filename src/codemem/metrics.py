@@ -17,8 +17,16 @@ LOCOMO_CATEGORY_NAMES = {
 
 
 def normalize_text(text: Any) -> str:
-	if isinstance(text, (dict, list, tuple)):
+	if isinstance(text, dict):
+		# 解析后的答案对象：只对 answer 字段评分，不把 reasoning 等元数据算进去。
+		if "answer" in text:
+			text = text["answer"]
+		else:
+			text = json.dumps(text, ensure_ascii=False, sort_keys=True)
+	elif isinstance(text, (list, tuple)):
 		text = json.dumps(text, ensure_ascii=False, sort_keys=True)
+	elif text is None:
+		text = ""
 	else:
 		text = str(text)
 	return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", text.lower(), flags=re.UNICODE)).strip()

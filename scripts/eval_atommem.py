@@ -20,7 +20,8 @@ if str(SRC_DIR) not in sys.path:
 from codemem.eval_utils import (  # type: ignore[import-not-found]  # noqa: E402
     DATA_FILE, DEFAULT_LLM_CONFIG, build_answer_messages, complete_with_client,
     evidence_to_ids, format_memories_with_metadata, get_conversation_date_context,
-    load_msgmem, load_samples, load_yaml_config, reference_answer,
+    interleave_retrieved,
+    load_msgmem, load_samples, load_yaml_config, parse_answer_output, reference_answer,
     retrieve_by_embedding_async, sample_dir, resolve_run_paths,
 )
 from codemem.judge import judge_answer_async  # type: ignore[import-not-found]  # noqa: E402
@@ -148,7 +149,7 @@ async def async_main(args: argparse.Namespace) -> None:
         result_path.unlink()
 
     # Setup clients
-    embedding_config = dict(config.get("embedding", ))
+    embedding_config = dict(config.get("embedding") or {})
     embedding_client = openai.AsyncOpenAI(
         base_url=embedding_config.get("base_url", "http://127.0.0.1:30001/v1"),
         api_key=embedding_config.get("api_key", "sglang"),
@@ -174,43 +175,40 @@ async def async_main(args: argparse.Namespace) -> None:
     async def run_job(job):
         sample, qa, msgmem, atommem, conversation_date = job
 
-        # Retrieve from msgmem
+        # Split the retrieval budget evenly: half from msgmem, half from atommem.
+        top_k = int(config.get("top_k", 30))
+        msgmem_k = top_k // 2
+        atommem_k = top_k - msgmem_k
+
         async with embedding_sem:
             msgmem_retrieved = await retrieve_by_embedding_async(
-                qa["question"], msgmem, embedding_model,
-                int(config.get("top_k", 30)), embedding_client,
+                qa["question"], msgmem, embedding_model, msgmem_k, embedding_client,
             )
 
-        # Retrieve from atommem
         async with embedding_sem:
             atommem_retrieved = await retrieve_by_embedding_async(
-                qa["question"], atommem, embedding_model,
-                int(config.get("top_k", 30)), embedding_client,
+                qa["question"], atommem, embedding_model, atommem_k, embedding_client,
             )
 
-        # Format contexts
-        msgmem_context, _ = format_memories_with_metadata(msgmem_retrieved)
-        atommem_context, _ = format_memories_with_metadata(atommem_retrieved)
+        # Merge the two halves into ONE context, ordered by similarity to the question.
+        merged_retrieved = interleave_retrieved(msgmem_retrieved, atommem_retrieved)
+        merged_context, _ = format_memories_with_metadata(merged_retrieved)
 
-        # Generate answers with both contexts
+        # Generate a single answer from the merged context.
         async with generation_sem:
-            msgmem_candidate = await complete_with_client(
+            raw_candidate = await complete_with_client(
                 generator, build_answer_messages(
-                    qa["question"], msgmem_context, RAG_ANSWER_PROMPT, conversation_date
+                    qa["question"], merged_context, RAG_ANSWER_PROMPT, conversation_date
                 ), answer_config
             )
 
-        async with generation_sem:
-            atommem_candidate = await complete_with_client(
-                generator, build_answer_messages(
-                    qa["question"], atommem_context, RAG_ANSWER_PROMPT, conversation_date
-                ), answer_config
-            )
+        candidate = parse_answer_output(raw_candidate)
 
         reference = reference_answer(qa)
         expected_ids = evidence_to_ids(qa.get("evidence"))
 
-        # Extract IDs from retrieved memories
+        # Collect retrieved IDs from both halves. Atommem entries carry their parent
+        # msgmem ids in metadata.source, so map them back before comparing to evidence.
         msgmem_retrieved_ids = set()
         for item in msgmem_retrieved:
             mem_id = item.get("metadata", {}).get("id", "")
@@ -219,52 +217,44 @@ async def async_main(args: argparse.Namespace) -> None:
 
         atommem_retrieved_ids = set()
         for item in atommem_retrieved:
-            # Atommem IDs are in format session_X_Y_Z, need to get parent raw ID
-            mem_id = item.get("metadata", {}).get("id", "")
-            if mem_id:
-                # Get source IDs from atommem
-                sources = item.get("metadata", {}).get("source", [])
-                atommem_retrieved_ids.update(sources)
+            atommem_retrieved_ids.update(item.get("metadata", {}).get("source", []))
+
+        retrieved_ids = msgmem_retrieved_ids | atommem_retrieved_ids
 
         result = {
             "sample_id": sample["sample_id"], "dir": sample_dir(sample),
             "question": qa["question"], "category": qa.get("category"), "reference": reference,
             "reference_field": "answer" if "answer" in qa else "adversarial_answer",
-            "msgmem_prediction": msgmem_candidate, "atommem_prediction": atommem_candidate,
+            "prediction": candidate,
+            "prediction_answer": candidate["answer"],
+            "prediction_unsupported": candidate["unsupported"],
+            "prediction_reasoning": candidate["reasoning"],
+            "prediction_raw": candidate["raw"],
             "evidence": qa.get("evidence", []),
             "evidence_ids": sorted(expected_ids),
             "msgmem_retrieved_ids": sorted(msgmem_retrieved_ids),
             "atommem_retrieved_ids": sorted(atommem_retrieved_ids),
+            "retrieved_ids": sorted(retrieved_ids),
             "msgmem_evidence_recall": evidence_recall(expected_ids, msgmem_retrieved_ids),
             "atommem_evidence_recall": evidence_recall(expected_ids, atommem_retrieved_ids),
-            "msgmem_exact_match": exact_match(reference, msgmem_candidate),
-            "atommem_exact_match": exact_match(reference, atommem_candidate),
-            "msgmem_token_f1": token_f1(reference, msgmem_candidate),
-            "atommem_token_f1": token_f1(reference, atommem_candidate),
+            "evidence_recall": evidence_recall(expected_ids, retrieved_ids),
+            "exact_match": exact_match(reference, candidate),
+            "token_f1": token_f1(reference, candidate),
+            "msgmem_retrieved_count": len(msgmem_retrieved),
+            "atommem_retrieved_count": len(atommem_retrieved),
         }
 
         if qa.get("category") == 5:
             result["score_skipped"] = True
         else:
-            # Judge both answers
             async with judge_sem:
                 try:
-                    result["msgmem_judge"] = await judge_answer_async(
-                        judge_client, qa["question"], reference, msgmem_candidate
+                    result["judge"] = await judge_answer_async(
+                        judge_client, qa["question"], reference,
+                        candidate["answer"], candidate["unsupported"],
                     )
                 except Exception as exc:  # noqa: BLE001
-                    result["msgmem_judge"] = {"label": "INCORRECT", "reason": f"judge failed: {exc}"}
-
-            async with judge_sem:
-                try:
-                    result["atommem_judge"] = await judge_answer_async(
-                        judge_client, qa["question"], reference, atommem_candidate
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    result["atommem_judge"] = {"label": "INCORRECT", "reason": f"judge failed: {exc}"}
-
-            # Add a unified judge field for compatibility with existing metrics
-            result["judge"] = result["msgmem_judge"]
+                    result["judge"] = {"label": "INCORRECT", "reason": f"judge failed: {exc}"}
 
         return result
 
@@ -294,39 +284,28 @@ async def async_main(args: argparse.Namespace) -> None:
     await generator.close()
     await judge_client.close()
 
-    # Calculate metrics separately for msgmem and atommem
-    def summarize_with_prefix(results: list[dict], prefix: str) -> dict:
-        """Create summary metrics with field prefix."""
-        judged = [r for r in results if f"{prefix}_judge" in r and r.get("category") != 5]
-        return {
-            f"{prefix}_judge_accuracy": (
-                sum(r[f"{prefix}_judge"].get("label") == "CORRECT" for r in judged) / len(judged)
-                if judged else 0.0
-            ),
-            f"{prefix}_evidence_recall": (
-                sum(r.get(f"{prefix}_evidence_recall", 0.0) for r in results) / len(results)
-                if results else 0.0
-            ),
-            f"{prefix}_exact_match": (
-                sum(r.get(f"{prefix}_exact_match", 0.0) for r in results) / len(results)
-                if results else 0.0
-            ),
-            f"{prefix}_token_f1": (
-                sum(r.get(f"{prefix}_token_f1", 0.0) for r in results) / len(results)
-                if results else 0.0
-            ),
-        }
-
-    msgmem_summary = summarize_with_prefix(results, "msgmem")
-    atommem_summary = summarize_with_prefix(results, "atommem")
+    # Summary: one merged prediction, so a single set of metrics. The per-source
+    # evidence recall is still reported as a diagnostic.
+    msgmem_recall = (
+        sum(r.get("msgmem_evidence_recall", 0.0) for r in results) / len(results)
+        if results else 0.0
+    )
+    atommem_recall = (
+        sum(r.get("atommem_evidence_recall", 0.0) for r in results) / len(results)
+        if results else 0.0
+    )
 
     summary = {
         "experiment": args.experiment,
         "result_file": str(result_path),
         "total_samples": len(results),
-        **msgmem_summary,
-        **atommem_summary,
+        **summarize(results),
         "by_category": summarize_by_category(results),
+        "retrieval_stats": {
+            "top_k": int(config.get("top_k", 30)),
+            "msgmem_evidence_recall": msgmem_recall,
+            "atommem_evidence_recall": atommem_recall,
+        },
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
