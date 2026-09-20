@@ -18,7 +18,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from codemem.eval_utils import (  # type: ignore[import-not-found]  # noqa: E402
-    DATA_FILE, DEFAULT_LLM_CONFIG, build_answer_messages, complete_with_client,
+    DATA_FILE, DEFAULT_LLM_CONFIG, build_answer_messages, check_embedding_endpoint,
+    complete_with_client,
     evidence_to_ids, format_memories_with_metadata, get_conversation_date_context,
     interleave_retrieved,
     load_msgmem, load_samples, load_yaml_config, parse_answer_output, reference_answer,
@@ -81,7 +82,11 @@ def update_progress(progress: tqdm, results: list[dict], started: float, total: 
         if judged else 0.0
     )
 
-    # Calculate average evidence recall for both msgmem and atommem
+    # Calculate merged evidence recall, plus per-source diagnostics
+    merged_evidence_recall = (
+        sum(float(item.get("evidence_recall", 0.0)) for item in results) / len(results)
+        if results else 0.0
+    )
     msgmem_evidence_recall = (
         sum(float(item.get("msgmem_evidence_recall", 0.0)) for item in results) / len(results)
         if results else 0.0
@@ -95,8 +100,9 @@ def update_progress(progress: tqdm, results: list[dict], started: float, total: 
     rate = progress.n / elapsed
     eta_seconds = max(total - progress.n, 0) / rate if rate > 0 else 0.0
     progress.set_postfix_str(
-        f"judge_acc={judge_accuracy:.3f} msg_recall={msgmem_evidence_recall:.3f} "
-        f"atom_recall={atommem_evidence_recall:.3f} rate={rate:.2f}/s ETA={eta_seconds / 60:.1f}m"
+        f"judge_acc={judge_accuracy:.3f} recall={merged_evidence_recall:.3f} "
+        f"(msg={msgmem_evidence_recall:.3f} atom={atommem_evidence_recall:.3f}) "
+        f"rate={rate:.2f}/s ETA={eta_seconds / 60:.1f}m"
     )
 
 
@@ -155,6 +161,12 @@ async def async_main(args: argparse.Namespace) -> None:
         api_key=embedding_config.get("api_key", "sglang"),
     )
     embedding_model = embedding_config.get("model", config["embedding_model"])
+
+    # 先探测 embedding 端点：配置错误时立刻报错，而不是让 1986 条 QA 各自退避重试
+    # 把进度条一直卡在 0。
+    print(f"[preflight] embedding endpoint: {embedding_config.get('base_url')} model={embedding_model}")
+    await check_embedding_endpoint(embedding_client, embedding_model)
+    print("[preflight] embedding endpoint OK")
 
     file_mode = "a" if args.resume else "w"
     generator = openai.AsyncOpenAI(

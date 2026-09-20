@@ -462,12 +462,7 @@ def retrieve_by_embedding(
     try:
         response = embedding_client.embeddings.create(model=model_name, input=[query, *texts])
     except Exception as exc:  # noqa: BLE001
-        message = str(exc)
-        if "--is-embedding" in message or "embedding model" in message.lower():
-            raise RuntimeError(
-                "Embedding API 未按 embedding 模式启动，请在 sglang 命令中加入 --is-embedding"
-            ) from exc
-        raise
+        _raise_embedding_error(exc)
     vectors = [item.embedding for item in response.data]
     query_vector = vectors[0]
     scored = [
@@ -495,6 +490,38 @@ def interleave_retrieved(
     return merged
 
 
+class EmbeddingUnavailable(RuntimeError):
+    """Embedding 端点不可用（连接失败/超时/未按 embedding 模式启动）。
+
+    这类错误单独成类，方便调用方快速失败，而不是在每条 QA 上反复退避重试——
+    那种情况下进度条会长时间停在 0，看起来像"卡住"。
+    """
+
+
+def _raise_embedding_error(exc: Exception) -> None:
+    """把 embedding 调用异常转成带有排查提示的 EmbeddingUnavailable。"""
+    message = str(exc)
+    if "--is-embedding" in message or "embedding model" in message.lower():
+        raise EmbeddingUnavailable(
+            "Embedding API 未按 embedding 模式启动，请在 sglang 命令中加入 --is-embedding"
+        ) from exc
+    raise EmbeddingUnavailable(
+        f"Embedding 端点不可用：{type(exc).__name__}: {message[:200]}\n"
+        "  请检查 embedding.base_url / api_key / model，并确认该服务可访问。"
+    ) from exc
+
+
+async def check_embedding_endpoint(client: Any, model_name: str) -> None:
+    """启动前探测 embedding 端点，尽早暴露配置错误。
+
+    失败直接抛 EmbeddingUnavailable，避免大批任务各自退避重试导致进度条长时间停在 0。
+    """
+    try:
+        await client.embeddings.create(model=model_name, input=["ping"])
+    except Exception as exc:  # noqa: BLE001
+        _raise_embedding_error(exc)
+
+
 async def retrieve_by_embedding_async(
     query: str,
     memories: list[dict[str, Any]],
@@ -517,12 +544,7 @@ async def retrieve_by_embedding_async(
     try:
         response = await embedding_client.embeddings.create(model=model_name, input=[query, *texts])
     except Exception as exc:  # noqa: BLE001
-        message = str(exc)
-        if "--is-embedding" in message or "embedding model" in message.lower():
-            raise RuntimeError(
-                "Embedding API 未按 embedding 模式启动，请在 sglang 命令中加入 --is-embedding"
-            ) from exc
-        raise
+        _raise_embedding_error(exc)
     vectors = [item.embedding for item in response.data]
     scored = [
         (cosine_similarity(vectors[0], vector), item)

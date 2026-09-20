@@ -18,7 +18,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from codemem.eval_utils import (  # type: ignore[import-not-found]  # noqa: E402
-    DATA_FILE, DEFAULT_LLM_CONFIG, build_answer_messages, complete_with_client,
+    DATA_FILE, DEFAULT_LLM_CONFIG, build_answer_messages, check_embedding_endpoint,
+    complete_with_client,
     evidence_to_ids, format_memories_with_metadata, get_conversation_date_context,
     load_msgmem, load_samples, load_yaml_config, parse_answer_output, reference_answer,
     retrieve_by_embedding_async, sample_dir, resolve_run_paths,
@@ -119,6 +120,11 @@ async def async_main(args: argparse.Namespace) -> None:
         api_key=embedding_config.get("api_key", "sglang"),
     )
     embedding_model = embedding_config.get("model", rag_config["embedding_model"])
+
+    # 先探测 embedding 端点，配置错误时立刻失败，避免大批任务退避重试卡在 0。
+    print(f"[preflight] embedding endpoint: {embedding_config.get('base_url')} model={embedding_model}")
+    await check_embedding_endpoint(embedding_client, embedding_model)
+    print("[preflight] embedding endpoint OK")
 
     file_mode = "a" if args.resume else "w"
     generator = openai.AsyncOpenAI(

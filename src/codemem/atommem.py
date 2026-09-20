@@ -421,6 +421,13 @@ class TruncatedCompletion(RuntimeError):
 async def chat_completion(
     client: openai.AsyncOpenAI, config: dict, messages: list[dict]
 ) -> str:
+    # 配置里可能指定了与 client 不同的 base_url（例如 eval 脚本共用 DEFAULT_LLM_CONFIG
+    # 构造 client，再按 generator 段覆盖地址）。OpenAI SDK 的默认 client 会忽略 base_url，
+    # 导致请求被静默发到旧地址，这里显式按请求切换。
+    base_url = config.get("base_url")
+    if base_url and str(client.base_url).rstrip("/") != str(base_url).rstrip("/"):
+        client = client.with_options(base_url=base_url)
+
     kwargs: dict[str, Any] = {
         "model": config["model"],
         "messages": messages,
