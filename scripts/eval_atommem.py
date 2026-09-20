@@ -7,6 +7,7 @@ import asyncio
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import openai
@@ -18,8 +19,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from codemem.eval_utils import (  # type: ignore[import-not-found]  # noqa: E402
-    DATA_FILE, DEFAULT_LLM_CONFIG, build_answer_messages, check_embedding_endpoint,
-    complete_with_client,
+    DATA_FILE, DEFAULT_LLM_CONFIG, EmbeddingCache, build_answer_messages,
+    check_embedding_endpoint, complete_with_client,
     evidence_to_ids, format_memories_with_metadata, get_conversation_date_context,
     interleave_retrieved,
     load_msgmem, load_samples, load_yaml_config, parse_answer_output, reference_answer,
@@ -75,7 +76,17 @@ def load_atommem(sample: dict) -> list[dict]:
     return memories
 
 
-def update_progress(progress: tqdm, results: list[dict], started: float, total: int) -> None:
+def make_logger(enabled: bool):
+    """返回一个带时间戳的日志函数；enabled=False 时退化为空操作。"""
+    def log(message: str) -> None:
+        if enabled:
+            stamp = datetime.now().strftime("%H:%M:%S")
+            print(f"[{stamp}] {message}", flush=True)
+    return log
+
+
+def update_progress(progress: tqdm, results: list[dict], started: float, total: int,
+                    stages: dict[str, int] | None = None) -> None:
     judged = [item for item in results if "judge" in item]
     judge_accuracy = (
         sum(item["judge"].get("label") == "CORRECT" for item in judged) / len(judged)
@@ -99,10 +110,23 @@ def update_progress(progress: tqdm, results: list[dict], started: float, total: 
     elapsed = max(time.monotonic() - started, 1e-6)
     rate = progress.n / elapsed
     eta_seconds = max(total - progress.n, 0) / rate if rate > 0 else 0.0
+
+    # 阶段计数：区分"卡在 embedding"还是"卡在生成/评判"。in-flight = 已进入该阶段
+    # 但还没产出结果的 QA 数，这是判断"是否在推进"的关键信号。
+    stage_str = ""
+    if stages is not None:
+        in_flight_embed = stages.get("embed", 0) - stages.get("embed_done", 0)
+        in_flight_gen = stages.get("generate", 0) - stages.get("generate_done", 0)
+        stage_str = (
+            f" | embed {stages.get('embed_done', 0)}/{stages.get('embed', 0)}"
+            f"(+{in_flight_embed}) gen {stages.get('generate_done', 0)}/{stages.get('generate', 0)}"
+            f"(+{in_flight_gen}) judged={len(judged)}"
+        )
+
     progress.set_postfix_str(
         f"judge_acc={judge_accuracy:.3f} recall={merged_evidence_recall:.3f} "
         f"(msg={msgmem_evidence_recall:.3f} atom={atommem_evidence_recall:.3f}) "
-        f"rate={rate:.2f}/s ETA={eta_seconds / 60:.1f}m"
+        f"rate={rate:.2f}/s ETA={eta_seconds / 60:.1f}m{stage_str}"
     )
 
 
@@ -154,6 +178,21 @@ async def async_main(args: argparse.Namespace) -> None:
     if not args.resume and result_path.exists():
         result_path.unlink()
 
+    # 启动前给出工作量与成本估算：每条 QA 需要 2 次 embedding（msgmem + atommem，
+    # 各自会把该样本的全部记忆重新嵌入一次）和 1 次生成 + 1 次评判。
+    msgmem_total = sum(len(job[2]) for job in pending_jobs)
+    atommem_total = sum(len(job[3]) for job in pending_jobs)
+    print(
+        f"[plan] pending QA={len(pending_jobs)} total={len(jobs)}\n"
+        f"       embedding calls={len(pending_jobs) * 2} "
+        f"(re-embedding {msgmem_total} msgmem + {atommem_total} atommem texts each time)\n"
+        f"       generation calls={len(pending_jobs)}, judge calls (excluding category 5) ~{len(pending_jobs)}\n"
+        f"       并发: embedding={config.get('embedding_concurrency', 8)} "
+        f"generation={config.get('concurrency', 4)} judge={config.get('judge_concurrency', 4)}\n"
+        f"       进度条每 10s 自动刷新；加 --verbose 可看每个 QA 的阶段日志。",
+        flush=True,
+    )
+
     # Setup clients
     embedding_config = dict(config.get("embedding") or {})
     embedding_client = openai.AsyncOpenAI(
@@ -184,35 +223,58 @@ async def async_main(args: argparse.Namespace) -> None:
     embedding_sem = asyncio.Semaphore(int(config.get("embedding_concurrency", 8)))
     judge_sem = asyncio.Semaphore(int(config.get("judge_concurrency", 4)))
 
+    # 阶段计数与日志：用于区分"卡在 embedding"还是"卡在生成/评判"。
+    stages = {"embed": 0, "embed_done": 0, "generate": 0, "generate_done": 0}
+    log = make_logger(args.verbose)
+
+    # embedding 缓存：同一样本的记忆只嵌入一次。磁盘缓存按目录存放，源文件改动会因
+    # 文本哈希变化而自动重新嵌入。
+    cache_dir = None if args.no_embedding_cache else (args.embedding_cache_dir or (PROJECT_ROOT / "data" / "embedding_cache"))
+    embedding_cache = EmbeddingCache(embedding_client, embedding_model, cache_dir)
+
     async def run_job(job):
         sample, qa, msgmem, atommem, conversation_date = job
+        question = qa["question"]
 
         # Split the retrieval budget evenly: half from msgmem, half from atommem.
         top_k = int(config.get("top_k", 30))
         msgmem_k = top_k // 2
         atommem_k = top_k - msgmem_k
 
+        stages["embed"] += 1
+        log(f"[embed] {sample['sample_id']} | {question[:50]!r} "
+            f"(msgmem={len(msgmem)} atommem={len(atommem)} -> top {msgmem_k}/{atommem_k})")
         async with embedding_sem:
             msgmem_retrieved = await retrieve_by_embedding_async(
-                qa["question"], msgmem, embedding_model, msgmem_k, embedding_client,
+                question, msgmem, embedding_model, msgmem_k, embedding_client,
+                cache=embedding_cache,
             )
 
         async with embedding_sem:
             atommem_retrieved = await retrieve_by_embedding_async(
-                qa["question"], atommem, embedding_model, atommem_k, embedding_client,
+                question, atommem, embedding_model, atommem_k, embedding_client,
+                cache=embedding_cache,
             )
+        stages["embed_done"] += 1
+        log(f"[embed] {sample['sample_id']} | done, got "
+            f"{len(msgmem_retrieved)}+{len(atommem_retrieved)} memories")
 
         # Merge the two halves into ONE context, ordered by similarity to the question.
         merged_retrieved = interleave_retrieved(msgmem_retrieved, atommem_retrieved)
         merged_context, _ = format_memories_with_metadata(merged_retrieved)
 
         # Generate a single answer from the merged context.
+        stages["generate"] += 1
+        log(f"[generate] {sample['sample_id']} | {question[:50]!r} "
+            f"({len(merged_context)} chars of context)")
         async with generation_sem:
             raw_candidate = await complete_with_client(
                 generator, build_answer_messages(
-                    qa["question"], merged_context, RAG_ANSWER_PROMPT, conversation_date
+                    question, merged_context, RAG_ANSWER_PROMPT, conversation_date
                 ), answer_config
             )
+        stages["generate_done"] += 1
+        log(f"[generate] {sample['sample_id']} | done ({len(raw_candidate)} chars)")
 
         candidate = parse_answer_output(raw_candidate)
 
@@ -267,10 +329,26 @@ async def async_main(args: argparse.Namespace) -> None:
                     )
                 except Exception as exc:  # noqa: BLE001
                     result["judge"] = {"label": "INCORRECT", "reason": f"judge failed: {exc}"}
+                    log(f"[judge] {sample['sample_id']} | FAILED {type(exc).__name__}: {exc}")
+
+            verdict = result["judge"].get("label")
+            log(
+                f"[judge] {sample['sample_id']} | {verdict} | "
+                f"unsupported={candidate['unsupported']} | "
+                f"pred={candidate['answer']!r} ref={reference!r} | "
+                f"{(result['judge'].get('reason') or '')[:120]}"
+            )
 
         return result
 
     tasks = [asyncio.create_task(run_job(job)) for job in pending_jobs]
+
+    async def heartbeat(progress: tqdm) -> None:
+        """定期刷新进度条：即使所有 worker 都阻塞在一个慢调用里，也能看到仍在推进。"""
+        while True:
+            await asyncio.sleep(10)
+            update_progress(progress, results, started, len(jobs), stages)
+
     with result_path.open(file_mode, encoding="utf-8") as file, tqdm(
         pending_jobs,
         total=len(jobs),
@@ -279,18 +357,25 @@ async def async_main(args: argparse.Namespace) -> None:
         unit="qa",
     ) as progress:
         started = time.monotonic()
-        update_progress(progress, results, started, len(jobs))
-        for task in asyncio.as_completed(tasks):
-            try:
-                result = await task
-                results.append(result)
-                completed_keys.add(result_key(result))
-                file.write(json.dumps(result, ensure_ascii=False) + "\n")
-                file.flush()
-            except Exception as exc:  # noqa: BLE001
-                print(f"\n[error] {exc}", file=sys.stderr)
-            progress.update(1)
-            update_progress(progress, results, started, len(jobs))
+        update_progress(progress, results, started, len(jobs), stages)
+        beat = asyncio.create_task(heartbeat(progress))
+        try:
+            for task in asyncio.as_completed(tasks):
+                try:
+                    result = await task
+                    results.append(result)
+                    completed_keys.add(result_key(result))
+                    file.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    file.flush()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"\n[error] {exc}", file=sys.stderr)
+                progress.update(1)
+                update_progress(progress, results, started, len(jobs), stages)
+        finally:
+            beat.cancel()
+
+    embedding_cache.save()
+    print(f"[cache] {embedding_cache.stats()}", flush=True)
 
     await embedding_client.close()
     await generator.close()
@@ -331,6 +416,10 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--sample", type=str, default=None)
     parser.add_argument("--resume", action="store_true", help="跳过输出文件中已完成的 QA")
+    parser.add_argument("--verbose", action="store_true", help="打印每个 QA 的 embed/generate 阶段日志")
+    parser.add_argument("--no-embedding-cache", action="store_true", help="禁用 embedding 缓存（每次重新嵌入）")
+    parser.add_argument("--embedding-cache-dir", type=Path, default=None,
+                        help="embedding 磁盘缓存目录（默认 data/embedding_cache）")
     asyncio.run(async_main(parser.parse_args()))
 
 

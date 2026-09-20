@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -522,24 +524,158 @@ async def check_embedding_endpoint(client: Any, model_name: str) -> None:
         _raise_embedding_error(exc)
 
 
+def memory_text(item: dict[str, Any]) -> str:
+    """取出用于 embedding 的文本，兼容 memory 格式与 message 格式。"""
+    if "memory" in item:
+        return item["memory"]
+    if "text" in item:
+        return item["text"]
+    return str(item)
+
+
+class EmbeddingCache:
+    """把 (model, text) -> vector 缓存在内存里，避免同一批记忆被反复嵌入。
+
+    之前的实现每条 QA 都调用一次 embeddings.create，把该样本的全部记忆重新嵌入一遍，
+    1986 条 QA 会产生约 4000 次调用、重复嵌入大量完全相同的文本。这里缓存之后，
+    同一样本的记忆只在第一次用到时嵌入一次。
+
+    磁盘缓存可选：key 里带上文本内容的哈希，源文件一旦变化会重新嵌入，不会读到过期向量。
+    """
+
+    def __init__(self, client: Any, model_name: str, disk_dir: Path | None = None) -> None:
+        self.client = client
+        self.model_name = model_name
+        self.disk_dir = disk_dir
+        self.vectors: dict[str, list[float]] = {}
+        self.hits = 0
+        self.misses = 0
+        self.requests = 0
+        self._disk_dirty = False
+        if disk_dir is not None:
+            self._load_disk()
+
+    def _cache_key(self, text: str) -> str:
+        return hashlib.sha1(f"{self.model_name}\x00{text}".encode("utf-8")).hexdigest()
+
+    def _disk_path(self) -> Path | None:
+        if self.disk_dir is None:
+            return None
+        return self.disk_dir / "embedding_cache.jsonl"
+
+    def _load_disk(self) -> None:
+        path = self._disk_path()
+        if path is None or not path.exists():
+            return
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                for line in file:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                        key, vector = record["key"], record["vector"]
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        continue
+                    if isinstance(key, str) and isinstance(vector, list) and vector:
+                        self.vectors[key] = vector
+        except OSError as exc:
+            print(f"[warn] 无法读取 embedding 缓存 {path}: {exc}", file=sys.stderr)
+        if self.vectors:
+            print(f"[cache] 从 {path} 载入 {len(self.vectors)} 条向量")
+
+    def _save_disk(self) -> None:
+        if not self._disk_dirty:
+            return
+        path = self._disk_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as file:
+                for key, vector in self.vectors.items():
+                    file.write(json.dumps({"key": key, "vector": vector}) + "\n")
+        except OSError as exc:
+            print(f"[warn] 无法写入 embedding 缓存 {path}: {exc}", file=sys.stderr)
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        """返回与 texts 等长的向量列表，命中缓存的不再请求。"""
+        keys = [self._cache_key(text) for text in texts]
+
+        # 同一批里去重，只请求一次未命中的文本（QA 之间常有完全相同的记忆）。
+        pending: dict[str, str] = {}
+        for key, text in zip(keys, texts):
+            if key in self.vectors:
+                self.hits += 1
+            else:
+                pending.setdefault(key, text)
+
+        if pending:
+            self.misses += len(pending)
+            self.requests += 1
+            unique_keys = list(pending)
+            try:
+                response = await self.client.embeddings.create(
+                    model=self.model_name, input=[pending[key] for key in unique_keys]
+                )
+            except Exception as exc:  # noqa: BLE001
+                _raise_embedding_error(exc)
+            if len(response.data) != len(unique_keys):
+                raise EmbeddingUnavailable(
+                    f"embedding 返回数量不匹配：请求 {len(unique_keys)} 条，返回 {len(response.data)} 条"
+                )
+            for key, item in zip(unique_keys, response.data):
+                self.vectors[key] = item.embedding
+            self._disk_dirty = True
+
+        return [self.vectors[key] for key in keys]
+
+    def stats(self) -> str:
+        total = self.hits + self.misses
+        ratio = (self.hits / total * 100) if total else 0.0
+        return (
+            f"embedding 缓存: 命中 {self.hits}/{total} ({ratio:.1f}%), "
+            f"实际请求 {self.requests} 次"
+        )
+
+    def save(self) -> None:
+        self._save_disk()
+
+
+def rank_by_query_vector(
+    query_vector: list[float],
+    memories: list[dict[str, Any]],
+    vectors: list[list[float]],
+    top_k: int,
+) -> list[dict[str, Any]]:
+    """按 query 向量与记忆向量的余弦相似度取 top_k（检索的唯一实现）。"""
+    scored = [
+        (cosine_similarity(query_vector, vector), item)
+        for vector, item in zip(vectors, memories)
+    ]
+    return [item for _, item in sorted(scored, key=lambda pair: pair[0], reverse=True)[:top_k]]
+
+
 async def retrieve_by_embedding_async(
     query: str,
     memories: list[dict[str, Any]],
     model_name: str,
     top_k: int,
     embedding_client: Any,
+    cache: "EmbeddingCache | None" = None,
 ) -> list[dict[str, Any]]:
+    """按 embedding 相似度检索 top_k。
+
+    传入 cache 时，记忆向量走缓存（同一批记忆只嵌入一次）；否则保持旧行为
+    （每次调用把 query 和全部记忆一起嵌入）。
+    """
+    if cache is not None:
+        query_vector, *memory_vectors = await cache.embed([query, *[memory_text(m) for m in memories]])
+        return rank_by_query_vector(query_vector, memories, memory_vectors, top_k)
+
     # Extract text from memory objects - handle both memory format and message format
-    texts = []
-    for item in memories:
-        if "memory" in item:
-            # Memory object format
-            texts.append(item["memory"])
-        elif "text" in item:
-            # Message object format
-            texts.append(item["text"])
-        else:
-            texts.append(str(item))
+    texts = [memory_text(item) for item in memories]
 
     try:
         response = await embedding_client.embeddings.create(model=model_name, input=[query, *texts])
