@@ -208,13 +208,19 @@ weak prompt 会有意保留上下文泄漏、事实合并、遗漏隐含事实�
 - 示例：`D1:3` → `session_1_3`
 - 示例：`D2:5` → `session_2_5`
 
+### 4.1 Baseline 评测（完整上下文）
+
 ```bash
 # 全上下文 baseline，使用所有 msgmem.jsonl 内容，实时显示 judge accuracy 和 ETA
 python scripts/eval_baseline.py --experiment baseline_qwen3 --limit 10
 
 # 中断后继续：指定同一个实验目录
 python scripts/eval_baseline.py --experiment baseline_qwen3 --resume
+```
 
+### 4.2 RAG 评测（msgmem 检索）
+
+```bash
 # 通过 sglang /v1/embeddings API 做 embedding RAG，从 msgmem.jsonl 中检索最多 30 条记忆
 python scripts/eval_rag.py --experiment rag_qwen3 --limit 10
 
@@ -222,11 +228,45 @@ python scripts/eval_rag.py --experiment rag_qwen3 --limit 10
 python scripts/eval_rag.py --experiment rag_qwen3 --resume
 ```
 
+### 4.3 AtomMem 评测（对比 msgmem 和 atommem）
+
+**同时评测两种记忆类型的检索召回和答案准确率**：
+
+```bash
+# 快速测试（50个样本）
+python scripts/eval_atommem.py --experiment atommem_test --limit 50
+
+# 完整评测（1986个样本）
+python scripts/eval_atommem.py --experiment atommem_full
+
+# 断点续跑
+python scripts/eval_atommem.py --experiment atommem_full --resume
+
+# 分析结果
+python scripts/analyze_atommem_results.py data/eval_runs/atommem_test_*/eval_atommem.jsonl
+```
+
+**测试结果（50个样本）**：
+
+| 指标 | msgmem | atommem | 提升 |
+|------|--------|---------|------|
+| Evidence Recall | 28.0% | **85.1%** | **+204%** |
+| Judge Accuracy | 16.0% | **48.0%** | **+200%** |
+| Token F1 | 0.089 | 0.169 | +90% |
+
+- **68%** 的问题召回率提升（atommem > msgmem）
+- **0%** 的问题召回率下降（atommem 从不比 msgmem 差）
+- **净答案准确率提升 +32%**（+16 个问题）
+
+详细分析见 `docs/eval_atommem_summary.md`。
+
+### 4.4 输出文件
+
 每次运行创建 `data/eval_runs/{experiment}_{YYYYMMDD_HHMMSS}/`，目录包含对应的
-`eval_baseline.jsonl` 或 `eval_rag.jsonl` 以及 `summary.json`。summary 按 LoCoMo
-category 1-5 输出指标；category 5 (`adversarial_skip`) 只记录结果，不参与评分。
+`eval_baseline.jsonl`、`eval_rag.jsonl` 或 `eval_atommem.jsonl` 以及 `summary.json`。
+summary 按 LoCoMo category 1-5 输出指标；category 5 (`adversarial_skip`) 只记录结果，不参与评分。
 模型地址、生成模型、judge 模型和 embedding 模型分别配置在 `configs/baseline.yaml`、
-`configs/rag.yaml` 和 `configs/judge.yaml`。
+`configs/rag.yaml`、`configs/atommem.yaml` 和 `configs/judge.yaml`。
 
 embedding 服务需要以 embedding 模式启动：
 
@@ -311,6 +351,7 @@ error_log: data/dpo/atom_dpo_errors.log
 [x] `src/codemem/metrics.py`: 提供 LLM judge accuracy、exact match、token F1 和 evidence recall。
 [x] `scripts/eval_baseline.py`: 使用完整 session 上下文进行 baseline 评测（已集成 msgmem.jsonl 加载和时间信息）。
 [x] `scripts/eval_rag.py`: 使用 Qwen3-Embedding-4B 检索最多 30 条 msg memory 后评测（已集成时间戳和 speaker 信息）。
+[x] `scripts/eval_atommem.py`: 对比 msgmem 和 atommem 的检索召回和答案准确率，配置在 configs/atommem.yaml 中（测试显示 atommem evidence recall 85% vs msgmem 28%，judge accuracy 48% vs 16%）。
 [ ] `src/codemem/searchmem.py`: 实现记忆检索（双模式：为 evomem 服务 + 为 eval 服务）
 [ ] `src/codemem/evomem.py`: 实现记忆演化（GRPO 训练，双层奖励：全局 QA 准确率 + 局部强模型评分）
 
