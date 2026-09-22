@@ -1,0 +1,52 @@
+{
+  "memory": {
+    "description": "[YOU] Core content of this memory atom. Exactly ONE fact. Keep the same fact as the target unless you are resolving a reference or folding in a value the evidence supplies - you are refining an existing memory, not extracting a new one. Self-contained: name the subject speaker explicitly (third person) and resolve every pronoun to a concrete entity. Preserve the target's own wording wherever it is still accurate; only rephrase what must change. <= 20 words; if your rewrite would need more, you are describing a different fact - ADD it instead. Keep token overlap with the target's current text high: a rewrite that replaces most of the words is a new memory, not an UPDATE.",
+    "type": "string"
+  },
+  "metadata": {
+    "id": {
+      "description": "[SYSTEM] Unique identifier. Auto-assigned. On UPDATE and DELETE you MUST echo the target's exact id; on ADD always leave it \"\".",
+      "type": "string"
+    },
+    "type": {
+      "description": "[YOU] Classify the fact. inner: fundamental, long-term identity or life facts - presupposed roles (parent, employee, student, spouse), core relationships, occupation, residence, values, major life events. outer: transient facts - actions, preferences, plans, intentions, emotions, states, and one-off events. When you UPDATE, keep the target's existing type unless the fact itself has changed category.",
+      "type": "enum",
+      "values": ["inner", "outer"]
+    },
+    "time": {
+      "description": "[YOU] Temporal scope. Prefer an absolute ISO 8601 date over a relative one ('2023-05-08', not 'last month'). For ranges use 'YYYY-MM-DD/YYYY-MM-DD'. If the evidence resolves the target's relative time, replace it. If it cannot be resolved, keep the original phrasing (e.g. 'two day before Alan was born'). If the fact carries no time, use ''.",
+      "type": "string",
+      "examples": [
+        "2026-09-14",
+        "2026-09-14T10:30:00Z",
+        "2026-09-01/2026-09-15",
+        "two day before Alan was born",
+        ""
+      ]
+    },
+    "tag": {
+      "description": "[YOU] Array of key-value labels. MUST include at least one 'speaker:<name>'. On UPDATE keep the target's existing tags. Other tags from Tag Taxonomy: topic, entity, sentiment, action, state, relation, other. Format: 'key:value'.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z]+:[a-zA-Z0-9_\\-]+$"
+      }
+    },
+    "source": {
+      "description": "[YOU] IDs of the memories this fact was derived from. On ADD this MUST be non-empty: list the target id, an earlier entry shown to you, and/or a msgmem id. On UPDATE you may add further justifying ids (the system unions them with the existing ones). Never invent an id.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "changelog": {
+      "description": "[SYSTEM] Version history. Time and content are recorded by the system when an entry changes; do not supply it.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "time": { "description": "[SYSTEM] When change occurred.", "type": "string" },
+          "content": { "description": "[SYSTEM] Previous content before change.", "type": "string" }
+        }
+      }
+    }
+  }
+}

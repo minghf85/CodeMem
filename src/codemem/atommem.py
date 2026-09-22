@@ -71,9 +71,17 @@ def load_config() -> dict[str, Any]:
     return config
 
 
-def load_template() -> dict:
-    if TEMPLATE_FILE.exists():
-        return json.loads(TEMPLATE_FILE.read_text(encoding="utf-8"))
+def load_template(template_file: Path | None = None) -> dict:
+    """读记忆模板。``template_file`` 缺省用抽取模板。
+
+    三种任务用三份模板：抽取（``memory_template_init_extract.json``，本模块与
+    ``gen_dpo_data`` 用）、演化（``memory_template_evomem.json``，``evomem`` 用）。
+    所以这里做成参数而不是改全局常量 —— 改全局会让抽取任务悄悄读到演化模板的
+    措辞（"refine an existing memory"），那对抽取是错的。
+    """
+    path = template_file or TEMPLATE_FILE
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
     return {}
 
 
@@ -494,7 +502,7 @@ def normalize_atom(atom: dict, source_raw: dict) -> dict | None:
     """把模型输出的原子记忆补全为完整的 memory item。
 
     模型只负责 memory / type / time / tag；
-    系统负责 id / source（固定为源 message 的 id）/ target（初始为空）/ changelog。
+    系统负责 id / source（固定为源 message 的 id）/ changelog。
     """
     memory = (atom.get("memory") or "").strip()
     if not memory:
@@ -566,9 +574,8 @@ def deduplicate_atoms(atoms: list[dict]) -> list[dict]:
 
 
 def finalize_atom(atom: dict) -> dict:
-    """补齐 target / changelog（changelog 时间为真实创建时间）。"""
+    """补齐 changelog（时间为真实创建时间）。"""
     meta = atom["metadata"]
-    meta["target"] = []
     meta["changelog"] = [{"time": _now(), "content": "created"}]
     # 保持字段顺序与模板一致
     ordered = {
@@ -579,7 +586,6 @@ def finalize_atom(atom: dict) -> dict:
             "time": meta["time"],
             "tag": meta["tag"],
             "source": meta["source"],
-            "target": meta["target"],
             "changelog": meta["changelog"],
         },
     }
