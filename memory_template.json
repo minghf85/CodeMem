@@ -37,11 +37,6 @@
       "type": "array",
       "items": { "type": "string" }
     },
-    "target": {
-      "description": "[SYSTEM] IDs of linked memories for forward association. Auto-generated based on model's linking.",
-      "type": "array",
-      "items": { "type": "string" }
-    },
     "changelog": {
       "description": "[SYSTEM time + YOU content] Version history. Time auto-generated on modification. Content records previous memory value.",
       "type": "array",
