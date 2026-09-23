@@ -368,14 +368,16 @@ REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing el
 # 反复调用直到 NOOP（或到 max_evomem_turn），然后游标移到下一条原子。
 #
 # 四个占位符，都由 evomem.build_messages 填充：
+#   {{QUESTION}} 这一轮要回答的问题（为什么这条原子此刻被演化）
 #   {{CURRENT}}  当前要精修的那一条（单条，不是整个库）
 #   {{RECALLED}} 召回的证据（源消息 + 前后上下文）
 #   {{HISTORY}}  这条原子之前几轮的动作与执行结果
 #   {{SCHEMA}}   字段定义，由 memory_template_evomem.json 生成
 #
-# 结构刻意保持"模块化"：ROLE / TARGET / EVIDENCE / HISTORY / WHEN TO ACT / ACTIONS /
-# FIELDS / OUTPUT。字段细节**只**出现在 {{SCHEMA}} 里（由模板生成），正文不再重复 ——
-# 旧版本把字段规则手写了一遍又一遍，改模板时两处会对不上。
+# **{{QUESTION}} 是 QA 驱动演化与旧版（逐条走库）的关键区别**：旧版的演化目标是
+# "把这条原子改得更自足"，新版的演化目标是"让这组候选原子足以回答这个问题"。问题文本
+# 是判定 UPDATE / ADD 值不值得做的唯一依据 —— 没有它，模型只能凭"这条记忆看起来不够好"
+# 来改，那正是旧版成本高、收益低的原因。
 
 EVOMEM_PROMPT = """Output exactly one tag: <ADD>...</ADD>, <UPDATE>...</UPDATE>, <DELETE>...</DELETE>, or <NOOP></NOOP>. No other text.
 
@@ -384,8 +386,14 @@ EVOMEM_PROMPT = """Output exactly one tag: <ADD>...</ADD>, <UPDATE>...</UPDATE>,
 If history shows REJECTED, IDENTICAL, or 2+ consecutive failures → <NOOP></NOOP>
 
 # TASK
-Refine one memory atom. Make it accurate, self-contained, connected.
+Refine one memory atom so that the candidate set can answer the QUESTION below.
+Make it accurate, self-contained, connected.
 Do NOT change meaning unless evidence proves it wrong.
+
+## QUESTION (why this entry is being refined)
+{{QUESTION}}
+The goal is to make the candidate set sufficient to answer this question.
+If the target is irrelevant to the QUESTION, prefer <NOOP></NOOP> over cosmetic edits.
 
 ## TARGET
 {{CURRENT}}
@@ -426,6 +434,10 @@ EVOMEM_CURRENT_PLACEHOLDER = "{{CURRENT}}"
 EVOMEM_CURRENT_HEADER = "## Target entry"
 
 EVOMEM_HISTORY_EMPTY = "(nothing yet - this is the first attempt on this entry)"
+
+# QA 驱动演化时 {{QUESTION}} 的占位。question 为空（兼容旧调用 / 纯原子精修）时用它 ——
+# 明确写出"没有问题"而不是留空，否则模型会对着一个空标题猜优化目标。
+EVOMEM_QUESTION_EMPTY = "(no question - standalone refinement)"
 
 EVOMEM_USER_SUFFIX = (
     "Produce the single action block now, following the format exactly."

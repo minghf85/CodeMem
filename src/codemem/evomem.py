@@ -3,27 +3,34 @@
 设计见 ``docs/evomem_plan.md``。这个模块是**第一阶段**实现：先不训练，纯粹靠 prompt
 驱动一个强模型反复演化记忆库，看效果如何。
 
-流程：
+流程（**QA 驱动**）：
 
     for 每对 speaker 目录（**目录之间并行**，目录之内串行）:
-        memories = atommem.jsonl                      # 初始记忆库 = 抽取出来的原子记忆
-        active   = {全部 id}                           # 存活集合，DELETE 只摘这里
-        anchor   = 该目录最后一条 raw 消息的 id         # 新记忆 id 挂在这个 anchor 下
-        for current in 按 id 顺序的每条原子:            # 外层游标
-            候选 = 库里位置早于 current 的存活原子
-            召回: 用 current 的文本 + 最近动作摘要拼成 query
-                  → 从候选里按 embedding 相似度取 top_k（**每条原子只召回一次**）
-                  → 每条附上它 source 对应的 msgmem + 前后 context_window 条原始消息
-            while inner < max_evomem_turn:            # 内层 agent loop
-                构建 prompt（current + 证据 + HISTORY）→ 调模型 → 解析出一个动作
-                执行动作（纯 CPU）→ 更新 memory / active / trace
-                动作结果写进 HISTORY，作为下一轮的反馈
-                动作是 NOOP → 结束**这一条原子**，游标前进到下一条
-                用满 max_evomem_turn → 同样结束这一条，游标前进
+        base = atommem.jsonl（按 atom_key 排好）        # 每条 QA 都从这份 base 出发
+        anchor = 该目录最后一条 raw 消息的 id            # 新记忆 id 挂在这个 anchor 下
+        for 每条 QA（跳过 category 5）:
+            候选集 = searchmem.search(question, base)    # 混合检索 dense+BM25+tag
+            for current in 候选集内每条原子:              # 中层
+                召回 = 严格早于 current 的存活原子 → 附 source msgmem + 上下文
+                while inner < max_evomem_turn:           # 内层 agent loop
+                    构建 prompt（question + current + 证据 + HISTORY）→ 调模型 → 一个动作
+                    执行动作（纯 CPU）→ 更新 memory / active / trace
+                    动作结果写进 HISTORY，作为下一轮的反馈
+                    NOOP → 结束**这一条原子**，候选集里下一条继续
+            落一条 QA trajectory（question / 候选 / 演化后集合 / 逐轮轨迹）
 
-**两层循环（重要）**：``max_evomem_turn`` 是**每条原子**的内层轮数上限，不是全目录的
-总轮数。NOOP 只结束当前这条原子的内层循环，外层游标继续走 —— 库里的原子都会被看一遍。
-坏输出（解析不出动作）同样只结束这一条，不再像早期实现那样终止整个目录。
+**三层循环（重要）**：外层是 **QA 问题**，中层是候选集里的原子，内层是 agent loop。
+``max_evomem_turn`` 是**每条原子**的内层轮数上限，不是全目录总轮数。
+
+**为什么 QA 驱动**（旧版是"按 id 顺序走遍全库逐条精修"）：成本从
+``原子数 × 轮数``（Tim_John 1771 条原子 ≈ 7000 次强模型调用）降到
+``QA 数 × 候选数 × 轮数``，且调用全部花在**问题相关**的原子上；演化目标从"把这条原子
+改得更自足"变成"让这组候选足以回答这个问题"（问题经 ``{{QUESTION}}`` 传给模型）；
+并且一条 QA 一条 trajectory，便于后续做 RL。
+
+**每条 QA 从同一份 base 库出发**：QA 之间互不影响 —— 这是"一条 QA 一条轨迹"的前提，
+也让 base ``atommem.jsonl`` 始终不被修改。代价是不同 QA 可能演化出重复的新原子
+（都挂在同一个 anchor 下），第一版接受这一点，重复度只在目录级并集快照里体现。
 
 **每条原子只召回一次**：内层各轮共享同一份证据，而不是每轮重新检索。这样上一轮改了什么
 只能通过 HISTORY 传给模型，避免把模型自己刚写出来的措辞当成"独立证据"又召回来，绕成
@@ -83,11 +90,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "embedding": {"base_url": "http://127.0.0.1:11434/v1", "api_key": "ollama", "model": "qwen3-embedding:4b"},
     "generator": {"base_url": "http://127.0.0.1:30000/v1", "api_key": "sglang", "model": "local"},
     "top_k": 30,
-    "max_evomem_turn": 4,
-    # 最多处理多少条 atommem（外层游标的上限）。0 = 不限制，走遍全库。
-    # 只用于调试/试跑：全库上千条、每条原子还要多轮调用模型，真跑一次很贵，
-    # 所以给个"只看前 N 条"的闸门。见 --max-atommem。
-    "max_atommem": 0,
+    "max_evomem_turn": 2,
+    # QA 驱动演化的闸门：
+    #   max_qa        每个目录最多处理前 N 条 QA（0 = 全部）。全库 1986 条 QA 真跑很贵，
+    #                 先用这个限制条数试跑。见 --max-qa。
+    #   qa_candidates 每条 QA 用混合检索取多少个候选原子来演化（K）。见 --candidates。
+    #   skip_category5 category 5 是 adversarial（故意不可回答），与评测口径一致地跳过。
+    "max_qa": 0,
+    "qa_candidates": 10,
+    "skip_category5": True,
+    # 混合检索（searchmem）的配置：rrf_k 是 RRF 的平滑常数，weights 是三路通道的权重。
+    # 想和旧的纯 embedding 检索对照，把 weights 设成 {dense: 1.0, bm25: 0.0, tag: 0.0}。
+    "search": {"rrf_k": 60, "weights": {"dense": 1.0, "bm25": 1.0, "tag": 0.5}},
     "context_window": 2,
     "concurrency": 2,
     "embedding_concurrency": 8,
@@ -609,8 +623,9 @@ def build_messages(
     recalled_block: str,
     traces: list[dict[str, Any]],
     schema: str,
+    question: str = "",
 ) -> list[dict[str, str]]:
-    """构造一次调用的 messages：**1 条 current** + recalled 证据。
+    """构造一次调用的 messages：**1 条 current** + recalled 证据 + 要回答的问题。
 
     注意占位符是 ``{{CURRENT}}``（不是 ``{{LIBRARY}}``）—— 名字很重要，叫 LIBRARY 会让
     模型以为它看见了整个库。
@@ -618,8 +633,13 @@ def build_messages(
     ``current`` 必须是单条 memory：传整个 list 会让 prompt 里塞进上千条目标、并且
     ``format_current`` 立刻 AttributeError。历史上这里被误传成 ``memories``（全库），
     所以显式断言，别再犯。
+
+    ``question`` 是 QA 驱动演化的目标（为什么这条原子此刻被演化）。为空时渲染成
+    ``EVOMEM_QUESTION_EMPTY``，兼容"纯原子精修"的旧调用方式。
     """
-    from .prompts import EVOMEM_PROMPT, EVOMEM_USER_SUFFIX
+    from .prompts import (
+        EVOMEM_PROMPT, EVOMEM_QUESTION_EMPTY, EVOMEM_USER_SUFFIX,
+    )
 
     if not isinstance(current, dict):
         raise TypeError(
@@ -627,7 +647,8 @@ def build_messages(
             f"收到 {type(current).__name__}；调用方是不是把整个记忆库传进来了？"
         )
     system = (
-        EVOMEM_PROMPT.replace("{{CURRENT}}", format_current(current))
+        EVOMEM_PROMPT.replace("{{QUESTION}}", question.strip() or EVOMEM_QUESTION_EMPTY)
+        .replace("{{CURRENT}}", format_current(current))
         .replace("{{RECALLED}}", recalled_block)
         .replace("{{HISTORY}}", format_history(traces))
         .replace("{{SCHEMA}}", schema)
@@ -636,6 +657,7 @@ def build_messages(
         {"role": "system", "content": system},
         {"role": "user", "content": EVOMEM_USER_SUFFIX},
     ]
+
 
 
 # ---------------------------------------------------------------------------
@@ -734,12 +756,25 @@ async def run_dir(
 ) -> dict[str, Any]:
     """对一个 speaker 目录跑完整演化，返回 summary。
 
-    **两层循环**（见 ``docs/evomem_plan.md``）：
+    **QA 驱动的三层循环**（见 ``docs/evomem_plan.md``）：
 
-    - 外层：游标按 id 顺序走遍库里每一条原子（``current``）；
+    - 外层：按 QA 问题走（每条 QA 独立，从同一份 base 库出发）—— 用 ``searchmem`` 的
+      混合检索（dense + BM25 + tag，RRF 融合）从库里取出**这条问题相关的候选原子集**；
+    - 中层：候选集内逐条原子（``current``）；
     - 内层（agent loop）：针对当前这一条，反复"调模型 → 执行动作 → 把结果写进
       HISTORY"，直到模型输出 **NOOP**（结束这一条）或到 ``max_evomem_turn``。
-      NOOP 只结束这一条原子，游标继续走到下一条 —— 不是结束整个目录。
+
+    **为什么要按 QA 驱动**（旧版是"按 id 顺序走遍全库逐条精修"）：
+
+    1. **成本**：旧版成本 = ``原子数 × max_evomem_turn``（Tim_John 1771 条原子 ≈ 7000 次
+       强模型调用），且大部分调用花在与任何问题都无关的原子精修上。新版只演化候选集，
+       成本 = ``QA 数 × 候选数 × 轮数``，全部花在**问题相关**的原子上。
+    2. **目标更明确**：旧版让模型"把这条原子改得更自足"，没有一个具体的成功判据；新版把
+       **问题**传给模型（``{{QUESTION}}``），演化目标变成"让这组候选足以回答这个问题"。
+    3. **对 RL 友好**：一条 QA 一条 trajectory，奖励信号（答案对不对）直接挂在这条轨迹上。
+
+    **每条 QA 从同一份 base 库出发**（``memories`` 在每条 QA 开始时重置），所以 QA 之间
+    互不影响 —— 这正是"一条 QA 一条轨迹"的前提，也让 base ``atommem.jsonl`` 始终不被修改。
 
     每条原子**只召回一次**，内层各轮共享同一份证据；上一轮改了什么靠 HISTORY 传递，
     而不是重新检索（避免把自己刚写的措辞当成独立证据）。
@@ -747,7 +782,7 @@ async def run_dir(
     每次模型调用都会把**本轮结果**（status / 动作 / 增删改 / 错误）记进 trace 并在 info
     级别打印一行，debug 级别另外打印完整的真实数据流（召回内容、完整 prompt、动作解析）。
     """
-    from . import atommem, evoactions
+    from . import atommem, evoactions, searchmem
 
     label = directory.name
     log = log.bind(label)
@@ -760,9 +795,9 @@ async def run_dir(
         log.warn("跳过：没有 msgmem.jsonl")
         return {"dir": label, "skipped": "no msgmem.jsonl", "status": "SKIPPED"}
 
-    memories = read_jsonl(atommem_path)
+    base_memories = read_jsonl(atommem_path)
     raw_order = read_jsonl(msgmem_path)
-    if not memories or not raw_order:
+    if not base_memories or not raw_order:
         log.warn("跳过：atommem/msgmem 为空")
         return {"dir": label, "skipped": "empty atommem/msgmem", "status": "SKIPPED"}
 
@@ -771,285 +806,371 @@ async def run_dir(
     # 顺序从 msgmem 的真实顺序取（而不信 atommem 文件顺序）——见文件顶部关于顺序的注释。
     msgmem_pos = {memory_id(raw): index for index, raw in enumerate(raw_order)}
 
-    # **把库按 atom_key 排好再走游标**。这一步不能省：``recall_pool`` 用 atom_key 判
-    # "是否早于 current"，而外层游标是按列表顺序推进的。两者不一致时（文件顺序 ≠ id
-    # 顺序，实测真实数据里有 9~43 处逆序，见文件顶部注释）游标会跳过原子、或者把本该
-    # 可见的候选判成"未来"而排除掉。排序后两套顺序统一，前缀语义才成立。
-    before_sort = [memory_id(m) for m in memories]
-    memories = order_atoms(memories, msgmem_pos)
-    if [memory_id(m) for m in memories] != before_sort:
+    # **把库按 atom_key 排好**。这一步不能省：``recall_pool`` 用 atom_key 判"是否早于
+    # current"，两者顺序不一致时（文件顺序 ≠ id 顺序，实测真实数据里有 9~43 处逆序）
+    # 前缀语义会失效。排序后两套顺序统一。
+    before_sort = [memory_id(m) for m in base_memories]
+    base_memories = order_atoms(base_memories, msgmem_pos)
+    if [memory_id(m) for m in base_memories] != before_sort:
         log.debug("库按 atom_key 重排（文件顺序 != id 顺序）")
 
     # 用**演化模板**（不是抽取模板）：字段措辞是"精修已有记忆 + 必须给 source"。
     schema = atommem.build_schema_prompt(atommem.load_template(EVOMEM_TEMPLATE_FILE))
     window = int(config.get("context_window", 2))
-    max_turns = max(1, int(config.get("max_evomem_turn", 4)))
+    max_turns = max(1, int(config.get("max_evomem_turn", 2)))
     max_library_tokens = int(config.get("library_max_tokens", 40000))
-    # 调试闸门：只看前 N 条原子。0 / 负数 = 不限制。在**排序之后**截断，所以取到的
-    # 是 id 顺序上的前 N 条（而不是文件顺序上的）。
-    max_atommem = max(0, int(config.get("max_atommem", 0) or 0))
+    # QA 驱动的闸门：每个目录最多处理前 N 条 QA（0 = 全部），每条 QA 取 K 个候选。
+    max_qa = max(0, int(config.get("max_qa", 0) or 0))
+    qa_candidates = max(1, int(config.get("qa_candidates", 10) or 10))
+    skip_category5 = bool(config.get("skip_category5", True))
+    search_cfg = config.get("search") or {}
+    search_weights = search_cfg.get("weights") or None
+    search_k = int(search_cfg.get("rrf_k", searchmem.DEFAULT_RRF_K))
 
     # anchor：新记忆的 id 挂在最后一条 raw 消息下，与 atommem 的 id 约定一致。
     anchor_raw = raw_order[-1]
     anchor_text = memory_text(anchor_raw)
     anchor_atom_id = memory_id(anchor_raw)
 
-    active: set[str] = {memory_id(m) for m in memories if memory_id(m)}
+    # QA 列表：目录 -> sample -> qa。找不到就当这个目录没有可演化的问题（SKIPPED）。
+    questions = load_dir_questions(label, limit=max_qa)
+    if not questions:
+        log.warn(f"跳过：QA 数据源里找不到目录 {label} 的问题")
+        return {"dir": label, "skipped": "no qa for dir", "status": "SKIPPED"}
+
     traces: list[dict[str, Any]] = []
+    qa_records: list[dict[str, Any]] = []
     state_path = output_dir / f"{label}.evolution.jsonl"
+    qa_path = output_dir / f"{label}.qa_trajectories.jsonl"
     state_path.parent.mkdir(parents=True, exist_ok=True)
 
     log.info(
-        f"开始演化：库 {len(memories)} 条 / msgmem {len(raw_order)} 条 / "
-        f"每条原子最多 {max_turns} 轮（NOOP 提前结束该条）/ "
-        f"anchor={anchor_atom_id} / window={window}"
-        + (f" / 只跑前 {max_atommem} 条（--max-atommem 调试）" if max_atommem else "")
+        f"开始演化：库 {len(base_memories)} 条 / msgmem {len(raw_order)} 条 / "
+        f"QA {len(questions)} 条"
+        + ("（跳过 category5）" if skip_category5 else "")
+        + f" / 每条 QA 取 {qa_candidates} 个候选 × 每条最多 {max_turns} 轮 / "
+        f"window={window} / anchor={anchor_atom_id}"
+        + (f" / 只跑前 {max_qa} 条 QA（--max-qa 调试）" if max_qa else "")
     )
 
-    with state_path.open("w", encoding="utf-8") as state_file:
-        stop_reason = "已走完库中所有原子"
-        atoms_done = 0        # 内层循环正常结束（NOOP 或到 max_turns）的原子数
-        total_calls = 0       # 模型调用总次数
+    stop_reason = "已走完全部 QA"
+    evolved_candidates = 0   # 演化过的候选原子数（跨 QA 累计）
+    total_calls = 0          # 模型调用总次数
+    qa_done = 0
+    qa_skipped = 0
 
-        # 外层游标：按 id 顺序走库。``--max-atommem`` 只截断**游标走到哪**，不截断
-        # ``memories`` 本身 —— 候选池/证据仍然取自整个库（前缀部分），否则前 N 条
-        # 之外更早的记忆就被错误地排除掉了。
-        walk = memories[:max_atommem] if max_atommem else memories
-        if max_atommem and len(walk) < len(memories):
-            stop_reason = f"达到 max_atommem={max_atommem}（调试上限）"
+    # 目录内所有 QA 的演化结果并集（按 id 去重），最后落成快照。
+    union: dict[str, dict[str, Any]] = {}
 
-        # ---- 外层：游标从头走到尾，逐条精修 ----
-        # 创建进度条：显示当前处理到第几条原子
-        active_walk = [m for m in walk if memory_id(m) in active]
+    with state_path.open("w", encoding="utf-8") as state_file, \
+            qa_path.open("w", encoding="utf-8") as qa_file:
         pbar = tqdm(
-            total=len(active_walk),
-            desc=f"[{label}] 演化原子",
-            unit="atom",
+            total=len(questions),
+            desc=f"[{label}] 演化 QA",
+            unit="qa",
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-            disable=log.threshold > 20,  # 如果日志级别高于INFO（20），禁用进度条
+            disable=log.threshold > 20,  # 仅 info/warn/error 时显示进度条（debug 下日志已够详细）
         )
 
-        for position, current in enumerate(walk):
-            current_id = memory_id(current)
-            if current_id not in active:
-                continue  # 已被软删除的原子跳过（不占预算）
+        for qa_index, qa in questions:
+            question = str(qa.get("question") or "").strip()
+            category = qa.get("category")
+            if skip_category5 and category == 5:
+                qa_skipped += 1
+                pbar.update(1)
+                log.debug(f"QA {qa_index}：category 5（adversarial），跳过演化")
+                continue
+            if not question:
+                qa_skipped += 1
+                pbar.update(1)
+                log.debug(f"QA {qa_index}：question 为空，跳过")
+                continue
 
-            # 候选池：**库里位置早于 current 的存活原子**（严格 key < key(current)）。
-            # 判断写在 recall_pool 一处，避免散落各处漏掉某个条件。
-            #
-            # **候选不足 top_k（包括为空）不做任何特殊处理**：库里前 top_k 条的候选池
-            # 天然小于 top_k，第一条更是空池。这些照常走完整流程 —— 召回返回空集，
-            # prompt 的 {{RECALLED}} 显示"(no recalled memories)"，模型照常判断。
-            # embedding 在这里的作用本来就是**排序**，候选不够就拿到多少算多少，
-            # 不值得为省这点调用加一条跳过分支（那会让第一条永远不被演化）。
-            candidates = recall_pool(current, memories, active, set(), msgmem_pos)
+            # ---- 每条 QA 从同一份 base 库出发（QA 之间互不影响）----
+            memories = [dict(m) for m in base_memories]
+            active: set[str] = {memory_id(m) for m in memories if memory_id(m)}
+            qa_trace_start = len(traces)
 
-            # ---- 召回：每条原子只做一次 ----
-            #
-            # 刻意**只召回一次**，内层多轮共享这一份证据，而不是每轮重新检索。两个原因：
-            # 1) 重新检索会让模型把自己上一轮刚写出的措辞当成"独立证据"再召回来，绕成
-            #    自我指涉（拿刚落地的措辞去 justify 自己）；
-            # 2) 每轮重嵌入整个候选池是纯粹的浪费 —— 证据集在这条原子的内层循环里本就
-            #    不该变。
-            # 上一轮改了什么，靠 HISTORY（每轮动作的执行结果）传给模型，不靠重检索。
-            query = build_recall_query(current, traces, fallback_text=anchor_text)
+            # ---- 外层：混合检索出这条问题的候选原子集 ----
+            pool = [m for m in memories if memory_id(m) in active]
             try:
-                recalled = await recall(query, candidates, config, embedder)
-            except Exception as exc:  # noqa: BLE001
-                log.error(f"current {current_id}: 召回失败，终止该目录：{type(exc).__name__}: {exc}")
-                traces.append(
-                    {
-                        "turn": total_calls + 1,
-                        "current_id": current_id,
-                        "position": position + 1,
-                        "status": "ERROR",
-                        "action": None,
-                        "summary": f"recall failed: {type(exc).__name__}: {exc}",
-                        "details": [],
-                        "touched": [],
-                        "added": [], "updated": [], "deleted": [],
-                        "errors": [f"recall: {type(exc).__name__}: {exc}"],
-                        "warnings": [], "library_size": len(memories),
-                        "active_size": len(active),
-                    }
+                scored = await searchmem.search_scored(
+                    question, pool,
+                    top_k=qa_candidates,
+                    embed=(embedder.embed if embedder is not None else None),
+                    query_tags=searchmem.extract_query_tags(question),
+                    weights=search_weights,
+                    k=search_k,
                 )
-                stop_reason = f"召回失败：{type(exc).__name__}"
+            except Exception as exc:  # noqa: BLE001
+                log.error(f"QA {qa_index}: 候选检索失败，终止该目录：{type(exc).__name__}: {exc}")
+                stop_reason = f"候选检索失败：{type(exc).__name__}"
                 break
 
-            recalled_block = build_recalled_block(recalled, raw_order, window)
+            candidates = [item.memory for item in scored]
+            log.info(
+                f"QA {qa_index}/{len(questions)}：候选 {len(candidates)}/{len(pool)}"
+                f"（category {category}）question={question[:80]!r}"
+            )
             log.debug(
                 evolog.block(
-                    f"current {current_id} 召回 {len(recalled)}/{len(candidates)} 条",
-                    "\n".join(f"  {memory_id(m)} | {memory_text(m)}" for m in recalled) or "(空)",
+                    f"QA {qa_index} 混合检索候选（RRF: dense+bm25+tag）",
+                    "\n".join(f"  {item.describe()} | {item.text[:80]}" for item in scored)
+                    or "(空)",
                 )
             )
 
-            # ---- 内层（agent loop）：同一条原子反复动作，直到 NOOP 或到 max_turns ----
-            inner = 0
-            while inner < max_turns:
-                inner += 1
-                total_calls += 1
+            # ---- 中层：候选集内逐条演化（保留现有 per-atom 内层 loop）----
+            # 按 atom_key 排序后走，保证"只看得到更早的原子"这个前缀语义成立。
+            for position, current in enumerate(order_atoms(candidates, msgmem_pos)):
+                current_id = memory_id(current)
+                if current_id not in active:
+                    continue  # 已被软删除（前面的候选演化时删掉的）
 
-                # **每轮按 id 重新取一次 current**：上一轮可能 UPDATE 了它，文本已经变了。
-                # 持有跨轮的旧引用会让第 2 轮看到的还是改之前的措辞。
-                live = next((m for m in memories if memory_id(m) == current_id), None)
-                if live is None or current_id not in active:
-                    log.warn(f"current {current_id}: 已被删除，结束该原子的内层循环")
-                    break
+                # 候选池：**库里位置早于 current 的存活原子**（严格 key < key(current)）。
+                candidates_pool = recall_pool(current, memories, active, set(), msgmem_pos)
 
-                # 目标只有 live 这一条。**不要**把整个库传进去（prompt 里只应有 1 条目标 +
-                # 召回证据；模型看见全库会对着看不见的内容乱删）。
-                # HISTORY 只包含**当前原子**的历史（同一个 current_id），不包含其他原子的轮次
-                current_history = [t for t in traces if t.get("current_id") == current_id]
-                messages = build_messages(live, recalled_block, current_history, schema)
-                log.info(
-                    f"current {current_id}（本次第 {position + 1}/{len(walk)} 条，"
-                    f"全库 {len(memories)} 条）"
-                    f"第 {inner}/{max_turns} 轮：候选 {len(candidates)} 召回 {len(recalled)} "
-                    f"prompt≈{count_tokens(messages[0]['content'])}tok 调用模型…"
-                )
-                # log.debug(evolog.block(
-                #     f"current {current_id} 第 {inner} 轮 prompt (system)", messages[0]["content"]
-                # ))
-
+                # ---- 召回：每条原子只做一次（内层多轮共享同一份证据）----
+                query = build_recall_query(current, traces, fallback_text=anchor_text)
                 try:
-                    content = await atommem.chat_completion(generator, gen_config, messages)
+                    recalled = await recall(query, candidates_pool, config, embedder)
                 except Exception as exc:  # noqa: BLE001
-                    log.error(f"current {current_id}: 模型调用失败：{type(exc).__name__}: {exc}")
+                    log.error(f"current {current_id}: 召回失败，终止该目录：{type(exc).__name__}: {exc}")
                     traces.append(
                         {
-                            "turn": total_calls,
+                            "turn": total_calls + 1,
+                            "qa_index": qa_index,
                             "current_id": current_id,
                             "position": position + 1,
-                            "inner": inner,
                             "status": "ERROR",
-                            "action": "MODEL_ERROR",
-                            "summary": f"model call failed: {type(exc).__name__}: {exc}",
+                            "action": None,
+                            "summary": f"recall failed: {type(exc).__name__}: {exc}",
                             "details": [],
                             "touched": [],
                             "added": [], "updated": [], "deleted": [],
-                            "errors": [f"model: {type(exc).__name__}: {exc}"],
+                            "errors": [f"recall: {type(exc).__name__}: {exc}"],
                             "warnings": [], "library_size": len(memories),
                             "active_size": len(active),
                         }
                     )
-                    stop_reason = f"模型调用失败：{type(exc).__name__}"
-                    log.info(describe_turn(traces[-1]))
+                    stop_reason = f"召回失败：{type(exc).__name__}"
                     break
 
-                log.info(evolog.block(
-                    f"current {current_id} 第 {inner} 轮 模型原始输出", content
-                ))
-
-                action = evoactions.parse_action(content)
-                mismatches = evoactions.verify_payload_matches(action.payload, memories, action.kind)
-                result = evoactions.apply_action(action, memories, active, anchor_atom_id)
-                memories = result.memories
-                touched = result.added_ids + result.updated_ids + result.deleted_ids
-                memories, shrunk = shrink_library(memories, active, max_library_tokens)
-
+                recalled_block = build_recalled_block(recalled, raw_order, window)
                 log.debug(
                     evolog.block(
-                        f"current {current_id} 第 {inner} 轮 动作解析/执行",
-                        f"kind={action.kind} supplied={action.supplied} "
-                        f"payload={len(action.payload)}\n"
-                        f"repairs={action.repairs}\n"
-                        f"parse_errors={action.errors}\n"
-                        f"apply_errors={result.errors}\n"
-                        f"content_mismatch={mismatches}\n"
-                        + "\n".join(
-                            f"  {op}: {ids}"
-                            for op, ids in (
-                                ("added", result.added_ids),
-                                ("updated", result.updated_ids),
-                                ("deleted", result.deleted_ids),
-                                ("shrunk", shrunk),
-                            ) if ids
-                        ),
+                        f"QA {qa_index} current {current_id} 召回 {len(recalled)}/{len(candidates_pool)} 条",
+                        "\n".join(f"  {memory_id(m)} | {memory_text(m)}" for m in recalled) or "(空)",
                     )
                 )
 
-                # summary 就是回灌给下一轮 HISTORY 的那句话：动作类型 + 执行结果。
-                summary = action_summary(action, result)
-                trace = {
-                    "turn": total_calls,
-                    "current_id": current_id,
-                    "position": position + 1,
-                    "inner": inner,
-                    "status": "NOOP" if action.is_noop else ("OK" if touched else "EMPTY"),
-                    "action": action.kind,
-                    "supplied": action.supplied,
-                    "summary": summary,
-                    "details": [f"warn: {w}" for w in mismatches],
-                    "added": result.added_ids,
-                    "updated": result.updated_ids,
-                    "deleted": result.deleted_ids,
-                    "touched": touched,
-                    "errors": action.errors + result.errors,
-                    "warnings": mismatches,
-                    "repaired": action.repairs,
-                    "shrunk": shrunk,
-                    "library_size": len(memories),
-                    "active_size": len(active),
-                    "library_tokens": library_token_estimate(memories),
-                    "recalled_ids": [memory_id(m) for m in recalled],
-                    "candidates": len(candidates),
-                    "prompt_tokens": count_tokens(messages[0]["content"]),
-                    "raw_output": content,
-                }
-                traces.append(trace)
-                state_file.write(json.dumps(trace, ensure_ascii=False) + "\n")
-                state_file.flush()
+                # ---- 内层（agent loop）：同一条原子反复动作，直到 NOOP 或到 max_turns ----
+                inner = 0
+                while inner < max_turns:
+                    inner += 1
+                    total_calls += 1
 
-                for warning in mismatches:
-                    log.warn(f"current {current_id}: {warning}")
-                for error in action.errors + result.errors:
-                    log.warn(f"current {current_id}: {error}")
-                if shrunk:
-                    log.warn(f"current {current_id}: 超出 token 预算，软删除 {shrunk}")
-                log.info(describe_turn(trace))
+                    # **每轮按 id 重新取一次 current**：上一轮可能 UPDATE 了它，文本已经变了。
+                    live = next((m for m in memories if memory_id(m) == current_id), None)
+                    if live is None or current_id not in active:
+                        log.warn(f"current {current_id}: 已被删除，结束该原子的内层循环")
+                        break
 
-                # NOOP 结束**这一条原子**的内层循环，游标继续走到下一条。
-                # （不是结束整个目录 —— 那会让库里绝大多数原子从没被看过。）
-                if action.is_noop:
-                    break
-                if not result.memories:
-                    break
+                    # 目标只有 live 这一条；HISTORY 也只含**当前原子**的历史。
+                    current_history = [t for t in traces if t.get("current_id") == current_id]
+                    messages = build_messages(live, recalled_block, current_history, schema, question)
+                    log.info(
+                        f"QA {qa_index} 候选 {position + 1}/{len(candidates)} current={current_id} "
+                        f"第 {inner}/{max_turns} 轮：候选 {len(candidates_pool)} 召回 {len(recalled)} "
+                        f"prompt≈{count_tokens(messages[0]['content'])}tok 调用模型…"
+                    )
 
-            else:
-                # while 正常结束（没 break）＝ 用满了 max_turns，这条原子到此为止。
-                log.warn(f"current {current_id}: 内层循环用满 {max_turns} 轮，转下一条")
+                    try:
+                        content = await atommem.chat_completion(generator, gen_config, messages)
+                    except Exception as exc:  # noqa: BLE001
+                        log.error(f"current {current_id}: 模型调用失败：{type(exc).__name__}: {exc}")
+                        traces.append(
+                            {
+                                "turn": total_calls,
+                                "qa_index": qa_index,
+                                "current_id": current_id,
+                                "position": position + 1,
+                                "inner": inner,
+                                "status": "ERROR",
+                                "action": "MODEL_ERROR",
+                                "summary": f"model call failed: {type(exc).__name__}: {exc}",
+                                "details": [],
+                                "touched": [],
+                                "added": [], "updated": [], "deleted": [],
+                                "errors": [f"model: {type(exc).__name__}: {exc}"],
+                                "warnings": [], "library_size": len(memories),
+                                "active_size": len(active),
+                            }
+                        )
+                        stop_reason = f"模型调用失败：{type(exc).__name__}"
+                        log.info(describe_turn(traces[-1]))
+                        break
 
-            atoms_done += 1
+                    log.debug(evolog.block(
+                        f"QA {qa_index} current {current_id} 第 {inner} 轮 模型原始输出", content
+                    ))
 
-            # 更新外层进度条
+                    action = evoactions.parse_action(content)
+                    mismatches = evoactions.verify_payload_matches(action.payload, memories, action.kind)
+                    result = evoactions.apply_action(action, memories, active, anchor_atom_id)
+                    memories = result.memories
+                    touched = result.added_ids + result.updated_ids + result.deleted_ids
+                    memories, shrunk = shrink_library(memories, active, max_library_tokens)
+
+                    log.debug(
+                        evolog.block(
+                            f"QA {qa_index} current {current_id} 第 {inner} 轮 动作解析/执行",
+                            f"kind={action.kind} supplied={action.supplied} "
+                            f"payload={len(action.payload)}\n"
+                            f"repairs={action.repairs}\n"
+                            f"parse_errors={action.errors}\n"
+                            f"apply_errors={result.errors}\n"
+                            f"content_mismatch={mismatches}\n"
+                            + "\n".join(
+                                f"  {op}: {ids}"
+                                for op, ids in (
+                                    ("added", result.added_ids),
+                                    ("updated", result.updated_ids),
+                                    ("deleted", result.deleted_ids),
+                                    ("shrunk", shrunk),
+                                ) if ids
+                            ),
+                        )
+                    )
+
+                    summary_text = action_summary(action, result)
+                    trace = {
+                        "turn": total_calls,
+                        "qa_index": qa_index,
+                        "current_id": current_id,
+                        "position": position + 1,
+                        "inner": inner,
+                        "status": "NOOP" if action.is_noop else ("OK" if touched else "EMPTY"),
+                        "action": action.kind,
+                        "supplied": action.supplied,
+                        "summary": summary_text,
+                        "details": [f"warn: {w}" for w in mismatches],
+                        "added": result.added_ids,
+                        "updated": result.updated_ids,
+                        "deleted": result.deleted_ids,
+                        "touched": touched,
+                        "errors": action.errors + result.errors,
+                        "warnings": mismatches,
+                        "repaired": action.repairs,
+                        "shrunk": shrunk,
+                        "library_size": len(memories),
+                        "active_size": len(active),
+                        "library_tokens": library_token_estimate(memories),
+                        "recalled_ids": [memory_id(m) for m in recalled],
+                        "candidates": len(candidates_pool),
+                        "prompt_tokens": count_tokens(messages[0]["content"]),
+                        "raw_output": content,
+                    }
+                    traces.append(trace)
+                    state_file.write(json.dumps(trace, ensure_ascii=False) + "\n")
+                    state_file.flush()
+
+                    for warning in mismatches:
+                        log.warn(f"current {current_id}: {warning}")
+                    for error in action.errors + result.errors:
+                        log.warn(f"current {current_id}: {error}")
+                    if shrunk:
+                        log.warn(f"current {current_id}: 超出 token 预算，软删除 {shrunk}")
+                    log.info(describe_turn(trace))
+
+                    # NOOP 结束**这一条原子**的内层循环；候选集里的下一条继续。
+                    if action.is_noop:
+                        break
+                    if not result.memories:
+                        break
+                else:
+                    # while 正常结束 ＝ 用满 max_turns，这条原子到此为止。
+                    log.warn(f"current {current_id}: 内层循环用满 {max_turns} 轮，转下一条")
+
+                evolved_candidates += 1
+
+            # ---- 落一条 QA trajectory ----
+            qa_traces = traces[qa_trace_start:]
+            survivor_ids = [memory_id(m) for m in candidates if memory_id(m) in active]
+            record = {
+                "dir": label,
+                "qa_index": qa_index,
+                "question": question,
+                "category": category,
+                "reference": qa.get("answer", qa.get("adversarial_answer")),
+                "evidence": qa.get("evidence") or [],
+                "candidate_ids": [memory_id(m) for m in candidates],
+                "evolved_ids": survivor_ids,
+                "library_size": len(memories),
+                "active_size": len(active),
+                "turns": len(qa_traces),
+                "actions": [t.get("action") for t in qa_traces],
+                "turn_status": [t.get("status") for t in qa_traces],
+                "added": sum(len(t.get("added", [])) for t in qa_traces),
+                "updated": sum(len(t.get("updated", [])) for t in qa_traces),
+                "deleted": sum(len(t.get("deleted", [])) for t in qa_traces),
+                "errors": sum(len(t.get("errors", [])) for t in qa_traces),
+            }
+            qa_records.append(record)
+            qa_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            qa_file.flush()
+
+            # 并集快照：这条 QA 演化后仍然存活的候选原子（供目录级快照汇总）
+            for memory in memories:
+                mem_id = memory_id(memory)
+                if mem_id in active and mem_id in record["evolved_ids"]:
+                    union[mem_id] = memory
+
+            qa_done += 1
+            log.info(
+                f"QA {qa_index} 完成：候选 {len(candidates)} 演化 {len(survivor_ids)}"
+                f"（+{record['added']} ~{record['updated']} -{record['deleted']}）"
+                f"turns={record['turns']}"
+            )
+
             pbar.update(1)
             pbar.set_postfix({
                 "turns": total_calls,
                 "active": len(active),
-                "current": current_id[:12] + "..." if len(current_id) > 12 else current_id
+                "qa": f"{qa_done}/{len(questions)}",
             })
 
-        # 关闭进度条
+            # 模型调用失败会 break 内层循环；这里同步结束外层（避免在坏状态上继续跑）
+            if stop_reason.startswith(("模型调用失败", "召回失败", "候选检索失败")):
+                break
+
         pbar.close()
 
-    final = [m for m in memories if memory_id(m) in active]
+    # 演化后快照：base 库 + 各 QA 演化出的新原子（并集）。QA 演化的结果都基于同一份 base
+    # 库，所以这里按 id 合并 —— 同名 id 取演化后的版本（union 里的），其余保留 base。
+    merged: dict[str, dict[str, Any]] = {memory_id(m): m for m in base_memories}
+    merged.update(union)
     out_path = output_dir / f"{label}.atommem.evolved.jsonl"
-    write_jsonl(out_path, final)
+    write_jsonl(out_path, list(merged.values()))
 
     errors = sum(len(t.get("errors", [])) for t in traces)
     status = "ERROR" if any(t.get("status") == "ERROR" for t in traces) else "OK"
     summary = {
         "dir": label,
         "status": status,
-        "turns": len(traces),           # 模型调用总次数（内层轮数之和）
-        "atoms_done": atoms_done,       # 走完内层循环的原子数
-        "library_size": len(memories),
+        "turns": len(traces),                    # 模型调用总次数
+        "atoms_done": evolved_candidates,        # 演化过的**候选**原子数（跨 QA 累计）
+        "qa_total": len(questions),
+        "qa_done": qa_done,
+        "qa_skipped": qa_skipped,
+        "qa_status": [r["turn_status"][-1] if r["turn_status"] else "EMPTY" for r in qa_records],
+        "candidates_total": sum(len(r["candidate_ids"]) for r in qa_records),
+        "library_size": len(merged),
         "stop_reason": stop_reason,
-        "max_atommem": max_atommem,
-        "initial_size": len(read_jsonl(atommem_path)),
-        "final_size": len(memories),
-        "final_active": len(final),
+        "max_qa": max_qa,
+        "qa_candidates": qa_candidates,
+        "initial_size": len(base_memories),
+        "final_size": len(merged),
         "added": sum(len(t.get("added", [])) for t in traces),
         "updated": sum(len(t.get("updated", [])) for t in traces),
         "deleted": sum(len(t.get("deleted", [])) for t in traces),
@@ -1058,19 +1179,57 @@ async def run_dir(
         "errors": errors,
         "warnings": sum(len(t.get("warnings", [])) for t in traces),
         "traces": traces,
+        "qa_records": qa_records,
         "output": str(out_path),
         "trace": str(state_path),
+        "qa_trajectories": str(qa_path),
     }
     log.info(
-        f"完成 {status}：{len(traces)} 次模型调用 / {atoms_done} 条原子 "
-        f"（停止：{stop_reason}）"
-        f"库 {summary['initial_size']}->{summary['final_size']}"
-        f"(active {summary['final_active']}) "
+        f"完成 {status}：{len(traces)} 次模型调用 / {qa_done} 条 QA（跳过 {qa_skipped}）"
+        f" / 共演化 {evolved_candidates} 个候选（停止：{stop_reason}）"
+        f"库 {summary['initial_size']}->{summary['final_size']} "
         f"+{summary['added']} ~{summary['updated']} -{summary['deleted']} "
         f"errors={errors} warns={summary['warnings']} -> {out_path}"
     )
     return summary
 
+
+
+# ---------------------------------------------------------------------------
+# QA 数据源：evomem 现在按问题驱动，所以要知道每个目录有哪些问题
+# ---------------------------------------------------------------------------
+
+def load_dir_questions(label: str, limit: int = 0) -> list[tuple[int, dict[str, Any]]]:
+    """取某个 speaker 目录的 QA 列表，保留**原始下标**：``[(qa_index, qa), ...]``。
+
+    为什么保留下标而不是用问题文本当键：**问题文本不唯一**（实测 conv-48 有 11 组重复
+    question、conv-30 有 1 组，全库 1974/1986 唯一）。用文本做键会把同一条 QA 的两份
+    数据当成一条，resume 时静默丢掉一条。下标才是唯一标识。
+
+    目录名 -> sample 靠 ``eval_utils.sample_dir``（``{speaker_a}_{speaker_b}``）。找不到
+    对应 sample 时返回空列表 —— 调用方据此把该目录标成 SKIPPED，而不是凭空造问题。
+
+    ``limit > 0`` 时只取前 limit 条（调试闸门）。
+    """
+    from . import eval_utils
+
+    try:
+        samples = eval_utils.load_samples()
+    except (OSError, ValueError) as exc:  # 数据文件缺失或坏掉
+        print(f"[warn] 无法读取 QA 数据源：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return []
+    for sample in samples:
+        if eval_utils.sample_dir(sample) != label:
+            continue
+        qas = sample.get("qa") or []
+        items = list(enumerate(qas))
+        return items[:limit] if limit > 0 else items
+    return []
+
+
+# ---------------------------------------------------------------------------
+# 召回
+# ---------------------------------------------------------------------------
 
 async def recall(
     query: str,
@@ -1104,8 +1263,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sample", type=str, default=None, help="只处理指定目录（等价于只传一个 dirs）")
     parser.add_argument("--max-turns", type=int, default=None, help="覆盖 max_evomem_turn（每条原子的内层轮数上限）")
     parser.add_argument(
-        "--max-atommem", type=int, default=None,
-        help="最多处理几条 atommem（调试用；0 或不传=走遍全库）",
+        "--max-qa", type=int, default=None,
+        help="每个目录最多处理前 N 条 QA（调试用；0 或不传=全部）",
+    )
+    parser.add_argument(
+        "--candidates", type=int, default=None,
+        help="覆盖 qa_candidates：每条 QA 用混合检索取几个候选原子来演化",
     )
     parser.add_argument("--top-k", type=int, default=None, help="覆盖召回条数")
     parser.add_argument("--concurrency", type=int, default=None, help="覆盖目录级并发")
@@ -1132,7 +1295,8 @@ async def async_main(args: argparse.Namespace) -> None:
                     config[key] = value
     for key, value in (
         ("max_evomem_turn", args.max_turns),
-        ("max_atommem", args.max_atommem),
+        ("max_qa", args.max_qa),
+        ("qa_candidates", args.candidates),
         ("top_k", args.top_k),
         ("concurrency", args.concurrency),
     ):
@@ -1200,9 +1364,14 @@ async def async_main(args: argparse.Namespace) -> None:
     )
 
     log.info(
-        f"evomem 启动：{len(dirs)} 个目录 | max_turns={config['max_evomem_turn']} "
+        f"evomem 启动（QA 驱动）：{len(dirs)} 个目录 | max_turns={config['max_evomem_turn']} "
+        f"candidates={config['qa_candidates']} max_qa={config['max_qa'] or '全部'} "
         f"top_k={config['top_k']} concurrency={config.get('concurrency')} "
         f"log={log.level}"
+    )
+    log.info(
+        f"混合检索权重 {(config.get('search') or {}).get('weights')} "
+        f"rrf_k={(config.get('search') or {}).get('rrf_k')}"
     )
     log.info(f"generator={gen_config['model']} @ {gen_config['base_url']}")
     log.info(f"embedding={embedding_model} @ {embedding_config.get('base_url')}")
@@ -1256,7 +1425,8 @@ async def async_main(args: argparse.Namespace) -> None:
     for item in ordered:
         log.info(
             f"  {item.get('status'):8s} {item.get('dir'):18s} "
-            f"turns={item.get('turns', 0)} actions={item.get('actions')} "
+            f"qa={item.get('qa_done', 0)}/{item.get('qa_total', 0)} "
+            f"cands={item.get('candidates_total', 0)} turns={item.get('turns', 0)} "
             f"+{item.get('added', 0)} ~{item.get('updated', 0)} -{item.get('deleted', 0)} "
             f"errors={item.get('errors', 0)}"
             + (f" | {item['error']}" if item.get("error") else "")

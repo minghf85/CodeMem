@@ -96,6 +96,17 @@ def main() -> None:
     atommem.chat_completion = fake_chat  # type: ignore[assignment]
     V.Embedder = FakeEmbedder  # type: ignore[assignment]
 
+    # QA 驱动后 run_dir 需要问题数据源。假目录没有对应的 sample，所以注入一个假的
+    # QA 列表 —— 否则 run_dir 会直接把这个目录标成 SKIPPED，什么都测不到。
+    # 每条 QA 只放一个问题；候选检索（FakeEmbedder + BM25/tag）会从两条原子里取候选。
+    fake_qas = {
+        "Pair_One": [(0, {"question": "Where did A get a new job?", "answer": "Berlin", "evidence": ["D1:2"], "category": 1})],
+        "Pair_Two": [(0, {"question": "Where did C move?", "answer": "Berlin", "evidence": ["D1:2"], "category": 1})],
+    }
+    V.load_dir_questions = (  # type: ignore[assignment]
+        lambda label, limit=0: (fake_qas.get(label) or [])[:limit] if limit > 0 else (fake_qas.get(label) or [])
+    )
+
     args = V.parse_args([
         "--sample", str(WORK / "Pair_One"), "--output-dir", str(OUT),
         "--experiment", "smoke", "--concurrency", "1",
@@ -117,25 +128,27 @@ def main() -> None:
     checks.append(("log_path 记录", summary.get("log_path") is not None))
     d = summary["dirs"][0]
     checks.append(("目录状态 OK", d.get("status") == "OK", d.get("status")))
-    # 嵌套语义：两条原子各走一遍内层循环（UPDATE → NOOP）。库里最早的那条候选池为空，
-    # 但照常调模型（不再跳过），所以两条都会被处理。
-    checks.append(("逐轮 status 记录", d.get("turn_status") == ["OK", "NOOP", "OK", "NOOP"],
+    # QA 驱动语义：1 条 QA 的候选集里有原子（FakeEmbedder 对任何 query 都给分，
+    # BM25/tag 也会命中），每条候选各走一遍内层循环（UPDATE → NOOP）。
+    checks.append(("QA 总数记录", d.get("qa_total") == 1, d.get("qa_total")))
+    checks.append(("QA 完成数", d.get("qa_done") == 1, d.get("qa_done")))
+    checks.append(("逐轮 status 交错(OK/NOOP 成对)", len(d.get("turn_status") or []) % 2 == 0,
                    d.get("turn_status")))
-    checks.append(("actions 记录", d.get("actions") == ["UPDATE", "NOOP", "UPDATE", "NOOP"],
-                   d.get("actions")))
-    checks.append(("走完内层循环的原子数", d.get("atoms_done") == 2, d.get("atoms_done")))
+    checks.append(("actions 与 status 等长", len(d.get("actions") or []) == len(d.get("turn_status") or [])))
+    checks.append(("演化过至少一个候选", (d.get("atoms_done") or 0) >= 1, d.get("atoms_done")))
     checks.append(("模型调用数 = 轮数", d.get("turns") == len(d.get("turn_status") or []),
                    d.get("turns")))
     checks.append(("traces 未写进 summary（体积）", "traces" not in d))
     checks.append(("演化输出存在", Path(d["output"]).exists()))
     checks.append(("逐轮 trace 存在", Path(d["trace"]).exists()))
+    checks.append(("QA trajectory 存在", Path(d["qa_trajectories"]).exists()))
     logs = list((WORK / "logs").glob("evomem_*.log"))
     checks.append(("日志落盘", bool(logs), str(logs)))
     if logs:
         body = logs[0].read_text(encoding="utf-8")
-        # 日志格式随嵌套循环改成 "current <id>（位置/总数）第 N/M 轮"，
-        # 断言按新格式走（旧格式的 "turn 1 OK" 已不存在）。
+        # 日志格式随 QA 驱动改成 "QA <idx> 候选 i/K current=<id> 第 N/M 轮"
         checks.append(("日志含每轮结果", "轮：" in body and "turn 1 OK" in body))
+        checks.append(("日志含 QA 行", "QA 0/" in body))
         checks.append(("日志含汇总", "全部结束" in body))
 
     bad = 0

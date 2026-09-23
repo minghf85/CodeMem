@@ -27,7 +27,7 @@ configs/
   dpo_data.yaml       # gen_dpo_data 的模型接口配置
   grpo_data.yaml      # 强模型 gpt-5.6-luna（gen_dpo 的 chosen 侧）
   atommem.yaml        # atommem 评测配置（embedding / generator / judge）
-  evomem.yaml         # evomem 演化配置（embedding / generator / 轮数 / token 预算）
+  evomem.yaml         # evomem 演化配置（embedding / generator / QA 闸门 / 混合检索权重）
   baseline.yaml rag.yaml judge.yaml
 data/
   correct_locomo10.json        # 原始对话数据（含 QA 和 evidence）
@@ -49,15 +49,17 @@ data/
     summary.json                 # 全部目录的汇总
 src/codemem/
   msgmem.py atommem.py gen_dpo_data.py
-  prompts.py                   # 全部 prompt（含 EVOMEM_PROMPT）
+  prompts.py                   # 全部 prompt（含 EVOMEM_PROMPT 的 {{QUESTION}} 槽）
+  searchmem.py                 # 混合检索：dense + BM25 + tag 三路，RRF 融合（唯一检索实现）
   evoactions.py                # evomem 动作的解析与执行（纯 CPU）
-  evomem.py                    # evomem 流程编排：两层循环（外层走库 / 内层 agent loop）
+  evomem.py                    # evomem 流程编排：QA 驱动三层循环（QA / 候选原子 / agent loop）
   evolog.py                    # 分级日志：级别过滤 + 终端 + 落盘
   eval_utils.py judge.py metrics.py
 scripts/
   eval_baseline.py eval_rag.py eval_atommem.py analyze_atommem_results.py
+  test_searchmem.py            # 混合检索的自测（纯 CPU，含假 embedder）
   test_evoactions.py           # 动作解析与执行的纯 CPU 自测
-  smoke_evomem_logging.py      # 日志、嵌套循环与逐轮上报的纯 CPU 自测
+  smoke_evomem_logging.py      # 日志、QA 驱动循环与逐轮上报的纯 CPU 自测
   smoke_evomem_main.py         # async_main 端到端（假模型）的纯 CPU 自测
 memory_template.json                 # 记忆条目字段定义（完整规范）
 memory_template_init_extract.json   # 原子记忆抽取字段定义（注入 atommem 的 prompt）
@@ -363,13 +365,15 @@ error_log: data/dpo/atom_dpo_errors.log
 ### `configs/evomem.yaml`（evomem 使用）
 
 字段含义见文件内注释。要改的关键项：`embedding`（本地 ollama）、`generator`（演化用强模型）、
-`top_k` / `context_window` / `max_evomem_turn`（**每条原子**的内层轮数上限）/
-`max_atommem`（调试上限，0 = 全库）/ `concurrency`（目录级）/ `library_max_tokens`、
-以及 `log`（见 §5.4）。
+**QA 驱动闸门** `max_qa`（调试上限，0 = 全部 QA）/ `qa_candidates`（每条 QA 取几个候选，K）/
+`skip_category5`、**混合检索** `search.rrf_k` 与 `search.weights`（`{dense, bm25, tag}`，
+设成 `{dense: 1.0, bm25: 0.0, tag: 0.0}` 即退化为纯 embedding 检索）、
+`top_k` / `context_window` / `max_evomem_turn`（**每条候选原子**的内层轮数上限，默认 2）/
+`concurrency`（目录级）/ `library_max_tokens`、以及 `log`（见 §5.4）。
 
-> ⚠️ **成本**：嵌套循环下调用次数 = 每条原子的内层轮数之和，最坏 `原子数 × max_evomem_turn`。
-> 不过每次 prompt 只含**一条目标 + top_k 条证据**（不是整个库），所以单次比早期版本小得多。
-> 真跑前先用 `--max-atommem 30` 或 `--max-turns 1` 试。
+> ⚠️ **成本**：QA 驱动下调用次数 ≈ `QA 数 × qa_candidates × max_evomem_turn`。全 1986 条 QA、
+> K=10、轮数 2 时最坏约 4 万次强模型调用。不过每次 prompt 只含**一条目标 + top_k 条证据**
+> （不是整个库），所以单次比早期版本小得多。真跑前先用 `--max-qa 20` 或 `--max-turns 1` 试。
 
 ---
 
@@ -390,31 +394,44 @@ error_log: data/dpo/atom_dpo_errors.log
 atommem 是"从消息里抽出事实"，evomem 是"把抽出来的记忆库改得更好"：更准确、更自足、
 更完整。当前阶段**不做强化学习**，直接用一个强模型按 prompt 反复演化。
 
+**演化单位是"一条 QA 问题"**：不再逐条精修全库原子，而是**按问题驱动** —— 用 QA 的
+question 在 atommem 上做**混合检索**得到一个候选原子集合，再对这个集合内的每条原子做
+演化，最后得到"更可能回答这个问题"的原子集合。这样既有成本上的好处（调用只花在与问题
+相关的原子上），也对后续 RL 友好（一条 QA 一条 trajectory）。
+
 ### 5.1 流程
 
 对每个 speaker 目录（**目录之间并行，目录之内串行** —— 第 N 轮动作依赖前 N-1 轮改完的
-记忆库）。**两层循环**：
+记忆库）。**QA 驱动的三层循环**：
 
 ```
-记忆库 = atommem.jsonl（按 id 顺序排好）;  active = 全部 id;  anchor = 最后一条 raw 消息
+base = atommem.jsonl（按 atom_key 排好）;  anchor = 最后一条 raw 消息的 id
 
-for current in 按 id 顺序的每条原子:            # 外层游标，默认走遍全库
-    召回（**每条原子只做一次**）: current 文本 + 最近动作摘要 → query
-          → 从「位置早于 current」的存活原子里按 embedding 相似度取 top_k
-          → 每条附上它 source 对应的 msgmem + 前后 context_window 条原始消息
-    for inner in 1..max_evomem_turn:          # 内层 agent loop，默认每条最多 4 轮
-        构建 prompt（current + 召回证据 + HISTORY）→ 调用模型 → 解析出恰好一个动作
-        → 执行（纯 CPU）→ 把执行结果写进 HISTORY，作为下一轮的反馈
-        输出本轮结果（status / 动作 / 增删改 / 错误）
-        动作是 NOOP → 结束**这一条原子**，游标前进到下一条
-        用满 max_evomem_turn → 同样结束这一条，游标前进
+for 每条 QA（跳过 category 5）:                # 外层：问题驱动
+    候选集 = searchmem.search(question, base, top_k=K)   # 混合检索 dense+BM25+tag（RRF）
+    for current in 候选集内每条原子:            # 中层：候选集内逐条
+        召回（**每条候选只做一次**）: current 文本 + 最近动作摘要 → query
+              → 从「位置早于 current」的存活原子里按 embedding 相似度取 top_k
+              → 每条附上它 source 对应的 msgmem + 前后 context_window 条原始消息
+        for inner in 1..max_evomem_turn:       # 内层 agent loop，默认每条最多 2 轮
+            构建 prompt（question + current + 召回证据 + HISTORY）→ 调模型 → 恰好一个动作
+            → 执行（纯 CPU）→ 把执行结果写进 HISTORY，作为下一轮的反馈
+            输出本轮结果（status / 动作 / 增删改 / 错误）
+            动作是 NOOP → 结束**这一条原子**，候选集里下一条继续
+            用满 max_evomem_turn → 同样结束这一条，候选集里下一条继续
+    落一条 QA trajectory（问题 / 候选 / 演化后集合 / 逐轮轨迹）
 
-输出: {dir}.atommem.evolved.jsonl + {dir}.evolution.jsonl（逐轮明细）+ summary.json
+输出: {dir}.qa_trajectories.jsonl + {dir}.atommem.evolved.jsonl
+      + {dir}.evolution.jsonl（逐轮明细）+ summary.json
 ```
+
+**每条 QA 从同一份 base 库出发**（QA 之间互不影响）—— 这是"一条 QA 一条 trajectory"的
+前提，也让 base `atommem.jsonl` 始终不被修改。代价是不同 QA 可能演化出重复的新原子
+（都挂在同一个 anchor 下），第一版接受这一点，重复度只在目录级并集快照里体现。
 
 `max_evomem_turn` 是**每条原子**的内层轮数上限，**不是全目录总轮数**。`NOOP` 只结束当前
-这条原子的内层循环（prompt 里写明这是大多数条目的正常结果），游标继续走 —— 库里的原子都会
-被看一遍。坏输出（解析不出动作）同样只结束这一条，不终止整个目录。
+这条原子的内层循环（prompt 里写明这是大多数条目的正常结果），候选集里下一条继续。坏输出
+（解析不出动作）同样只结束这一条，不终止整个 QA、更不终止目录。
 
 **每条原子只召回一次**：内层各轮共享同一份证据，上一轮改了什么靠 `HISTORY` 传给模型，而
 不是重新检索 —— 避免把模型自己刚写出的措辞当成"独立证据"又召回来，绕成自我指涉。
@@ -429,16 +446,52 @@ embedding 在这里的作用本来就是**排序**，候选不够就拿到多少
 召回的 top_k 子区；embedding 失败**直接报错终止该目录**，不静默退化（退化只能按文件顺序
 取前 top_k，那不是语义召回，模型会对着无关证据回 NOOP —— 看起来像"库已很好"，实际是嵌入挂了）。
 
+### 5.1.1 混合检索（`src/codemem/searchmem.py`）
+
+`searchmem` 是本项目唯一的检索实现，**两种模式共用同一套打分**：
+
+| 模式 | 用在哪 | query 文本 |
+|---|---|---|
+| atom → atom | evomem 给当前原子找证据 | 该原子的 `memory` 文本 + 最近动作摘要 |
+| question → atommem | evomem 选候选集 / QA 回答 | 问题的文本 |
+
+**三路通道，RRF 融合**（`k = 60`）：
+
+```
+score(d) = Σ_r  w_r / (k + rank_r(d))
+    r = dense   余弦相似度排名                权重 1.0
+    r = bm25    BM25 词法排名（纯 stdlib 实现） 权重 1.0
+    r = tag     tag 命中计数排名              权重 0.5
+```
+
+**为什么用 RRF 而不是加权分数**：dense 余弦、BM25 分数、tag 计数三者量纲完全不同，直接
+加权要先做分数归一化，而归一化对分布很敏感（换库、换 query 长度就得重调）。RRF 只看
+**名次**，天然可比、免调参；以后加 time 通道就是多一路，不影响其它路。
+
+**为什么 tag 单列一路而不是拼进被嵌入的文本**：`speaker:Caroline` 这种值对 embedding
+几乎不携带信息（会被整句话的语义平均掉），但对标签匹配很关键；单列一路才能给它独立权重。
+
+**为什么零信号候选要兜底填充**：RRF 只给"有信号的候选"排名，所以纯词法模式下一条在
+BM25/tag 上都不命中的原子会完全消失。但调用方要的是**恰好 K 条**候选去演化 —— 没有词法
+信号不代表语义不相关（那正是 dense 通道的意义）。所以零信号候选按库中顺序接在有效候选
+之后**补足 `top_k`**（`score=0`、无通道明细，可辨认），不会被静默截短。
+
+纯 CPU 自测：`python scripts/test_searchmem.py`（无需 embedding 端点，用假 embedder 测
+dense 通道）。
+
 ### 5.2 动作空间
 
 模型每次只输出**一个**动作块（`src/codemem/prompts.py` 的 `EVOMEM_PROMPT`）：
 
 ```
-<ADD>[atommem, ...]</ADD>       新增（从库内 + 召回证据派生）
+<ADD>[atommem, ...]</ADD>       新增（从候选集内 + 召回证据派生）
 <UPDATE>[atommem, ...]</UPDATE> 就地改写已有条目
 <DELETE>[atommem, ...]</DELETE> 只删冗余重复
 <NOOP></NOOP>                   不需要改动（多数轮次的正常结果）
 ```
+
+`EVOMEM_PROMPT` 的占位符：`{{QUESTION}}`（为什么这条原子此刻被演化）/ `{{CURRENT}}` /
+`{{RECALLED}}` / `{{HISTORY}}` / `{{SCHEMA}}`。
 
 三种载荷动作共用**同一个形状**（完整 atommem 对象数组）：
 
@@ -455,21 +508,22 @@ embedding 在这里的作用本来就是**排序**，候选不够就拿到多少
 ### 5.3 用法
 
 ```bash
-# 先跑通一个目录（默认走遍全库，注意成本）
-python -m codemem.evomem Caroline_Melanie
+# **调试首选**：只跑前 20 条 QA（每条 QA 取 10 个候选、每条最多 2 轮），零风险试跑
+python -m codemem.evomem --sample Caroline_Melanie --max-qa 20
 
-# **调试首选**：只跑前 30 条原子（每条最多 4 轮），零风险试跑
-python -m codemem.evomem --sample Caroline_Melanie --max-atommem 30
+# 最省的一次试跑：20 条 QA × 每条候选仅 1 轮
+python -m codemem.evomem --sample Caroline_Melanie --max-qa 20 --max-turns 1
 
-# 看完整数据流（召回 / prompt / 模型原始输出 / 动作解析）
-python -m codemem.evomem --sample Caroline_Melanie --max-atommem 5 --log-level debug
+# 看完整数据流（混合检索候选 / 召回 / prompt / 模型原始输出 / 动作解析）
+python -m codemem.evomem --sample Caroline_Melanie --max-qa 5 --max-turns 1 --log-level debug
 
-# 全部目录（注意成本：每条原子最多 max_evomem_turn 次强模型调用）
+# 全部目录全部 QA（注意成本：≈ QA 数 × 候选数 × 轮数 次强模型调用）
 python -m codemem.evomem --experiment evomem_dev
 
 # 纯 CPU 自测（零模型成本）
+python scripts/test_searchmem.py           # 混合检索（BM25 / tag / RRF 融合）
 python scripts/test_evoactions.py          # 动作解析与执行
-python scripts/smoke_evomem_logging.py     # 日志、嵌套循环与逐轮上报
+python scripts/smoke_evomem_logging.py     # 日志、QA 驱动循环与逐轮上报
 python scripts/smoke_evomem_main.py        # async_main 端到端（假模型）
 ```
 
@@ -479,38 +533,42 @@ python scripts/smoke_evomem_main.py        # async_main 端到端（假模型）
 | `--config PATH` | 配置文件路径（默认 `configs/evomem.yaml`） |
 | `--sample NAME` | 只处理指定目录 |
 | `--max-turns N` | 覆盖 `max_evomem_turn`（**每条原子**的内层轮数上限） |
-| `--max-atommem N` | **调试用**：最多处理前 N 条 atommem（按 id 顺序取；不传或 0 = 走遍全库） |
-| `--top-k / --concurrency N` | 覆盖召回条数 / 目录级并发 |
+| `--max-qa N` | **调试用**：每个目录最多处理前 N 条 QA（不传或 0 = 全部） |
+| `--candidates K` | 覆盖 `qa_candidates`：每条 QA 用混合检索取几个候选原子来演化 |
+| `--top-k / --concurrency N` | 覆盖给候选找证据时的召回条数 / 目录级并发 |
 | `--output-dir PATH` | 输出目录（默认 `data/evomem_runs/`） |
 | `--experiment NAME` | 实验名，作为输出子目录前缀 |
 | `--log-level LEVEL` | 覆盖 `log.level`：`debug`/`info`/`warn`/`error`/`silent` |
 | `--log-output PATH` | 覆盖 `log.output`（日志保存目录） |
 
-> ⚠️ **成本**：嵌套循环下模型调用 = 每条原子的内层轮数之和。全库 1273 条、`max_evomem_turn`
-> 为 4 时最坏约 5000 次强模型调用。先用 `--max-atommem 30` 或 `--max-turns 1` 小范围试跑，
-> 确认召回与 prompt 符合预期再放开。`summary.json` 的 `stop_reason` 会记录这次为何停下。
+> ⚠️ **成本**：调用数 ≈ `QA 数 × qa_candidates × max_evomem_turn`。全 1986 条 QA、
+> 每条 10 个候选、每条 2 轮时最坏约 4 万次强模型调用。先用 `--max-qa 20` 或
+> `--max-turns 1` 小范围试跑，确认候选检索与 prompt 符合预期再放开。`summary.json` 的
+> `stop_reason` 会记录这次为何停下。
 
 ### 5.4 日志
 
 日志分两级，`configs/evomem.yaml` 的 `log` 段控制（命令行可覆盖）：
 
-- **`info`（默认）**——每次模型调用一行结果 + 收尾汇总。每次调用一行形如：
+- **`info`（默认）**——每条 QA 一行、每个候选每轮一行结果、每条 QA 收尾一行、目录汇总。形如：
 
   ```
-  INFO  [Caroline_Melanie] current session_5_2_1（本次第 40/1273 条，全库 1273 条）第 1/4 轮：候选 39 召回 30 prompt≈4200tok 调用模型…
-  INFO  [Caroline_Melanie] turn 78 OK current=session_5_2_1 action=UPDATE ~3 warns=1 | library=1273 active=1270
-  INFO  [Caroline_Melanie] turn 79 NOOP current=session_5_2_1 action=NOOP | library=1273 active=1270
+  INFO  [Caroline_Melanie] QA 12/199：候选 10/1273（category 2）question='When did Caroline go to the LGBTQ support group?'
+  INFO  [Caroline_Melanie] QA 12 候选 3/10 current=session_5_2_1 第 1/2 轮：候选 39 召回 30 prompt≈4200tok 调用模型…
+  INFO  [Caroline_Melanie] turn 78 qa=12 OK current=session_5_2_1 action=UPDATE ~3 warns=1 | library=1273 active=1270
+  INFO  [Caroline_Melanie] QA 12 完成：候选 10 演化 10（+4 ~6 -1）turns=17
   ```
 
-  第一行说明**正在处理哪条原子、这是本次第几条、内层第几轮**；第二行是本轮结果。
-  `status` 含义：`OK` 改了库 / `NOOP` 模型明确不改（正常收敛，且会**结束这一条原子**，
-  游标前进到下一条）/ `EMPTY` 解析出的动作一条都没执行成功 / `ERROR` 模型调用或召回失败。
-  收尾再汇总每个目录的 status、`atoms_done` 与 `stop_reason`。
+  第一行说明**这是第几条问题、检索到几个候选、问题原文与类别**；第二行说明**这条 QA 内
+  正在处理第几个候选、内层第几轮**；第三行是本轮结果。`status` 含义：`OK` 改了库 /
+  `NOOP` 模型明确不改（正常收敛，且会**结束这一条原子**，候选集里下一条继续）/
+  `EMPTY` 解析出的动作一条都没执行成功 / `ERROR` 模型调用或召回失败。
+  收尾再汇总每个目录的 status、`qa_done` 与 `stop_reason`。
 
-- **`debug`**——上面全部，外加**完整真实数据流**，逐轮打印：召回 query、召回了哪些
-  记忆（id + 文本）、完整 prompt（system/user）、模型原始输出、动作解析与执行明细
-  （kind/payload/repairs/errors/增删改 id/软删除 id）。排查"为什么回 NOOP""为什么删错"
-  看这个级别。
+- **`debug`**——上面全部，外加**完整真实数据流**，逐条 QA 打印：混合检索候选（id + RRF 分 +
+  各路名次）、召回 query、召回了哪些记忆（id + 文本）、完整 prompt（system/user）、模型
+  原始输出、动作解析与执行明细（kind/payload/repairs/errors/增删改 id/软删除 id）。
+  排查"为什么这条问题只检索到这些原子""为什么回 NOOP""为什么删错"看这个级别。
 
 `log.output` 设成目录时日志同时落盘为 `evomem_{level}_{时间戳}.log`；留空则只打终端。
 并行跑多目录时每行都带 `[目录名]` 前缀，日志写入加锁，不会交错乱行。
@@ -525,19 +583,30 @@ python scripts/smoke_evomem_main.py        # async_main 端到端（假模型）
 
 两种情况下 evomem 都会**明确报错终止该目录并计入 `status=ERROR`**，不会静默退化。
 
+**混合检索的说明**：`searchmem` 按 id 去重候选池（演化中 ADD 可能落下重复条目），RRF 免
+归一化所以不用调 score scale；权重在 `configs/evomem.yaml` 的 `search.weights` 可调，
+设成 `{dense: 1.0, bm25: 0.0, tag: 0.0}` 即退化为旧的纯 embedding 检索，便于对照。
+
 ### 5.5 输出
 
 `data/evomem_runs/{experiment}_{YYYYMMDD_HHMMSS}/`：
 
-- `{dir}.atommem.evolved.jsonl` — 演化后仍存活的记忆库
-- `{dir}.evolution.jsonl` — 逐轮 trace（`turn`/`current_id`/`inner`/status、动作、增删改
-  id、错误、warnings、召回 id、token 估算、模型原始输出）。`inner` 是这条原子的内层第几轮，
-  `turn` 是全局第几次模型调用 —— 同一条原子的多轮靠 `current_id` 相同、`inner` 递增辨认
-- `summary.json` — 配置、日志路径、embedding 统计、每目录摘要（`atoms_done` 走完内层循环的
-  原子数、`turns` 模型调用总数、`stop_reason` 本次为何停止、逐轮 status；不含 traces 以免体积过大）
+- `{dir}.qa_trajectories.jsonl` — **每 QA 一行**：`qa_index` / `question` / `category` /
+  `reference` / `evidence` / `candidate_ids`（混合检索到的候选）/ `evolved_ids`（演化后仍
+  存活的）/ `library_size` / `turns` / `actions` / `turn_status` / 增删改计数。这是后续 RL
+  取 trajectory 的入口
+- `{dir}.atommem.evolved.jsonl` — 目录级**并集快照**：base 库 + 各 QA 演化出的新原子
+  （按 id 合并去重）
+- `{dir}.evolution.jsonl` — 逐轮 trace（`turn` / `qa_index` / `current_id` / `inner` / status、
+  动作、增删改 id、错误、warnings、召回 id、token 估算、模型原始输出）。`inner` 是这条原子
+  的内层第几轮，`turn` 是全局第几次模型调用，`qa_index` 说明属于哪条问题
+- `summary.json` — 配置、日志路径、embedding 统计、每目录摘要（`qa_total` / `qa_done` /
+  `qa_skipped` / `candidates_total` / `atoms_done` 演化过的候选数 / `turns` 模型调用总数 /
+  `stop_reason` 本次为何停止；不含 traces 以免体积过大）
 
 > **原子性**：evomem 只写 `data/evomem_runs/` 下的文件，**绝不修改** `atommem.jsonl`，
 > 所以不需要提前备份、事后恢复。
+
 
 ---
 
@@ -549,10 +618,13 @@ python scripts/smoke_evomem_main.py        # async_main 端到端（假模型）
 [x] `scripts/eval_atommem.py`: 对比 msgmem 和 atommem 的检索召回和答案准确率，配置在 configs/atommem.yaml 中（测试显示 atommem evidence recall 85% vs msgmem 28%，judge accuracy 48% vs 16%）。
 [x] `src/codemem/evoactions.py` + `prompts.py` + `evomem.py`: EvoMem 基本版（动作解析与执行、`EVOMEM_PROMPT`、召回与多轮演化），含分级日志与逐轮结果上报
 [x] **CRITICAL FIX** EvoMem 收敛问题修复（2026-09-23）：增强HISTORY信号强度 + 强化prompt停止条件 + context_window增加到2。收敛率从35%提升到90%，卡死率从30%降为0%，摆动率从20%降为10%。详见 `EVOMEM_COMPLETE_REPORT.md`
+[x] **`src/codemem/searchmem.py`**: 混合检索（dense + BM25 + tag 三路，RRF 融合），支持 atom→atom 与 question→mem 两种查询；纯 CPU 自测 `scripts/test_searchmem.py`
+[x] **QA 驱动的 EvoMem**：外层从"走遍全库逐条演化"改成"按 QA 问题混合检索候选集 → 候选集内逐条演化"，`EVOMEM_PROMPT` 加 `{{QUESTION}}` 槽，输出 `{dir}.qa_trajectories.jsonl`（每 QA 一条 trajectory，便于 RL）；日志与自测同步更新
 [ ] **S0** `src/codemem/eval_utils.py`: 修 `evidence_to_ids` 解析 bug —— 空格分隔多引用（`"D9:1 D4:4 D4:6"`）与 `"D:11:26"` 目前被静默丢弃，影响 4 条 QA（Evan_Sam 3 / Tim_John 1）
 [ ] **S1** `src/codemem/evocheck.py`: 更严格的 CPU 不变量（4-gram 重叠、`token-F1 ≥ 0.6`、时间可解析性、删除必须能指出同文本的另一条）
-[ ] **S2** EvoMem 强化学习：在基本版之上加 QA+Evidence 召回子区的 oracle 轨迹采样 + GRPO 训练（奖励 `w_ans·Judge + w_attr·credit + w_proc·mean proc − w_len − w_size`），详见 `docs/evomem_plan.md`
-[ ] **S3** 纯 prompt 版效果评估：跑完 10 个目录，对比演化前后的记忆库（自足性、冗余、过时条目）
+[ ] **S2** EvoMem 强化学习：QA 驱动的候选检索子区**已是主流程**（见 §5.1），在其上加 oracle 轨迹采样 + GRPO 训练（奖励 `w_ans·Judge + w_attr·credit + w_proc·mean proc − w_len − w_size`），详见 `docs/evomem_plan.md`
+[ ] **S3** 纯 prompt 版效果评估：跑完 10 个目录，对比演化前后的记忆库与 QA 准确率（混合检索 dense-only vs hybrid 的 evidence recall 也要对照，ceiling 参考 ~78%）
+
 [ ] **S4** `ANSWER_PROMPT` 加 `used_ids` 字段并校准准确率（后续 `credit` 归因依赖它）
 
 （注：`data/*/atommem.jsonl` 的 10 个目录均已生成完毕。）

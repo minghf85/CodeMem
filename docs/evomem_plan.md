@@ -52,7 +52,24 @@
   }
 }
 目标：逐步优化细化演化atommem
-基础方案：针对每对speakers，按照id先后顺序处理，针对一个atommem，即current_atommem，通过embedding检索从此id之前的atommem得到recalled_atommem（需要根据atommem index，message index，session index筛出此id之前的内容再去召回然后按照相似度排序返回），top_k个atommem。针对每个atommem还需要附上对应source的msgmem+context_line的内容。
+**当前实现（QA 驱动）**：针对每对 speakers，对**每条 QA 问题**：
+1. 用问题的文本在 atommem 上做**混合检索**（`src/codemem/searchmem.py`：dense + BM25 + tag
+   三路通道，用 RRF 倒数排名融合，`score(d)=Σ_r w_r/(k+rank_r(d))`，k=60、权重
+   dense=1.0 / bm25=1.0 / tag=0.5），得到 top_k 个**候选原子**；
+2. 对候选集内的每条原子（按 atom_key 顺序）跑内层 agent loop 演化 —— 演化的证据仍是
+   "从此原子之前（严格 key <）的存活原子里召回 top_k 条 + 附上 source 的 msgmem 与
+   前后 context_window 条上下文"；
+3. 得到该问题的"更优的、更可能回答它的"原子集合，并落一条 QA trajectory。
+
+**为什么按 QA 驱动而不是逐条走库**：旧版对库里每条原子都跑一遍内层循环，成本
+`原子数 × 轮数`（最坏上千条原子 × 4 轮），且大部分精修与任何问题都无关；新版只演化
+"问题相关"的候选集，成本 `QA 数 × 候选数 × 轮数`，并且演化目标明确（让候选集能回答该问题），
+一条 QA 一条 trajectory 也便于后续 RL。
+每条 QA 都从同一份 base 库出发（QA 之间互不影响），base `atommem.jsonl` 始终不被修改。
+
+**prompt**：`EVOMEM_PROMPT` 的 `{{QUESTION}}` 槽把问题告诉模型（"为什么这条原子此刻被演化"），
+其余占位符 `{{CURRENT}}`（单条目标）/ `{{RECALLED}}`（证据）/ `{{HISTORY}}` / `{{SCHEMA}}` 不变。
+
 
 动作空间：ADD, UPDATE, DELETE, NOOP
 ADD: 添加新的atommem, 需要大模型生成的内容有memory，type[inner outer], time, tag, source(msgmem_id or atommem_id list), id和changelog有系统处理。可能一次性添加多个新的记忆，所以输出是atommem列表，需要包含所有的字段，id和changelog留空
@@ -72,9 +89,22 @@ NOOP: 什么都不做
     实现取舍见文件头注释：DELETE 仍需回填 id（否则无法定位），但额外要求逐字复制
     被删条目的 memory，由 `verify_payload_matches` 校验内容与 id 是否一致。
 [x] src\codemem\prompts.py EVOMEM_PROMPT，实现这个prompt
-    占位符：{{LIBRARY}} / {{RECALLED}} / {{HISTORY}} / {{SCHEMA}}
-[x] src\codemem\evomem.py，实现evomem.py的流程，召回，召回需要使用scripts\eval_atommem.py这段代码生成的atommem embedding cache:data\embedding_cache\embedding_cache.jsonl，然后构建上下文，用EVOMEM_PROMPT调用，多轮调用直到输出NOOP结束，最大max_evomem_turn = 4(包含NOOP turn)
-    缓存 key 与 eval_utils.EmbeddingCache 同构（sha1(f"{model}\x00{text}")），
-    模型一致即可直接命中。输出到 data/evomem_runs/{experiment}_{ts}/。
+    占位符：{{QUESTION}}（为什么这条原子此刻被演化）/ {{CURRENT}} / {{RECALLED}} /
+    {{HISTORY}} / {{SCHEMA}}
+[x] src\codemem\searchmem.py，混合检索（dense + BM25 + tag → RRF 融合）
+    两种模式共用同一套打分：atom→atom（evomem 找证据）/ question→atommem（选候选集）。
+    `embed` 是注入的异步函数（evomem 传 Embedder.embed，eval 传 EmbeddingCache.embed），
+    为 None 时只跑 BM25 + tag（纯 CPU 自测用）。零信号候选**兜底补足 top_k**，避免
+    候选集被"没有词法信号"静默截短。
+    自测：`python scripts/test_searchmem.py`（纯 CPU，含确定性假 embedder）
+[x] src\codemem\evomem.py，实现 evomem.py 的 **QA 驱动**流程
+    外层 = 每条 QA 问题 → searchmem 混合检索出候选原子集；中层 = 候选集内逐条原子；
+    内层 = agent loop（EVOMEM_PROMPT，最多 max_evomem_turn 轮，NOOP 结束该条）。
+    每条 QA 从同一份 base 库出发（QA 之间独立，base atommem.jsonl 不被修改）。
+    输出到 data/evomem_runs/{experiment}_{ts}/：{dir}.qa_trajectories.jsonl（每 QA 一行）+
+    {dir}.evolution.jsonl（逐轮 trace，带 qa_index）+ {dir}.atommem.evolved.jsonl（并集快照）。
+    自测：`python scripts/test_searchmem.py` / `test_evoactions.py` /
+    `smoke_evomem_logging.py` / `smoke_evomem_main.py`
 [ ] 后续（强化学习阶段，本轮刻意不做）：evocheck.py 更严格的不变量、gen_evomem_data.py
     oracle 轨迹采样、train_evomem_grpo.py、eval_evomem.py 三条件六指标
+    （QA 驱动的候选检索子区**已是主流程**，RL 直接在这条 trajectory 上采样即可）
