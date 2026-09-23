@@ -65,6 +65,7 @@ from typing import Any
 
 import openai
 import yaml
+from tqdm import tqdm
 
 from . import evolog
 from .evolog import Logger
@@ -642,7 +643,10 @@ def build_messages(
 # ---------------------------------------------------------------------------
 
 def action_summary(action: Any, result: Any) -> str:
-    """给下一轮 prompt 用的一句话摘要。"""
+    """给下一轮 prompt 用的一句话摘要。
+
+    **关键**：当 UPDATE 被判为 unchanged 时，用非常强的信号告诉模型停止尝试。
+    """
     if action.kind == "NOOP":
         return "NOOP - library left unchanged"
     details = []
@@ -652,9 +656,18 @@ def action_summary(action: Any, result: Any) -> str:
         details.append(f"updated {result.updated_ids}")
     if result.deleted_ids:
         details.append(f"deleted {result.deleted_ids}")
+
+    # 检测 "unchanged" 错误：UPDATE 被提交但没有改变任何内容
+    unchanged_errors = [e for e in result.errors if "unchanged" in e.lower()]
+
     if not details:
+        if unchanged_errors:
+            # 用非常强烈的警告信号，告诉模型停止尝试
+            return (f"⚠️ {action.kind} REJECTED - Your output is IDENTICAL to the current memory. "
+                   "This means the memory is already optimal. "
+                   "⚠️ OUTPUT NOOP IMMEDIATELY to avoid wasting resources.")
         details.append("no change applied")
-    if result.errors:
+    if result.errors and not unchanged_errors:
         details.append(f"rejected: {result.errors[:3]}")
     return f"{action.kind}: " + "; ".join(details)
 
@@ -806,6 +819,16 @@ async def run_dir(
             stop_reason = f"达到 max_atommem={max_atommem}（调试上限）"
 
         # ---- 外层：游标从头走到尾，逐条精修 ----
+        # 创建进度条：显示当前处理到第几条原子
+        active_walk = [m for m in walk if memory_id(m) in active]
+        pbar = tqdm(
+            total=len(active_walk),
+            desc=f"[{label}] 演化原子",
+            unit="atom",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+            disable=log.threshold > 20,  # 如果日志级别高于INFO（20），禁用进度条
+        )
+
         for position, current in enumerate(walk):
             current_id = memory_id(current)
             if current_id not in active:
@@ -876,16 +899,18 @@ async def run_dir(
 
                 # 目标只有 live 这一条。**不要**把整个库传进去（prompt 里只应有 1 条目标 +
                 # 召回证据；模型看见全库会对着看不见的内容乱删）。
-                messages = build_messages(live, recalled_block, traces, schema)
+                # HISTORY 只包含**当前原子**的历史（同一个 current_id），不包含其他原子的轮次
+                current_history = [t for t in traces if t.get("current_id") == current_id]
+                messages = build_messages(live, recalled_block, current_history, schema)
                 log.info(
                     f"current {current_id}（本次第 {position + 1}/{len(walk)} 条，"
                     f"全库 {len(memories)} 条）"
                     f"第 {inner}/{max_turns} 轮：候选 {len(candidates)} 召回 {len(recalled)} "
                     f"prompt≈{count_tokens(messages[0]['content'])}tok 调用模型…"
                 )
-                log.debug(evolog.block(
-                    f"current {current_id} 第 {inner} 轮 prompt (system)", messages[0]["content"]
-                ))
+                # log.debug(evolog.block(
+                #     f"current {current_id} 第 {inner} 轮 prompt (system)", messages[0]["content"]
+                # ))
 
                 try:
                     content = await atommem.chat_completion(generator, gen_config, messages)
@@ -911,6 +936,10 @@ async def run_dir(
                     stop_reason = f"模型调用失败：{type(exc).__name__}"
                     log.info(describe_turn(traces[-1]))
                     break
+
+                log.info(evolog.block(
+                    f"current {current_id} 第 {inner} 轮 模型原始输出", content
+                ))
 
                 action = evoactions.parse_action(content)
                 mismatches = evoactions.verify_payload_matches(action.payload, memories, action.kind)
@@ -992,6 +1021,17 @@ async def run_dir(
                 log.warn(f"current {current_id}: 内层循环用满 {max_turns} 轮，转下一条")
 
             atoms_done += 1
+
+            # 更新外层进度条
+            pbar.update(1)
+            pbar.set_postfix({
+                "turns": total_calls,
+                "active": len(active),
+                "current": current_id[:12] + "..." if len(current_id) > 12 else current_id
+            })
+
+        # 关闭进度条
+        pbar.close()
 
     final = [m for m in memories if memory_id(m) in active]
     out_path = output_dir / f"{label}.atommem.evolved.jsonl"

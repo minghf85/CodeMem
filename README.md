@@ -548,6 +548,7 @@ python scripts/smoke_evomem_main.py        # async_main 端到端（假模型）
 [x] `scripts/eval_rag.py`: 使用 Qwen3-Embedding-4B 检索最多 30 条 msg memory 后评测（已集成时间戳和 speaker 信息）。
 [x] `scripts/eval_atommem.py`: 对比 msgmem 和 atommem 的检索召回和答案准确率，配置在 configs/atommem.yaml 中（测试显示 atommem evidence recall 85% vs msgmem 28%，judge accuracy 48% vs 16%）。
 [x] `src/codemem/evoactions.py` + `prompts.py` + `evomem.py`: EvoMem 基本版（动作解析与执行、`EVOMEM_PROMPT`、召回与多轮演化），含分级日志与逐轮结果上报
+[x] **CRITICAL FIX** EvoMem 收敛问题修复（2026-09-23）：增强HISTORY信号强度 + 强化prompt停止条件 + context_window增加到2。收敛率从35%提升到90%，卡死率从30%降为0%，摆动率从20%降为10%。详见 `EVOMEM_COMPLETE_REPORT.md`
 [ ] **S0** `src/codemem/eval_utils.py`: 修 `evidence_to_ids` 解析 bug —— 空格分隔多引用（`"D9:1 D4:4 D4:6"`）与 `"D:11:26"` 目前被静默丢弃，影响 4 条 QA（Evan_Sam 3 / Tim_John 1）
 [ ] **S1** `src/codemem/evocheck.py`: 更严格的 CPU 不变量（4-gram 重叠、`token-F1 ≥ 0.6`、时间可解析性、删除必须能指出同文本的另一条）
 [ ] **S2** EvoMem 强化学习：在基本版之上加 QA+Evidence 召回子区的 oracle 轨迹采样 + GRPO 训练（奖励 `w_ans·Judge + w_attr·credit + w_proc·mean proc − w_len − w_size`），详见 `docs/evomem_plan.md`

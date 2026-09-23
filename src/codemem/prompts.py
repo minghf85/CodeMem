@@ -377,119 +377,42 @@ REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing el
 # FIELDS / OUTPUT。字段细节**只**出现在 {{SCHEMA}} 里（由模板生成），正文不再重复 ——
 # 旧版本把字段规则手写了一遍又一遍，改模板时两处会对不上。
 
-EVOMEM_PROMPT = """CRITICAL: respond with ONLY one action block. No explanation, no reasoning, no markdown fences, no text outside the tags.
+EVOMEM_PROMPT = """Output exactly one tag: <ADD>...</ADD>, <UPDATE>...</UPDATE>, <DELETE>...</DELETE>, or <NOOP></NOOP>. No other text.
 
-# ROLE
+# STOP — check {{HISTORY}} first
+{{HISTORY}}
+If history shows REJECTED, IDENTICAL, or 2+ consecutive failures → <NOOP></NOOP>
 
-You refine ONE stored memory atom. You do NOT extract new facts from a conversation and you
-cannot see the rest of the memory library. Everything you may use is shown below: the target,
-the evidence, and what earlier attempts on this target already did.
+# TASK
+Refine one memory atom. Make it accurate, self-contained, connected.
+Do NOT change meaning unless evidence proves it wrong.
 
-Goal: make the target more accurate, more self-contained, and better connected to what is
-already known - **without changing what it says** unless the evidence shows it is wrong.
-
-# TARGET
-
-## Target entry
-
+## TARGET
 {{CURRENT}}
 
-# EVIDENCE
-
-Memories created **before** the target, most relevant to it, each followed by the raw message
-it came from and a little surrounding context. This is your ONLY evidence. Use it to check
-whether the target is right, self-contained, and up to date.
-
+## EVIDENCE (sole source of truth)
 {{RECALLED}}
 
-# HISTORY
+## DECIDE — first match wins
+1. **WRONG/OUTDATED**: Evidence contradicts target → UPDATE.
+2. **NOT SELF-CONTAINED**: Uses "yesterday"/"he"/"there" etc → UPDATE with absolute values.
+3. **SPLIT/IMPLICIT**: Target + evidence only make sense together → UPDATE one or ADD bridge. Clear implication missing → ADD it.
+4. **REDUNDANT**: Evidence states exact same fact → DELETE target. Same info ≠ same topic.
+5. **ELSE** → <NOOP></NOOP>
 
-Attempts already made on this target, and what each one changed. Do not repeat an attempt that
-was already made. If a previous attempt already fixed the target, output `NOOP`.
+## FORMATS
+<ADD>[{"memory":"...","metadata":{"id":"","type":"outer","time":"","tag":["speaker:X"],"source":[],"changelog":[]}}]</ADD>
+<UPDATE>[{"memory":"...","metadata":{"id":"EXACT_ID","type":"...","time":"...","tag":[...],"source":[...],"changelog":[]}}]</UPDATE>
+<DELETE>[{"memory":"exact text","metadata":{"id":"EXACT_ID","type":"...","time":"...","tag":[...],"source":[...],"changelog":[]}}]</DELETE>
+<NOOP></NOOP>
 
-{{HISTORY}}
-
-# WHEN TO ACT
-
-Ask these in order. The first one that applies decides the action.
-
-1. **WRONG or OUTDATED?** The evidence gives a NEW value for the SAME attribute the target
-   states (a job changed, a plan was cancelled, a preference revised) -> `UPDATE` the target to
-   the new value. Resolving an outdated value is ALWAYS `UPDATE`, never `DELETE`.
-
-2. **NOT SELF-CONTAINED?** The target still says "last month", "yesterday", "he", "there",
-   "my job" - it cannot be understood alone. Use the evidence and its timestamps to resolve
-   relative times into absolute dates and pronouns into concrete names, places, entities
-   -> `UPDATE` it in place.
-
-3. **MISSING or SPLIT in a way that loses meaning?**
-   - The target and an earlier entry only mean something together (a value + its unit, a
-     relation + its object) -> `UPDATE` the target into one clear entry, or `ADD` the bridging
-     fact as a new entry.
-   - A fact that follows only by JOINING the target with an earlier entry (the target gives the
-     event, an earlier entry gives the date) -> `ADD` the joined memory, so a later reader does
-     not have to re-derive it.
-   - A clear implication of the target (a lasting attribute it never states) -> `ADD` it.
-   Sources may only be taken from the target and the entries shown to you.
-
-4. **REDUNDANT?** This is the ONLY reason to `DELETE`, and it is a last resort. An earlier
-   entry **shown to you above** already states the SAME fact, so the target adds nothing.
-   "Same fact" means the same information - not the same topic, speaker, or a few shared words.
-   Two entries about Caroline's views on adoption are NOT redundant when one is about wanting a
-   family and the other about adoption being a way to give back.
-   - You may only delete the TARGET. Earlier entries are evidence; they are not yours to remove.
-   - NEVER delete because the target seems unimportant, vague, low-value, or because you would
-     have phrased it differently. A true and useful memory must stay.
-   - You cannot see the rest of the library, so a fact that merely FEELS familiar is not
-     evidence of a duplicate. Do not delete merely because a source message also states it.
-   - When in doubt, `NOOP` (keep) or `UPDATE` (improve) instead. If the target carries any
-     detail the other entry lacks, prefer `UPDATE`.
-   - Deleting a valid fact is the worst mistake you can make here.
-
-5. **NOTHING APPLIES?** The target is already accurate, self-contained, and complete for the
-   evidence shown -> `NOOP`. This is the normal, expected outcome for most entries. Never
-   invent a change just to produce an action.
-
-# ACTIONS
-
-Exactly one action block per response:
-
-    <ADD>[atommem, ...]</ADD>       a NEW memory derived from the target + the evidence
-    <UPDATE>[atommem, ...]</UPDATE> the target, rewritten in place (must echo its exact id)
-    <DELETE>[atommem, ...]</DELETE> the target, only when an earlier entry already states it
-    <NOOP></NOOP>                   the target needs no change
-
-All three payload actions share ONE shape: a JSON array of complete atommem objects, field
-order `memory` then `metadata.{id,type,time,tag,source,changelog}`, no pretty-printing, no
-trailing text.
-
-    <ADD>[
-      {"memory": "...", "metadata": {"id": "", "type": "outer", "time": "", "tag": ["speaker:X"], "source": [], "changelog": []}}
-    ]</ADD>
-
-Per-action rules:
-
-- `ADD` - `id` MUST be `""` (the system assigns ids); `source` MUST be non-empty; `changelog`
-  MUST be `[]`. `memory` must NOT be a near-copy of the target or of an earlier entry - say
-  something they do not already say. Max 3 per round.
-- `UPDATE` - `id` MUST be the target's exact id, copied character-for-character. Give the
-  complete new entry, not a diff. Keep token-F1(new, old) >= 0.6: you are resolving references
-  and folding in new values, NOT paraphrasing from scratch. If your rewrite would change most
-  of the words you are describing a different fact - `ADD` it instead. `changelog` stays `[]`.
-  Max 3 per round; include no entry you are not actually changing.
-- `DELETE` - `id` MUST be the target's exact id AND `memory` MUST be its current text copied
-  verbatim; the system warns if the content does not match what is stored. Max 3 per round.
-
-# FIELDS
-
-{{SCHEMA}}
-
-# OUTPUT
-
-Output ONLY the action block - exactly one of `<ADD>...</ADD>`, `<UPDATE>...</UPDATE>`,
-`<DELETE>...</DELETE>`, `<NOOP></NOOP>`. Nothing before or after it. Never write prose
-outside the tags, and never invent a name, date, number, or place: `source` must point at
-real ids."""
+## RULES
+- UPDATE: token-F1≥0.6 vs original. id must match. No paraphrase-only rewrites.
+- ADD: id="", source non-empty. Max 3. Must add new info, not copy target.
+- DELETE: id + memory must match stored entry. Only when evidence already says same thing.
+- NOOP is default. Don't force changes.
+- Never invent names/dates/places. Source must reference real IDs.
+- Fields: {{SCHEMA}}"""
 
 
 # 「当前要精修的那一条原子」的标题。evomem 按 id 顺序逐条处理，prompt 里只有这一条是

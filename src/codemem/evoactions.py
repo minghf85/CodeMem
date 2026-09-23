@@ -666,9 +666,29 @@ def verify_payload_matches(
 
 
 def _changed_scalar_fields(old_meta: dict[str, Any], new_meta: dict[str, Any]) -> bool:
+    """检查 metadata 字段是否有变化（包括标量和列表字段）。
+
+    标量字段（type, time）：直接比较值
+    列表字段（tag, source）：用集合比较（忽略顺序）
+        - 只有当新值非空且与旧值不同时，才算有变化
+        - 空列表表示"未提供新值"（因为 apply_update 使用合并而非替换）
+
+    返回 True 表示有任何字段发生了变化。
+    """
+    # 检查标量字段
     for key in ("type", "time"):
         if new_meta.get(key) and new_meta.get(key) != old_meta.get(key):
             return True
+
+    # 检查列表字段（tag、source）- 用集合比较忽略顺序
+    # 只有当新值非空（表示"有意提供新值"）且与旧值不同时，才算变化
+    for key in ("tag", "source"):
+        new_val = new_meta.get(key) or []
+        if new_val:  # 只检查非空的新值
+            old_val = set(old_meta.get(key) or [])
+            if set(new_val) != old_val:
+                return True
+
     return False
 
 

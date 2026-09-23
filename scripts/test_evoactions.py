@@ -215,6 +215,32 @@ def test_apply_update() -> None:
     check("unchanged update skipped", noop_like.updated_ids == [], str(noop_like.updated_ids))
     check("unchanged reported", any("unchanged" in e for e in noop_like.errors), str(noop_like.errors))
 
+    # 测试 source 变化（新增 source 应被视为有效更新）
+    source_change = E.apply_action(
+        E.parse_action(f"<UPDATE>{payload(item('old text one', id='s_1', source=['session_1_1', 'session_1_2']))}</UPDATE>"),
+        memories, active, "s"
+    )
+    check("source change accepted", len(source_change.updated_ids) == 1, str(source_change.updated_ids))
+    check("source merged", set(source_change.memories[0]["metadata"]["source"]) == {"session_1_1", "session_1_2"},
+          str(source_change.memories[0]["metadata"]["source"]))
+
+    # 测试 tag 变化（新增 tag 应被视为有效更新）
+    tag_change = E.apply_action(
+        E.parse_action(f"<UPDATE>{payload(item('old text one', id='s_1', tag=['speaker:A', 'topic:work']))}</UPDATE>"),
+        memories, active, "s"
+    )
+    check("tag change accepted", len(tag_change.updated_ids) == 1, str(tag_change.updated_ids))
+    check("tag updated", set(tag_change.memories[0]["metadata"]["tag"]) >= {"speaker:A", "topic:work"},
+          str(tag_change.memories[0]["metadata"]["tag"]))
+
+    # 测试只有 source/tag 变化时不算 unchanged（修复前会被错误拒绝）
+    metadata_only = E.apply_action(
+        E.parse_action(f"<UPDATE>{payload(item('old text one', id='s_1', source=['session_1_1', 'session_1_3']))}</UPDATE>"),
+        memories, active, "s"
+    )
+    check("metadata-only change not rejected as unchanged", len(metadata_only.updated_ids) == 1,
+          str(metadata_only.updated_ids))
+
     missing_id = E.apply_action(E.parse_action(f"<UPDATE>{payload(item('x'))}</UPDATE>"), memories, active, "s")
     check("missing id rejected", missing_id.updated_ids == [], str(missing_id.updated_ids))
 
