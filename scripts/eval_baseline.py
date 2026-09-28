@@ -17,7 +17,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from codemem.eval_utils import (  # type: ignore[import-not-found]  # noqa: E402
+from codemem.eval.legacy import (  # type: ignore[import-not-found]  # noqa: E402
     DATA_FILE,
     DEFAULT_LLM_CONFIG,
     build_answer_messages,
@@ -33,8 +33,8 @@ from codemem.eval_utils import (  # type: ignore[import-not-found]  # noqa: E402
     resolve_run_paths,
     sample_dir,
 )
-from codemem.judge import judge_answer_async  # type: ignore[import-not-found]  # noqa: E402
-from codemem.metrics import exact_match, summarize, summarize_by_category, token_f1  # type: ignore[import-not-found]  # noqa: E402
+from codemem.eval.judge import judge_answer_async  # type: ignore[import-not-found]  # noqa: E402
+from codemem.eval.metrics import exact_match, summarize, summarize_by_category, token_f1  # type: ignore[import-not-found]  # noqa: E402
 from codemem.prompts import BASELINE_ANSWER_PROMPT  # type: ignore[import-not-found]  # noqa: E402
 
 CONFIG_FILE = PROJECT_ROOT / "configs" / "baseline.yaml"

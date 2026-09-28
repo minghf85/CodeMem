@@ -1,4 +1,16 @@
-"""Shared Locomo evaluation data loading, retrieval, and model helpers."""
+"""Legacy 评测支撑：三个 ablation baseline 脚本（``scripts/eval_{baseline,rag,atommem}.py``）共用。
+
+**为什么还留着**：README 里 28%→85% 那组对比数字就是这三个脚本产出的，删掉就复现不了。
+它们各自"检索 + 作答 + 评判"一条龙，早于 answer/eval 两个步骤，所以**不参与新链路**。
+
+新增能力请放到新模块，不要往这里加：
+
+    数据 / QA / evidence 映射  -> codemem.dataset
+    JSONL 读写 / memory 访问器 -> codemem.io
+    LLM 调用（重试/退避/截断）-> codemem.llm
+    嵌入缓存 / 向量检索        -> codemem.search.embedder
+    judge / metrics           -> codemem.eval.{judge,metrics}
+"""
 
 from __future__ import annotations
 
@@ -15,11 +27,11 @@ from typing import Any, Iterable
 import openai
 import yaml
 
-from . import atommem
-from .prompts import ANSWER_PROMPT
+from .. import dataset, llm
+from ..io import PROJECT_ROOT, repair_json
+from ..prompts import ANSWER_PROMPT
 
-PROJECT_ROOT = atommem.PROJECT_ROOT
-DATA_FILE = PROJECT_ROOT / "data" / "correct_locomo10.json"
+DATA_FILE = dataset.DATA_FILE
 
 
 def resolve_run_paths(
@@ -372,7 +384,7 @@ def _parse_answer_json(raw: str) -> dict[str, Any] | None:
     fence = re.match(r"^```[a-zA-Z]*\s*(.*?)\s*```$", candidate, re.DOTALL)
     if fence:
         candidate = fence.group(1).strip()
-    for text in (candidate, atommem._repair_json(candidate)):
+    for text in (candidate, repair_json(candidate)):
         try:
             value = json.loads(text)
         except (json.JSONDecodeError, TypeError):
@@ -385,7 +397,7 @@ def _parse_answer_json(raw: str) -> dict[str, Any] | None:
     start, end = candidate.find("{"), candidate.rfind("}")
     if 0 <= start < end:
         block = candidate[start : end + 1]
-        for text in (block, atommem._repair_json(block)):
+        for text in (block, repair_json(block)):
             try:
                 value = json.loads(text)
             except (json.JSONDecodeError, TypeError):
@@ -425,7 +437,7 @@ async def complete(messages: list[dict[str, str]], config: dict[str, Any]) -> st
     request_config = dict(DEFAULT_LLM_CONFIG)
     request_config.update(config)
     try:
-        return await atommem.chat_completion(client, request_config, messages)
+        return await llm.chat_completion(client, request_config, messages)
     finally:
         await client.close()
 
@@ -437,7 +449,7 @@ async def complete_with_client(
 ) -> str:
     request_config = dict(DEFAULT_LLM_CONFIG)
     request_config.update(config)
-    return await atommem.chat_completion(client, request_config, messages)
+    return await llm.chat_completion(client, request_config, messages)
 
 
 def complete_sync(messages: list[dict[str, str]], config: dict[str, Any]) -> str:

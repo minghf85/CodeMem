@@ -1,0 +1,37 @@
+# add 步骤：msgmem（原始对话 → raw memory）+ atommem（raw → 原子记忆）
+# 用法：python -m codemem.add [dirs...] [--stage msgmem|atommem|dpo]
+
+# atommem 的抽取模型
+model: /home/minghaifeng/Train/model/Qwen3-8B
+base_url: http://127.0.0.1:30000/v1
+api_key: sglang
+temperature: 0.2
+# 注意：reasoning token 也计入 max_tokens，过小会导致输出被截断
+max_tokens: 4096
+concurrency: 4
+timeout: 300
+max_retries: 3
+backoff_base: 2.0
+rate_limit_backoff: 10.0
+max_backoff: 60.0
+backoff_jitter: 0.2
+# 上下文窗口：抽取时给目标 raw 前后各 N 条作为上下文
+context_window: 4
+enable_thinking: false
+
+# ---- dpo 阶段（可选）：为抽取模型造偏好训练数据 ----
+# 用法：python -m codemem.add --stage dpo [--resume]
+strong:
+  base_url: https://api.openlux.ai/v1
+  api_key: sk-replace-me
+  model: gpt-4.1-mini
+  temperature: 0.2
+  concurrency: 4
+weak:
+  base_url: http://localhost:11434/v1
+  api_key: ollama
+  model: qwen3:14b
+  temperature: 0.7
+  concurrency: 1
+output: data/dpo/atom_dpo.jsonl
+error_log: data/dpo/atom_dpo_errors.log

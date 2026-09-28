@@ -7,7 +7,10 @@
     "type": {
       "description": "[YOU] inner: fundamental, long-term identity/life facts, including presupposed roles (parent, employee, student, spouse), core relationships, occupation, residence, values, major life events. outer: transient facts, actions, preferences, plans, intentions, emotions, states. Past events and intentions/goals MUST be separate atoms.",
       "type": "enum",
-      "values": ["inner", "outer"]
+      "values": [
+        "inner",
+        "outer"
+      ]
     },
     "time": {
       "description": "[YOU] Temporal scope. Always include temporal information if present in the fact; do NOT drop dates, durations, or relative times. Prefer absolute time when resolvable from context (e.g. 'in 2018' not 'five years ago' if the session year is known). Use ISO 8601. For ranges, use 'YYYY-MM-DD/YYYY-MM-DD'.If can not solve, use original descrptio like 'two day before Alan was born'. If completely unknown or no need to use time to describe, use empty string ''. Only to the exact unit of time that can be confirmed.",
@@ -21,11 +24,11 @@
       ]
     },
     "tag": {
-      "description": "[YOU] Array of key-value labels. MUST include at least one 'speaker:<name>'. Other tags from Tag Taxonomy: topic, entity, sentiment, action, state, relation, other. Format: 'key:value'.",
+      "description": "[YOU] Array of 'key:value' labels. MUST include at least one 'speaker:<name>'. Use ONLY these keys, and pick the one that fits best:\n  speaker  -- who the fact is about (required, at least one)\n  topic    -- what it is ABOUT: a subject, interest, or recurring theme (topic:art, topic:family, topic:career, topic:mental health)\n  activity -- something a person DOES as a leisure or habitual pursuit (activity:pottery, activity:camping, activity:swimming, activity:painting). Use this for hobbies, sports, pastimes, and recurring practices -- NOT for one-off speech acts.\n  action   -- a one-off speech or conversational act (action:ask, action:plan, action:thank, action:invite). Not for hobbies.\n  event    -- a dated occurrence (event:birthday, event:road trip, event:concert)\n  state    -- a temporary condition or feeling (state:tired, state:excited)\n  sentiment-- an attitude toward something (sentiment:love, sentiment:worry)\n  relation -- a relationship (relation:family, relation:friend, relation:mentor)\n  entity   -- a named person, place, or thing (entity:Paris, entity:David)\n  time     -- a temporal reference that matters (time:2023-05, time:weekly)\n  other    -- only if none of the above fits.\nIMPORTANT: a hobby or pastime is `activity:`, never `action:`/`topic:`/`hobby:`. If a fact is about an interest rather than something done, use `topic:`. Do not invent new keys.",
       "type": "array",
       "items": {
         "type": "string",
-        "pattern": "^[a-z]+:[a-zA-Z0-9_\\-]+$"
+        "pattern": "^[a-z]+:[a-zA-Z0-9_\\- ]+$"
       }
     }
   }

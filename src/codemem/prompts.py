@@ -74,6 +74,7 @@ CRITICAL OUTPUT FORMAT:
 
 Format: {"atoms": [ ... ]}
 - Keep it compact: field order memory, then metadata.{type,time,tag}; no pretty-printing, no trailing text.
+- Tag keys are FIXED (speaker/topic/activity/action/event/state/sentiment/relation/entity/time/other). A hobby or pastime is `activity:<name>` -- never `action:` or `hobby:`. Something merely talked about is `topic:<name>`. Never invent a new key.
 - Output at most 12 atoms per message. If the message seems to yield more, keep the 12 most
   important and distinct facts - quality over exhaustiveness. A truncated response is useless.
 
@@ -294,11 +295,29 @@ Predicted Answer: {prediction}
 Evaluation Criteria:
 
 1. TEMPORAL ACCURACY:
-   - If the question asks "when", check if the prediction conveys the SAME point in time as the reference
-   - Absolute dates (e.g., "2022", "7 May 2023") are preferred, but relative time expressions CAN be accepted IF they can be reasonably inferred from context
-   - Example: In a conversation dated June 2023, "last year" = "2022" → ACCEPTABLE
-   - However, if NO conversation date context is available, relative times should be marked INCORRECT
-   - Key test: Would someone reading both answers agree they refer to the same time?
+   - If the question asks "when", check whether the prediction and the reference denote the SAME point in time.
+   - **A reference phrased relatively and a prediction phrased absolutely are EQUIVALENT when the arithmetic works out.**
+     This is the single most common way judges get it wrong -- do the arithmetic before deciding.
+   - "the week before X" / "a week before X"  = X minus 7 days
+   - "the weekend before X"                    = the Saturday/Sunday immediately preceding X.
+     Work out X's weekday first: if X is a Friday, the weekend before starts 6 days earlier;
+     if X is a Monday, it is 2 days earlier. Accept a prediction matching either the Saturday
+     or the Sunday of that weekend (and allow +/- 1 day).
+   - "the <weekday> before X"                  = the nearest that weekday strictly before X
+   - "N days/weeks/months before X"            = X minus N days/weeks/months
+   - "last week"/"last year" relative to a conversation dated Y = the corresponding period before Y
+   - WORKED EXAMPLES (all ACCEPTABLE):
+       reference "The week before 6 July 2023", prediction "2023-06-29"        (6 Jul - 7d = 29 Jun)
+       reference "The Friday before 15 July 2023", prediction "July 8, 2023"   (15 Jul is a Saturday; prior Friday = 8 Jul)
+       reference "The weekend before 17 July 2023", prediction "2023-07-10"    (17 Jul is a Monday; prior weekend = 10-11 Jul)
+       reference "July 2023", prediction "2023-07"                             (same month)
+       reference "10 years ago" (conversation dated 2023), prediction "2013"
+   - Allow +/- 1 day on a computed weekday/weekend, and accept a month-only answer when the
+     reference is month-only (or vice versa) as long as the month matches.
+   - Only mark INCORRECT when the two answers denote DIFFERENT points in time after the
+     arithmetic, or when the prediction leaves a time un-resolved that the reference resolves.
+   - Key test: convert BOTH to a concrete date if you can, then compare; do not compare the
+     surface wording.
 
 2. CORE FACTUAL ACCURACY:
    - The main factual claim of the prediction must match the reference

@@ -27,7 +27,7 @@ if str(SRC_DIR) not in sys.path:
 
 import openai
 
-from codemem import atommem  # type: ignore[import-not-found]
+from codemem.add import atommem  # type: ignore[import-not-found]
 
 
 DEFAULT_INPUT = PROJECT_ROOT / "data/dpo/atom_dpo.jsonl"

@@ -1,4 +1,4 @@
-"""统一的日志：级别过滤 + 终端输出 + 文件保存。
+"""统一的日志：级别过滤 + 终端输出 + 文件保存（add/search/answer/eval 共用）。
 
 设计目标（按重要性）：
 
@@ -26,7 +26,7 @@ from typing import Any
 LEVELS = {"debug": 10, "info": 20, "warn": 30, "error": 40, "silent": 100}
 DEFAULT_LEVEL = "info"
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+from .io import PROJECT_ROOT
 
 
 def parse_level(value: Any) -> str:
@@ -62,15 +62,14 @@ class Logger:
     def from_config(
         cls,
         config: dict[str, Any],
-        fallback_dir: Path | None = None,
+        prefix: str = "codemem",
     ) -> "Logger":
         """按 ``config['log']`` 建 logger。
 
         ``log.output`` 语义：
         - 未设置 / 空 → 只打终端，不落盘
-        - 目录路径 → 写入 ``{该目录}/evomem_{level}_{ts}.log``
-        ``fallback_dir`` 是本次运行的输出目录，仅当 ``log.output`` 未设置且调用方希望
-        默认落盘时由调用方显式传入（当前不自动启用）。
+        - 目录路径 → 写入 ``{该目录}/{prefix}_{level}_{ts}.log``
+        ``prefix`` 用来区分是哪个步骤的日志（``add`` / ``search`` / ``answer`` / ``eval``）。
         """
         section = config.get("log") or {}
         level = parse_level(section.get("level", DEFAULT_LEVEL))
@@ -82,7 +81,7 @@ class Logger:
                 directory = PROJECT_ROOT / directory
             directory.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = directory / f"evomem_{level}_{stamp}.log"
+            path = directory / f"{prefix}_{level}_{stamp}.log"
         handle = path.open("w", encoding="utf-8") if path else None
         logger = cls(level=level, path=path, _handle=handle)
         if path:

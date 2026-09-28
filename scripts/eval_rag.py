@@ -17,15 +17,15 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from codemem.eval_utils import (  # type: ignore[import-not-found]  # noqa: E402
+from codemem.eval.legacy import (  # type: ignore[import-not-found]  # noqa: E402
     DATA_FILE, DEFAULT_LLM_CONFIG, build_answer_messages, check_embedding_endpoint,
     complete_with_client,
     evidence_to_ids, format_memories_with_metadata, get_conversation_date_context,
     load_msgmem, load_samples, load_yaml_config, parse_answer_output, reference_answer,
     retrieve_by_embedding_async, sample_dir, resolve_run_paths,
 )
-from codemem.judge import judge_answer_async  # type: ignore[import-not-found]  # noqa: E402
-from codemem.metrics import evidence_recall, exact_match, summarize, summarize_by_category, token_f1  # type: ignore[import-not-found]  # noqa: E402
+from codemem.eval.judge import judge_answer_async  # type: ignore[import-not-found]  # noqa: E402
+from codemem.eval.metrics import evidence_recall, exact_match, summarize, summarize_by_category, token_f1  # type: ignore[import-not-found]  # noqa: E402
 from codemem.prompts import RAG_ANSWER_PROMPT  # type: ignore[import-not-found]  # noqa: E402
 
 CONFIG_FILE = PROJECT_ROOT / "configs" / "rag.yaml"

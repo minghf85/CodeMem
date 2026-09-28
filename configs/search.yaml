@@ -1,0 +1,111 @@
+# search 步骤：question + atommem → evidence.jsonl
+# 用法：python -m codemem.search --sample Caroline_Melanie --max-qa 3 --log-level debug
+#
+# 工具描述与 prompt 在 configs/tool.json（agent 上下文的单一事实源）。
+
+# ---- 生成模型（agent 与 verifier 共用）----
+generator:
+  base_url: http://127.0.0.1:30000/v1
+  api_key: sglang
+  model: /home/minghaifeng/Train/model/Qwen3-8B
+  temperature: 0.2
+  max_tokens: 4096
+  enable_thinking: false
+
+# ---- 嵌入（建检索索引 + search 命令的 query 嵌入）----
+embedding:
+  base_url: http://127.0.0.1:30001/v1
+  api_key: sglang
+  model: /home/minghaifeng/Train/model/Qwen3-Embedding-4B
+  # 批越小越稳（并发压力下偶发 400，报错提到内部 tokenizer 端口，是误导信息）
+  chunk_size: 32
+  # 嵌入服务不可用时是否允许降级为词法模式（BM25 + tag，search 需带 --lexical）。
+  # true = 不建索引、search 走词法路径，并大声告警（便于离线试跑 agent 流程）
+  # false = 直接报错终止该目录，不静默退化
+  allow_lexical_fallback: true
+
+# ---- 检索（searchmem 三路 RRF；经环境变量传给 search 命令）----
+search:
+  rrf_k: 60
+  weights:
+    dense: 1.0
+    bm25: 1.0
+    tag: 0.5
+  # search 结果里 memory 文本的截断长度（不够可以 read/jq 看全文）
+  memory_chars: 400
+
+# ---- agent loop ----
+max_steps: 30
+# 连续多少步**唯一记录指纹**没变 → 提前收尾。判据是唯一记录集合而不是行数：
+# 实测模型会用 `>>` 反复追加同样的行，行数在涨但一个 id 都没多。0 行数判会当成进展。
+no_progress_patience: 6
+# 最多让 verifier 判几次。1 = 判一次就收尾；2 = 还有一轮"补齐缺口"的机会
+max_verify_rounds: 2
+# 单次工具观测最多给模型多少字符（工具的 2000 行/50KB 截断之上再压一道）
+observation_max_chars: 8000
+
+# 已经烧了这么多步、evidence 还是空的时候，由 harness 在观测里插一句"该动笔了"（0 = 关）。
+# 为什么需要：prompt 里写了"第 4 步前必须写"，但 8B 实测会无视 —— 12 步全在读、一个字没写。
+# 软约束不可靠，机制可靠。
+write_nudge_after: 5
+
+# evidence 条数软上限：超过就在观测里提醒模型精简（**不硬截断** —— 截断会静默丢证据）。
+# 实测踩到：强化"集合型问题要收全成员"之后，模型在单事实问题上也写 658 条，顶爆模型上下文。
+evidence_soft_limit: 12
+
+# 轨迹文件（{dir}.qa_trajectories.jsonl）里每步观测与模型输出的保留字符数（0 = 不截断）。
+# 实测全量跑 152 个 QA 的轨迹 4.8MB，其中 95% 在 rounds[].steps[]，而"原始工具观测"
+# 一项就占 55%。观测是唯一记录"模型当时看到什么"的地方（model_calls 默认不写 messages），
+# 所以是**截断**而非删除；要全文设成 0。
+trajectory_observation_chars: 600
+
+# 每次模型调用落盘时是否带上完整 messages。
+# 默认 false：messages 是**整个不断增长的上下文**，相邻记录 95% 重复，实测单条 21KB、
+# 一个 QA 800KB、全量约 1.6GB。默认只记模型原始输出（排错需要的正是它）；
+# 要复现"模型当时看到了什么"再打开（debug 日志本来就打印完整 prompt 与观测）。
+log_full_messages: false
+
+# ---- 错误重试 ----
+# 输出为空或不是合法工具调用时注入纠正消息再试几次。
+# 只有模型**明确回复纯文本**才算"我做完了"；以 { 开头却被截断是重试信号，不是完成信号
+max_parse_retries: 2
+# 同一工具+参数、**且文件状态未变**时重复几次后拒绝执行（状态变了就放行）
+repeat_limit: 1
+# evidence 里重复行达到这个数就追加一次去重警告
+duplicate_warn_at: 10
+
+# ---- 上下文压缩 ----
+# messages 总字符超限就把中段坍缩成摘要，保留 system + 最近 N 条 + 工具用过的 id 集合。
+# 摘要机械提取（不花模型调用、不会编造）。0 = 不压缩。
+context_max_chars: 160000
+context_keep_recent: 8
+# bash 单条命令超时（秒）
+bash_timeout: 60
+
+# ---- 并发与预算 ----
+# QA 级并发（每个 QA 一个私有工作目录，base 库只读 → 可放心并发）
+concurrency: 4
+# 目录级并发
+concurrency_dirs: 1
+# 成本软闸门：单目录累计步数上限，超过后不再开新 QA。0 = 不限
+max_total_steps: 0
+# 每个目录最多处理前 N 条 QA（调试首选；0 = 全部）
+max_qa: 0
+# category 5 是 adversarial（故意不可回答），与评测口径一致地跳过
+skip_category5: true
+
+# ---- 调用与重试 ----
+timeout: 300
+max_retries: 3
+backoff_base: 2.0
+rate_limit_backoff: 10.0
+max_backoff: 60.0
+backoff_jitter: 0.2
+
+log:
+  # debug < info < warn < error < silent
+  #   info：每个 QA 一行开跑 / 每个工具调用一行结果 / verifier 判定 / QA 收尾汇总
+  #   debug：上面全部 + 完整数据流（system prompt、每步观测、模型原始输出、verifier 输入输出）
+  level: info
+  # 日志保存目录（相对项目根）。留空则只打终端。
+  output: data/search_runs

@@ -19,11 +19,11 @@
     }
 
 用法：
-    python -m codemem.gen_dpo_data                      # 处理 data/ 下全部 speaker 目录
-    python -m codemem.gen_dpo_data Caroline_Melanie     # 只处理指定目录
-    python -m codemem.gen_dpo_data --limit 50           # 每个目录只取前 50 条 raw（调试）
-    python -m codemem.gen_dpo_data --resume             # 跳过已生成过的样本，追加到已有输出
-    python -m codemem.gen_dpo_data --include-identical  # 保留 chosen==rejected 的样本
+    python -m codemem.add --stage dpo                      # 处理 data/ 下全部 speaker 目录
+    python -m codemem.add --stage dpo Caroline_Melanie     # 只处理指定目录
+    python -m codemem.add --stage dpo --limit 50           # 每个目录只取前 50 条 raw（调试）
+    python -m codemem.add --stage dpo --resume             # 跳过已生成过的样本，追加到已有输出
+    python -m codemem.add --stage dpo --include-identical  # 保留 chosen==rejected 的样本
 """
 
 import argparse
@@ -36,12 +36,12 @@ from typing import Any
 import openai
 import yaml
 
+from .. import llm
+from ..io import DATA_DIR, PROJECT_ROOT, append_jsonl, read_jsonl, resolve_dir
+from ..prompts import ATOM_EXTRACTION_SYSTEM_PROMPT, WEAK_ATOM_EXTRACTION_SYSTEM_PROMPT
 from . import atommem
-from .prompts import ATOM_EXTRACTION_SYSTEM_PROMPT, WEAK_ATOM_EXTRACTION_SYSTEM_PROMPT
 
-PROJECT_ROOT = atommem.PROJECT_ROOT
-DATA_DIR = atommem.DATA_DIR
-DPO_CONFIG_FILE = PROJECT_ROOT / "configs" / "dpo_data.yaml"
+DPO_CONFIG_FILE = PROJECT_ROOT / "configs" / "add.yaml"
 
 DEFAULT_DPO_CONFIG: dict[str, Any] = {
     "strong": {"base_url": "", "api_key": "", "model": "", "temperature": 0.2, "concurrency": 4},
@@ -78,7 +78,7 @@ def load_dpo_config() -> dict:
 
 
 def _model_config(dpo_config: dict, which: str) -> dict:
-    """把某个模型 profile + 通用参数组装成 atommem.chat_completion 可用的 config。"""
+    """把某个模型 profile + 通用参数组装成 ``llm.chat_completion`` 可用的 config。"""
     profile = dpo_config[which]
     config = {
         "base_url": profile.get("base_url", ""),
@@ -101,7 +101,7 @@ async def _generate_one(
     client: openai.AsyncOpenAI, config: dict, messages: list[dict]
 ) -> str | None:
     try:
-        return await atommem.chat_completion(client, config, messages)
+        return await llm.chat_completion(client, config, messages)
     except Exception:  # noqa: BLE001 - 单条失败不影响整体
         return None
 
@@ -199,7 +199,7 @@ async def process_dir(
     output: Path,
     include_identical: bool,
 ) -> tuple[list[dict], list[str]]:
-    directory = atommem.resolve_dir(dir_name)
+    directory = resolve_dir(dir_name)
     label = directory.name
     msgmem_file = directory / "msgmem.jsonl"
     legacy_memory_file = directory / "memory.jsonl"
@@ -208,7 +208,7 @@ async def process_dir(
         print(f"[skip] {label}: no msgmem.jsonl")
         return [], []
 
-    existing = atommem.read_jsonl(source_file)
+    existing = read_jsonl(source_file)
     raws = [item for item in existing if item["metadata"].get("type") == "raw"]
     if limit is not None:
         raws = raws[:limit]
@@ -264,7 +264,7 @@ async def process_dir(
             kept = _filter_identical([sample], include_identical)
             if kept:
                 samples.append(sample)
-                _append_jsonl(output, kept)
+                append_jsonl(output, kept)
                 done_keys.add((sample["meta"]["dir"], sample["meta"]["id"]))
             else:
                 filtered_identical += 1
@@ -286,13 +286,6 @@ async def process_dir(
 # ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
-
-def _append_jsonl(path: Path, items: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        for item in items:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
-
 
 def _load_done_keys(
     path: Path, expected_models: tuple[str, str] | None = None

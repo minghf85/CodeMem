@@ -297,6 +297,7 @@ async def search_scored(
     query_tags: Iterable[str] | None = None,
     weights: dict[str, float] | None = None,
     k: int = DEFAULT_RRF_K,
+    extra_channels: dict[str, Sequence[float]] | None = None,
 ) -> list[ScoredMemory]:
     """混合检索，返回带通道明细的结果（按 RRF 分降序，最多 top_k 条）。
 
@@ -306,6 +307,10 @@ async def search_scored(
 
     ``query_tags`` 是 query 侧用于 tag 匹配的词元；缺省时从 query 文本自动抽。
     传空集合可以显式关掉 tag 通道（此时该路无候选，等价于不带 tag 权重）。
+
+    ``extra_channels`` 是**调用方算好的通道分数**（与 ``memories`` 等长），用来避免重复
+    请求 embedding：``searchctl`` 已经从预建索引里拿到了 dense 余弦分，直接作为 ``dense``
+    一路传进来，而不是让这里再嵌一次。同名通道以 ``extra_channels`` 为准（覆盖内置通道）。
     """
     memories = dedupe_by_id(memories)
     if not memories or top_k <= 0:
@@ -345,12 +350,22 @@ async def search_scored(
     if active_weights.get("dense", 0.0) != 0.0 and embed is not None:
         vectors = await embed([query, *texts])
         if len(vectors) == len(texts) + 1:
-            from .eval_utils import cosine_similarity
+            from .embedder import cosine_similarity
 
             add_channel(
                 "dense",
                 [cosine_similarity(vectors[0], vector) for vector in vectors[1:]],
             )
+
+    # ---- 调用方注入的通道（覆盖内置同名通道，避免重复嵌入）----
+    for name, scores in (extra_channels or {}).items():
+        if len(scores) != len(memories):
+            raise ValueError(
+                f"extra_channels[{name!r}] 长度 {len(scores)} 与候选数 {len(memories)} 不一致"
+            )
+        rankings.pop(name, None)
+        rankings.pop(f"__tail_{name}", None)
+        add_channel(name, scores)
 
     # ---- 融合 ----
     fused, fallback = rrf_fuse(rankings, active_weights, k=k)
