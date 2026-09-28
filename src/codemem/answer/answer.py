@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import dataset, llm
-from ..io import DATA_DIR, PROJECT_ROOT, memory_speaker, memory_text, memory_time, read_jsonl
+from ..io import DATA_DIR, PROJECT_ROOT, msg_content, read_jsonl
 from ..log import Logger
 from ..prompts import ANSWER_PROMPT
 
@@ -81,37 +81,47 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
 def render_evidence(memories: list[dict[str, Any]]) -> str:
     """把 evidence 记录渲染成给 answer 模型的上下文。
 
-    带上 ``[time] speaker:`` 前缀：时间推理依赖它，而 evidence 里的 ``time`` 已经是
-    search 阶段解析过的绝对日期 —— 这里原样透传，不再重算。
+    **必须走 ``io.msg_content``**。这里曾经读 v2 的 ``memory`` 字段，而新的 evidence 是
+    ``content`` —— 于是每条渲染成 ``[unknown time] unknown:``，**正文是空的**。
+    实测后果：全量 1422/1487 条回答报"证据不足"，因为模型确实什么都没看到。
+
+    带上 ``source``：answer 阶段的推理需要知道这条证据出自哪些消息（时间锚点、
+    指代关系常常依赖它）。
     """
     if not memories:
         return "(no memories provided)"
     lines: list[str] = []
     for memory in memories:
-        time = memory_time(memory) or "unknown time"
-        speaker = memory_speaker(memory)
-        lines.append(f"[{time}] {speaker}: {memory_text(memory)}")
+        meta = memory.get("metadata") or {}
+        text = msg_content(memory) or json.dumps(memory, ensure_ascii=False)
+        when = str(memory.get("time") or meta.get("time") or "").strip()
+        source = meta.get("source")
+        source_text = ", ".join(str(s) for s in source) if isinstance(source, list) else ""
+        head = f"[{when}] " if when else ""
+        tail = f"  (from: {source_text})" if source_text else ""
+        lines.append(f"{head}{text}{tail}")
     return "\n".join(lines)
 
 
 def current_date_hint(memories: list[dict[str, Any]]) -> str:
-    """从证据里取最晚的绝对日期作为"当前日期"。
+    """从证据里取最晚的日期作为"当前日期"。
 
-    提示模型时间轴的方向（"a month ago" 是相对哪一天）。取不到就返回今天 ——
-    但 evidence 里的时间已被 search 解析过，所以这里通常能取到。
+    提示模型时间轴的方向（"a month ago" 是相对哪一天）。**扫正文而不只扫 time 字段**：
+    evidence 记录通常没有 ``time``（模板里只有 content 与 source），日期是写在正文里的
+    （search 阶段已把相对时间折算成绝对日期）。取不到就返回今天。
     """
     latest: datetime | None = None
     for memory in memories:
-        raw = memory_time(memory)
-        match = re.match(r"^(\d{4})-(\d{2})-(\d{2})", raw)
-        if not match:
-            continue
-        try:
-            moment = datetime(*(int(match.group(i)) for i in (1, 2, 3)))
-        except ValueError:
-            continue
-        if latest is None or moment > latest:
-            latest = moment
+        candidates = [str(memory.get("time") or "")]
+        candidates.append(msg_content(memory))
+        for text in candidates:
+            for match in re.finditer(r"(\d{4})-(\d{2})-(\d{2})", text or ""):
+                try:
+                    moment = datetime(*(int(match.group(i)) for i in (1, 2, 3)))
+                except ValueError:
+                    continue
+                if latest is None or moment > latest:
+                    latest = moment
     return (latest or datetime.now()).strftime("%Y-%m-%d")
 
 

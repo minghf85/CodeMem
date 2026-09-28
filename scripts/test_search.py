@@ -1085,6 +1085,37 @@ def test_qa_selection() -> None:
     check("单次运行不产生 repeat 报告", runner.repeat_agreement([rec(0, 1, True, "A", 1)]) == [])
 
 
+def test_verifier_rendering() -> None:
+    """verifier 必须真正"看见"证据 —— 这是最容易静默出错的一环。
+
+    实测：``render_memories`` 硬读 v2 的 ``memory``/``metadata.id`` 字段，而新的 evidence
+    是 ``content`` + ``metadata.{source,score}``，于是每条记录都渲染成 ``[] () type= tag=[] null``。
+    **verifier 收到的证据是空的**，全量 1540 条 QA 的 sufficient 全是 false ——
+    看起来像"模型判得太严"，实际是数据管道坏了。0% 这个数字本身就说明不该往能力上归因。
+    """
+    section("15. verifier：证据渲染（静默出错的高危环节）")
+    from codemem.search import verifier as V
+
+    ev = [{"content": "Caroline joined an LGBTQ support group in May 2023.",
+           "metadata": {"source": ["session_5_2"], "score": 0.9}}]
+    rendered = V.render_memories(ev)
+    check("新格式的正文被渲染出来", "joined an LGBTQ support group" in rendered, rendered)
+    check("不再出现 v2 的空占位", "type= tag=[]" not in rendered, rendered)
+    check("source 被带上", "session_5_2" in rendered, rendered)
+    # evidence 记录没有 msg_id（标识就是 content），所以方括号为空、靠 source 溯源 ——
+    # 这是预期的；关键是**正文必须渲染出来**，而不是像 bug 时那样渲染成 null
+    check("正文不是 null", "null" not in rendered.split(chr(10))[1], rendered[:80])
+
+    msgs = V.build_verifier_messages("When?", ev)
+    check("verifier 消息里真的有证据", "LGBTQ support group" in msgs[1]["content"])
+    check("verifier 看不到参考答案", "reference" not in msgs[0]["content"].lower())
+
+    # 旧格式仍能渲染（历史产物）
+    legacy = [{"memory": "old atom text", "metadata": {"id": "a1", "source": ["s"]}}]
+    check("旧格式仍能渲染", "old atom text" in V.render_memories(legacy))
+    check("空证据给出说明", "no records" in V.render_memories([]))
+
+
 def test_agent_guards() -> None:
     """agent 的两条机制提醒（纯 CPU）：该动笔了 / 写太多了。"""
     section("13. agent 机制提醒（write nudge / oversize guard）")
@@ -1178,13 +1209,22 @@ def test_answer_parse() -> None:
 
     memory = {"memory": "X happened", "metadata": {"time": "2023-05-07",
                                                   "tag": ["speaker:Caroline"]}}
-    check("渲染带 time + speaker", A.render_evidence([memory]) == "[2023-05-07] Caroline: X happened",
-          A.render_evidence([memory]))
+    # 新格式：content + metadata.source。渲染必须带上正文与来源（这是修掉的 bug 的核心）
+    new_ev = {"content": "X happened", "metadata": {"source": ["session_1_1"], "score": 0.9}}
+    rendered_ev = A.render_evidence([new_ev])
+    check("渲染带正文", "X happened" in rendered_ev, rendered_ev)
+    check("渲染带来源", "session_1_1" in rendered_ev, rendered_ev)
+    check("不再渲染出空正文", "unknown:" not in rendered_ev, rendered_ev)
+    check("旧格式仍能渲染", "old text" in A.render_evidence(
+        [{"memory": "old text", "metadata": {"source": ["s"]}}]))
     check("无证据时给出占位", "no memories" in A.render_evidence([]))
-    check("current_date 取最晚日期",
-          A.current_date_hint([memory, {"memory": "y", "metadata": {"time": "2023-01-01"}}])
+    # evidence 通常没有 time 字段，日期写在正文里 —— 提示要扫正文
+    check("current_date 从正文里取日期",
+          A.current_date_hint([{"content": "event on 2023-05-07", "metadata": {"source": ["s"]}},
+                               {"content": "other on 2023-01-01", "metadata": {"source": ["s"]}}])
           == "2023-05-07")
-    check("无日期时回退今天", len(A.current_date_hint([{"memory": "y", "metadata": {}}])) == 10)
+    check("无日期时回退今天", len(A.current_date_hint(
+        [{"content": "no date here", "metadata": {"source": ["s"]}}])) == 10)
 
 
 def test_eval_metrics() -> None:
@@ -1579,6 +1619,7 @@ def main() -> int:
         test_evidence(tmp)
         test_timecalc()
         test_qa_selection()
+        test_verifier_rendering()
         test_agent_guards()
         test_judge_temporal()
         test_answer_parse()

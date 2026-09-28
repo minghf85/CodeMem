@@ -380,7 +380,9 @@ async def run_search(args: argparse.Namespace) -> int:
         missing_positions = [i for i, memory_id in enumerate(ids) if memory_id not in row_of]
         try:
             vectors = await _embed_query_evidence(
-                [args.query, *[(pool[i].get("memory") or "") for i in missing_positions]],
+                # 必须走 msg_content：新格式是 content 字段，硬读 memory 会得到空串，
+                # 于是新加入 evidence 的记录被嵌成空向量、永远检索不到。
+                [args.query, *[msg_content(pool[i]) for i in missing_positions]],
                 base_url=embed_url,
                 api_key=_env("CODEMEM_EMBED_KEY"),
                 model=_env("CODEMEM_EMBED_MODEL"),

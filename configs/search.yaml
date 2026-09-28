@@ -83,9 +83,11 @@ context_keep_recent: 8
 bash_timeout: 60
 
 # ---- 并发与预算 ----
-# QA 级并发（每个 QA 一个私有工作目录，base 库只读 → 可放心并发）
-concurrency: 4
-# 目录级并发
+# QA 级并发（每个 QA 一个私有工作目录，base 库只读 → 可放心并发）。
+# 实测：模型服务在并发 32 时吞吐达峰（9.1 req/s），更高反而下降（48 时 8.4）。
+concurrency: 32
+# 目录级并发。目录之间完全独立（各自的语料与产物），可以并行。
+# 注意总并发 ≈ concurrency × concurrency_dirs，别让它超过服务的吞吐拐点。
 concurrency_dirs: 1
 # 成本软闸门：单目录累计步数上限，超过后不再开新 QA。0 = 不限
 max_total_steps: 0

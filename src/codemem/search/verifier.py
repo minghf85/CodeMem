@@ -20,6 +20,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
+from ..io import msg_content, msg_id
 from ..log import Logger, block
 
 VERIFIER_SYSTEM_PROMPT = """You are a strict evidence auditor. You do NOT know how the evidence was produced; you only see a question and a set of memory records. Judge only what is in front of you.
@@ -136,20 +137,28 @@ def parse_verdict(text: str) -> Verdict:
 
 
 def render_memories(memories: list[dict[str, Any]], max_chars: int = 600) -> str:
-    """把 evidence 记录渲染成 verifier 的输入。只给 verifier 需要的最小信息面。"""
+    """把 evidence 记录渲染成 verifier 的输入。
+
+    **必须走 ``io`` 的访问器**。这里曾经硬读 v2 的 ``memory``/``metadata.id``/``type``/``tag``
+    字段，而新的 evidence 是 ``content`` + ``metadata.{source,score}`` —— 于是每条记录都
+    渲染成 ``[] () type= tag=[] null``，**verifier 实际收到的证据是空的**。
+
+    实测后果：全量 1540 条 QA 的 sufficient 全是 false。verifier 的判定没错 ——
+    它确实什么也没看到；是喂给它的输入被渲染坏了。这是一个"看起来像模型能力问题、
+    实际是数据管道问题"的典型：0% 这个数字本身就说明不该往能力上归因。
+    """
     if not memories:
         return "(no records were provided)"
     lines: list[str] = []
     for memory in memories:
         meta = memory.get("metadata") or {}
-        text = memory.get("memory")
-        text = text if isinstance(text, str) else json.dumps(text, ensure_ascii=False)
+        text = msg_content(memory) or json.dumps(memory, ensure_ascii=False)
         if len(text) > max_chars:
             text = text[:max_chars] + "…"
-        lines.append(
-            f"[{meta.get('id', '')}] ({meta.get('time', '')}) "
-            f"type={meta.get('type', '')} tag={meta.get('tag', [])}\n  {text}"
-        )
+        source = meta.get("source")
+        source_text = ", ".join(str(s) for s in source) if isinstance(source, list) else ""
+        provenance = f" source=[{source_text}]" if source_text else ""
+        lines.append(f"[{msg_id(memory)}]{provenance}\n  {text}")
     return "\n".join(lines)
 
 
