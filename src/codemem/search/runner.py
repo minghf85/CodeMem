@@ -12,7 +12,7 @@
 产物：
 
     data/search_runs/{experiment}_{ts}/{dir}/
-        inputs/{atommem,msgmem}.jsonl   只读输入（硬链）
+        inputs/{sessions,session_summaries,speakers_summary}.jsonl  只读输入（硬链）
         inputs/index/                   预建检索索引（dense 不可用时为空）
         inputs/search                   可执行的 search 包装（PATH 里就能直接调）
         qa_{idx}/evidence.jsonl         **唯一产物**
@@ -59,6 +59,9 @@ from ..io import PROJECT_ROOT
 DATA_DIR = PROJECT_ROOT / "data"
 CONFIG_FILE = PROJECT_ROOT / "configs" / "search.yaml"
 TOOL_CONFIG_FILE = PROJECT_ROOT / "configs" / "tool.json"
+
+#: 三层语料文件名（与 searchctl.LIBRARY_FILES 一致）。索引、篡改校验、来源描述都用它。
+CORPUS_FILES = ("sessions.jsonl", "session_summaries.jsonl", "speakers_summary.jsonl")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "generator": {"base_url": "http://127.0.0.1:30000/v1", "api_key": "sglang", "model": "local",
@@ -143,7 +146,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return items
 
 
-# ``atommem.chat_completion`` 需要的键。**重试参数在顶层**（timeout / max_retries /
+# ``llm.chat_completion`` 需要的键。**重试参数在顶层**（timeout / max_retries /
 # backoff_*），模型参数在 ``generator`` 段里 —— 所以要把两处合起来给它，否则 KeyError。
 CALL_KEYS = (
     "timeout", "max_retries", "backoff_base", "rate_limit_backoff", "max_backoff",
@@ -450,7 +453,8 @@ async def run_qa(
     dir_name = f"qa_{qa_index}" if repeat <= 1 else f"qa_{qa_index}_r{repeat}"
     workspace_root = run_dir / directory.name / dir_name
     evidence_path = workspace_root / "evidence.jsonl"
-    inputs_sha_before = sha256_of(inputs_dir / "atommem.jsonl")
+    # 篡改校验覆盖**全部语料**（不只原始消息）—— 只查一个是自欺欺人
+    inputs_sha_before = {name: sha256_of(inputs_dir / name) for name in CORPUS_FILES}
 
     async with semaphore:
         qa_log.info(
@@ -636,12 +640,14 @@ async def run_qa(
         record.evidence_ids = [_id_of(m) for m in report.valid]
         record.evidence_count = len(report.valid)
         record.inputs_sha256 = {
-            "atommem.jsonl": inputs_sha_before,
-            "atommem.jsonl.after": sha256_of(inputs_dir / "atommem.jsonl"),
+            **{name: {"before": digest} for name, digest in inputs_sha_before.items()},
         }
-        if record.inputs_sha256["atommem.jsonl"] != record.inputs_sha256["atommem.jsonl.after"]:
-            record.tampered = True
-            qa_log.error("inputs/atommem.jsonl 被改动了！该 QA 结果作废（tampered=true）")
+        for name in CORPUS_FILES:
+            after = sha256_of(inputs_dir / name)
+            record.inputs_sha256[name]["after"] = after
+            if inputs_sha_before[name] != after:
+                record.tampered = True
+                qa_log.error(f"inputs/{name} 被改动了！该 QA 结果作废（tampered=true）")
 
         record.steps = step_offset
         record.tool_calls = sum(item["tool_calls"] for item in record.rounds)
@@ -662,8 +668,10 @@ async def run_qa(
 
 
 def _id_of(memory: dict[str, Any]) -> str:
-    value = (memory.get("metadata") or {}).get("id")
-    return value if isinstance(value, str) else ""
+    """记录标识。**委托给 ``evidence._id_of``**，别在这里再写一份 ——
+    新格式的 evidence 没有 ``metadata.id``（用 content 当标识），两处各写一份就会不一致
+    （实测：这里只读 metadata.id，于是所有新格式记录的标识全是空串）。"""
+    return evidence_mod._id_of(memory)
 
 
 # ---------------------------------------------------------------------------
@@ -803,11 +811,21 @@ async def run_dir(
 
     label = directory.name
     log = log.bind(label)
-    atommem_path = directory / "atommem.jsonl"
-    msgmem_path = directory / "msgmem.jsonl"
-    if not atommem_path.exists() or not msgmem_path.exists():
-        log.warn("跳过：缺少 atommem.jsonl 或 msgmem.jsonl")
-        return {"dir": label, "status": "SKIPPED", "reason": "missing inputs"}
+    # 需要的输入：原始消息 + 两层 summary。缺 summary 时**只警告不跳过** ——
+    # 原始消息本身是可检索的，退化成"没有概览"总比整个目录跑不了好。
+    sessions_path = directory / "sessions.jsonl"
+    if not sessions_path.exists():
+        log.warn("跳过：缺少 sessions.jsonl（先跑 `python -m codemem.add --stage session`）")
+        return {"dir": label, "status": "SKIPPED", "reason": "missing sessions.jsonl"}
+    missing_summaries = [
+        name for name in ("session_summaries.jsonl", "speakers_summary.jsonl")
+        if not (directory / name).exists()
+    ]
+    if missing_summaries:
+        log.warn(
+            f"缺少 {missing_summaries}：检索将只有原始消息，没有概览层"
+            f"（建议先跑 `python -m codemem.add --stage summary`）"
+        )
 
     out_dir = run_dir / label
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -971,12 +989,18 @@ async def build_inputs(
       也**绝不会**静默复用过期向量；
     - 删除某次运行目录只删链接，共享索引不受影响。
 
-    ``atommem.jsonl`` / ``msgmem.jsonl`` 本来就用硬链，不占额外空间（inode 共享）。
+    ``sessions.jsonl`` / ``session_summaries.jsonl`` 本来就用硬链，不占额外空间（inode 共享）。
     """
     inputs_dir = run_dir / directory.name / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
-    link_or_copy(directory / "atommem.jsonl", inputs_dir / "atommem.jsonl")
-    link_or_copy(directory / "msgmem.jsonl", inputs_dir / "msgmem.jsonl")
+    # 三层语料，粒度递减（agent 由粗到细地检索）：
+    #   speakers_summary     整段关系的顶层概览（1 条）
+    #   session_summaries    每次会话一份
+    #   sessions             原始消息
+    for name in ("sessions.jsonl", "session_summaries.jsonl", "speakers_summary.jsonl"):
+        source = directory / name
+        if source.exists():
+            link_or_copy(source, inputs_dir / name)
     search_bin = write_search_wrapper(inputs_dir)
 
     embed_cfg = config.get("embedding") or {}
@@ -985,11 +1009,12 @@ async def build_inputs(
     model = str(embed_cfg.get("model", ""))
     index_dir = inputs_dir / "index"
 
-    # 索引**同时覆盖 atommem 与 msgmem**：检索池要能搜到原话（见 searchctl.merge_pool），
-    # 否则"答案只在原话里"的问题会退化成靠猜 id。两份语料 id 不重叠。
-    atoms = read_jsonl(inputs_dir / "atommem.jsonl")
-    raws = read_jsonl(inputs_dir / "msgmem.jsonl")
-    memories = [*atoms, *raws]
+    # 索引覆盖**三层语料全部**：summary 是概览（粗检索），原始消息是细节（精检索），
+    # 只索引其中一层会让另一层永远搜不到。三份 id 不重叠（summary 的 id 带 _summary 后缀）。
+    speakers_summaries = read_jsonl(inputs_dir / "speakers_summary.jsonl")
+    session_summaries = read_jsonl(inputs_dir / "session_summaries.jsonl")
+    sessions = read_jsonl(inputs_dir / "sessions.jsonl")
+    memories = [*speakers_summaries, *session_summaries, *sessions]
 
     if not have_embed or embedder is None:
         if not allow_fallback:
@@ -1004,11 +1029,14 @@ async def build_inputs(
     if index_mod.index_is_usable(shared, memories, model):
         log.info(
             f"复用共享索引缓存：{len(memories)} 条 × {index_mod.load_index(shared).dim} 维 "
-            f"（{len(atoms)} 原子 + {len(raws)} 原话）"
+            f"（speakers {len(speakers_summaries)} + session {len(session_summaries)} + "
+            f"消息 {len(sessions)}）"
         )
     else:
         log.info(
-            f"建检索索引：{len(memories)} 条（原子 {len(atoms)} + 原话 {len(raws)}）"
+            f"建检索索引：{len(memories)} 条"
+            f"（speakers summary {len(speakers_summaries)} + "
+            f"session summary {len(session_summaries)} + 原始消息 {len(sessions)}）"
             f" -> 共享缓存 {shared}"
         )
         try:
@@ -1017,7 +1045,7 @@ async def build_inputs(
                 embed=embedder.embed,
                 directory=shared,
                 model=model,
-                source=f"{directory / 'atommem.jsonl'} + {directory / 'msgmem.jsonl'}",
+                source=" + ".join(sorted(CORPUS_FILES)),
             )
         except Exception as exc:  # noqa: BLE001
             if not allow_fallback:
@@ -1172,7 +1200,7 @@ def resolve_dirs(config: dict[str, Any], args: argparse.Namespace) -> list[Path]
         return [DATA_DIR / args.sample]
     return sorted(
         path for path in DATA_DIR.iterdir()
-        if path.is_dir() and (path / "atommem.jsonl").exists()
+        if path.is_dir() and (path / "sessions.jsonl").exists()
     )
 
 
@@ -1262,7 +1290,8 @@ async def async_main(args: argparse.Namespace) -> None:
 
     directories = resolve_dirs(config, args)
     if not directories:
-        log.error("没有找到任何含 atommem.jsonl 的目录")
+        log.error("没有找到任何含 sessions.jsonl 的目录"
+                  "（先跑 `python -m codemem.add --stage session`）")
         return
 
     # --list-qa：只列下标就退出（run 之前先看下标，比让人自己数靠谱）

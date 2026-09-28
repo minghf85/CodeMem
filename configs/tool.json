@@ -140,64 +140,60 @@
   },
   "commands": {
     "jq": {
-      "summary": "JSON processor. This is how you inspect and select memory records; do not use grep or cat for JSON.",
+      "summary": "JSON processor. This is how you read records; do not use grep or cat for JSON.",
       "recipes": [
         {
-          "why": "See the top hits for a query: id, score, and text only.",
-          "cmd": "search \"QUERY\" -k 8 | jq -c '{id,score,memory}'"
+          "why": "See the top hits: id, which layer, score, and text.",
+          "cmd": "search \"QUERY\" -k 8 | jq -c '{id,kind,score,memory}'"
         },
         {
-          "why": "IDS DIFFER BY FILE. atommem records end with a sequence number; msgmem MESSAGES do not. Look up a message with its message id, a record with its record id.",
-          "cmd": "jq -c 'select(.metadata.id==\"session_1_3\") | .metadata' inputs/msgmem.jsonl"
+          "why": "READ A SPECIFIC MESSAGE. Input records are id'd by `msg_id` -- NOT `metadata.id`.",
+          "cmd": "jq -c 'select(.msg_id==\"session_1_11\")' inputs/sessions.jsonl"
         },
         {
-          "why": "Print the real message ids (use this when a select matches nothing).",
-          "cmd": "jq -r '.metadata.id' inputs/msgmem.jsonl | head -20"
+          "why": "Read a session's summary (one per session).",
+          "cmd": "jq -c 'select(.msg_id==\"session_3_summary\")' inputs/session_summaries.jsonl"
         },
         {
-          "why": "Print the ids of the records you already put in evidence (never add one twice).",
-          "cmd": "jq -r '.metadata.id' evidence.jsonl"
+          "why": "Read the top-level speakers summary (there is exactly one).",
+          "cmd": "jq -c . inputs/speakers_summary.jsonl"
         },
         {
-          "why": "Pull ONE library record in full so you can rewrite it with the context resolved.",
-          "cmd": "jq -c 'select(.metadata.id==\"session_5_2_1\")' inputs/atommem.jsonl"
+          "why": "READ A WHOLE SESSION. Get its summary, then every message whose msg_id starts with session_8_.",
+          "cmd": "jq -c 'select(.msg_id|startswith(\"session_8_\"))' inputs/sessions.jsonl"
         },
         {
-          "why": "Check a message's raw text and timestamp -- needed whenever a relative time or a pronoun has to be resolved.",
-          "cmd": "jq -c 'select(.metadata.id==\"session_5_2\")' inputs/msgmem.jsonl"
-        },
-        {
-          "why": "SESSION DATES: every message of a session carries that session's timestamp. This is the anchor for relative time.",
-          "cmd": "jq -c 'select(.metadata.type==\"raw\") | {id:.metadata.id, time:.metadata.time}' inputs/msgmem.jsonl | head -20"
+          "why": "See the ids of the records you already put in evidence (never add one twice).",
+          "cmd": "jq -r '.content' evidence.jsonl | head"
         },
         {
           "why": "Self-check your evidence: list any line missing required fields.",
-          "cmd": "jq -c 'select((.memory|type)!=\"string\" or (.metadata.source|length)==0 or (.metadata.id|type)!=\"string\")' evidence.jsonl"
+          "cmd": "jq -c 'select((.content|type)!=\"string\" or (.metadata.source|length)==0)' evidence.jsonl"
         },
         {
-          "why": "Count how many records you have so far.",
+          "why": "Count how many evidence records you have so far.",
           "cmd": "jq -s 'length' evidence.jsonl"
         },
         {
-          "why": "Deduplicate by id (do this if you have accidentally appended twice).",
-          "cmd": "jq -sc 'unique_by(.metadata.id)[]' evidence.jsonl > t && mv t evidence.jsonl"
+          "why": "Deduplicate by content (do this if you appended twice).",
+          "cmd": "jq -sc 'unique_by(.content)[]' evidence.jsonl > t && mv t evidence.jsonl"
         }
       ]
     },
     "timecalc": {
-      "summary": "Deterministic date arithmetic. USE THIS instead of computing dates in your head -- you will get them wrong. Turn a relative time ('about a month ago', 'two weeks later') into an absolute one by anchoring on the session timestamp from inputs/msgmem.jsonl.",
+      "summary": "Deterministic date arithmetic. USE THIS instead of computing dates in your head -- you will get them wrong. Records carry the session time in its original form (\"1:56 pm on 8 May, 2023\"); turn a relative time (\"about a month ago\", \"two weeks later\") into an absolute one by anchoring on it.",
       "usage": "timecalc shift <date> <offset> [...] | diff <a> <b> | range <start> <end> | info <date>",
       "recipes": [
         {
-          "why": "Relative time -> absolute. 'about a month before the 2023-06-17 session'.",
-          "cmd": "timecalc shift 2023-06-17 -1month"
+          "why": "Relative time -> absolute, anchoring on a session time (the raw form is accepted).",
+          "cmd": "timecalc shift \"1:56 pm on 8 May, 2023\" -1month"
         },
         {
           "why": "How far apart two events are (signed days/months).",
           "cmd": "timecalc diff 2023-05-08 2023-06-17"
         },
         {
-          "why": "Build the 'time' field for a range you inferred.",
+          "why": "Build the time for a range you inferred.",
           "cmd": "timecalc range 2023-05-01 2023-05-31"
         },
         {
@@ -207,51 +203,30 @@
       ]
     },
     "search": {
-      "summary": "Hybrid retrieval (dense + BM25 + tag, RRF-fused) over THREE corpora: the atom library (inputs/atommem.jsonl), the raw messages (inputs/msgmem.jsonl), and the records you have already written to evidence.jsonl. Prints one JSON object per hit, best first. Rows with score 0.0 and all ranks null are FILLER -- ignore them.",
-      "usage": "search \"QUERY\" [-k N] [--source base|raw|evidence|all] [--tag TAG]... [--exclude-tag TAG]... [--tag-values] [--derive] [--lexical]",
+      "summary": "Hybrid retrieval (dense + BM25 + tag, RRF-fused) over the three input layers, plus the records you have already written to evidence.jsonl. Prints one JSON object per hit, best first. Rows with score 0.0 and all ranks null are FILLER -- ignore them.",
+      "usage": "search \"QUERY\" [-k N] [--source all|summary|sessions|evidence] [--lexical] [--fields ...]",
       "output_fields": {
-        "id": "record id",
-        "kind": "atom = an extracted atom (its `source` points at the raw messages it came from); raw = an actual message",
+        "id": "record id (a msg_id like session_1_11, or session_3_summary, or speakers_summary)",
+        "kind": "which layer: speakers_summary (the whole relationship) / session_summary (one session) / session (a raw message)",
         "score": "RRF score (higher is better; only comparable within one call)",
         "rank_dense": "rank in the embedding channel, or null if it did not hit",
         "rank_bm25": "rank in the keyword channel, or null if it did not hit",
-        "rank_tag": "rank in the tag channel, or null if it did not hit",
+        "rank_tag": "rank in the role-matching channel, or null if it did not hit",
         "memory": "the record text",
-        "source": "for kind=atom: the raw message ids it was extracted from. For kind=raw: empty",
-        "derived_from": "only with --derive: the atom ids extracted from this raw message"
+        "source": "for session_summary: the msg_ids of that session"
       },
       "recipes": [
         {
-          "why": "Default search -- atoms AND raw messages together.",
+          "why": "Default: searches all three layers at once.",
           "cmd": "search \"counseling mental health\" -k 8"
         },
         {
-          "why": "STEP 1 FOR A SET QUESTION. List the tag vocabulary with counts first -- reading 100 raw hits is too much, but this shows exactly which values exist and how many records each has.",
-          "cmd": "search --source base --tag-values --tag speaker:Melanie --tag activity --tag topic"
+          "why": "Search only the summaries -- coarse retrieval, to locate WHICH session matters.",
+          "cmd": "search \"adoption\" -k 5 --source summary"
         },
         {
-          "why": "STEP 2: pull the promising values by tag, then keep the ones that really answer the question.",
-          "cmd": "search \"Melanie\" -k 50 --source base --tag activity --tag topic:art --exclude-tag action:ask"
-        },
-        {
-          "why": "See what tag values exist in the whole library.",
-          "cmd": "jq -r '.metadata.tag[]' inputs/atommem.jsonl | sort | uniq -c | sort -rn | head -30"
-        },
-        {
-          "why": "SEARCH THE ACTUAL WORDS. If the question asks what someone wants/said/meant, the literal wording is often only in a raw message -- no atom states it outright.",
-          "cmd": "search \"counseling mental health\" -k 8 --source raw"
-        },
-        {
-          "why": "Only the atom library (skip raw messages).",
-          "cmd": "search \"education career\" -k 8 --source base"
-        },
-        {
-          "why": "Trace a hit back to its origin: an atom's `source` lists the message ids it came from.",
-          "cmd": "search \"education\" -k 5 | jq -c '{id,kind,source}'"
-        },
-        {
-          "why": "Spread out from a raw message to every atom extracted from it.",
-          "cmd": "search \"counseling mental health\" -k 5 --source raw --derive"
+          "why": "SEARCH THE ACTUAL WORDS. Summaries rewrite wording, so a specific name, number, or phrase often exists only in a raw message. Never conclude an answer is missing before searching the raw messages by keyword.",
+          "cmd": "search \"pottery class\" -k 8 --source sessions"
         },
         {
           "why": "Only inside your own evidence (check coverage / duplication).",
@@ -266,21 +241,23 @@
   },
   "workspace": {
     "layout": [
-      "inputs/atommem.jsonl  -- the atom library, READ-ONLY. Distilled facts, one per line. `search` covers it.",
-      "inputs/msgmem.jsonl   -- the RAW conversation messages, READ-ONLY. `search --source raw` covers it.",
-      "evidence.jsonl        -- YOUR output (in the working directory). One record per line."
+      "inputs/speakers_summary.jsonl  -- ONE record: the top-level summary of the whole relationship. READ-ONLY. Start here.",
+      "inputs/session_summaries.jsonl -- One record per session, in order. READ-ONLY.",
+      "inputs/sessions.jsonl          -- Every raw message, in order. READ-ONLY.",
+      "evidence.jsonl                 -- YOUR output (in the working directory). One record per line."
     ],
     "rules": [
       "Never modify anything under inputs/. It is read-only and your writes there are rejected.",
       "The working directory is your own; only evidence.jsonl matters in the end.",
-      "An evidence record's metadata.source must be non-empty and must reference ids you actually saw. Keep an atom's source when you reuse it; list every id you relied on for a record you write.",
-      "A record id must be unique within evidence.jsonl. Reuse the library id when you rewrite a library record; invent a new id for a new one."
+      "Read from coarse to fine: the speakers summary tells you WHICH session matters; that session's summary tells you what was discussed; sessions.jsonl holds the exact words. Go down only as far as the question needs.",
+      "An evidence record's metadata.source must be non-empty and must list the msg_ids you actually read. This is the anti-hallucination guard."
     ]
   },
   "writing_policy": {
     "headline": "Evidence must be READY TO USE, not a copy of the library. Rewrite freely.",
     "rules": [
-      "DO NOT just copy library records. A downstream reader sees ONLY evidence.jsonl -- not the library, not the raw messages. Anything needed to read your records must be inside them.",
+      "**The shape of an evidence record** -- this is NOT the same shape as the input records. Evidence is: {\"content\": \"<the statement>\", \"metadata\": {\"source\": [\"<msg_id>\", ...], \"score\": <0.0-1.0>}}. Input records have msg_id/role/time/content and NO metadata -- copying one straight into evidence.jsonl will be REJECTED because it has no source. You must write the record yourself, with the msg_ids you actually read in `source`.",
+      "DO NOT just copy input records. A downstream reader sees ONLY evidence.jsonl -- not the summaries, not the raw messages. Anything needed to read your records must be inside them.",
       "REWRITE a record when its meaning depends on context it does not carry: resolve 'she'/'he'/'there' to names, replace 'yesterday'/'last month' with the absolute date, expand a fragment into a sentence.",
       "REASON, do not just extract. Time, event and personality questions usually need inference:",
       "  - time: relative wording + the session timestamp -> absolute date (use `timecalc`).",
@@ -294,47 +271,32 @@
     ]
   },
   "schema": {
-    "_comment": "base_mem record. Same shape as inputs/atommem.jsonl lines.",
+    "_comment": "evidence record -- same shape as evidence_template.jsonl",
     "fields": [
       {
-        "name": "memory",
+        "name": "content",
         "required": true,
-        "note": "The fact, as one self-contained sentence. No id/prefix boilerplate. YOU MAY REWRITE THE LIBRARY TEXT: resolve pronouns to names, replace relative times with absolute dates, or state a conclusion you inferred. A downstream reader sees only this text."
-      },
-      {
-        "name": "metadata.id",
-        "required": true,
-        "note": "Unique within the file. Keep the library id when you rewrite a library record; invent a unique id for a record you added (e.g. \"evidence_3_1\")."
-      },
-      {
-        "name": "metadata.type",
-        "required": true,
-        "note": "inner (stable identity/long-term fact) or outer (temporary state, plan)."
-      },
-      {
-        "name": "metadata.time",
-        "required": true,
-        "note": "ISO-8601, or a range 'YYYY-MM-DD/YYYY-MM-DD'. RESOLVE relative times to absolute ones whenever the session date lets you (use `timecalc`); if genuinely unresolvable keep the original wording, e.g. 'two days before Alan was born'. Empty string if there is none."
-      },
-      {
-        "name": "metadata.tag",
-        "required": true,
-        "note": "Array of 'key:value'. MUST include at least one 'speaker:<name>'. Others: topic:, entity:, relation:, action:, state:, sentiment:, other:."
+        "note": "The evidence, written as one self-contained statement that answers or supports the answer. YOU MAY REWRITE: resolve pronouns to names, turn relative times into absolute dates, join two facts into one conclusion. A downstream reader sees ONLY this text -- never the inputs."
       },
       {
         "name": "metadata.source",
         "required": true,
-        "note": "NON-EMPTY array of real ids you actually saw (msgmem id like 'session_5_2', or atommem id). This is the anti-hallucination guard: a record with no provenance is not admissible. For an inferred record, list every id you reasoned from."
+        "note": "NON-EMPTY array of the msg_ids you actually read to produce this record (e.g. [\"session_1_9\", \"session_1_11\"]). Every claim must trace back to real messages."
+      },
+      {
+        "name": "metadata.score",
+        "required": true,
+        "note": "YOUR confidence that this record helps answer the QUESTION, from 0.0 to 1.0. Be honest: a record you are unsure about should score low rather than be dropped."
       },
       {
         "name": "metadata.changelog",
         "required": false,
-        "note": "Leave [] for new records. The system fills it in if missing."
+        "note": "Leave [] -- the system fills it in with the creation time."
       }
     ]
   },
   "prompt": {
-    "system": "You are a memory-evidence builder. You work inside a single directory and use four tools: read, write, edit, bash.\n\n# RESPONSE FORMAT (read this first)\n\n{{PROTOCOL}}\n\n# YOUR GOAL\n\nGiven a QUESTION, produce `evidence.jsonl`: the set of memory records that together are SUFFICIENT to answer that question. A downstream reader sees ONLY that file -- not the library, not the raw messages. So every record must be readable on its own, and the set must already contain the answer.\n\n# WRITE EARLY, AND WRITE EVERYTHING AT ONCE\n\nA common way to fail is to spend every turn reading and never produce a file. There is a hard rule:\n\n- By turn 4 you MUST have written something to evidence.jsonl.\n- Once you know which records you need, write them ALL IN ONE CALL -- a single `write` with the whole list (or one `jq -s` that builds the whole file). Do not write them one per turn; that wastes your budget and makes duplicates likely.\n- Never finish without having written the file. An empty evidence.jsonl scores zero no matter how well you searched.\n- Do not re-read the same record you have already read. If you have read it, use it.\n\n# EVIDENCE IS DERIVED, NOT COPIED (the second hard rule)\n\nDo NOT treat this as a search-and-copy task. The library records are raw material: fragments, dangling pronouns, relative times. Your job is to REASON on them and write records that are ready to use.\n\n- Resolve references: 'she'/'he'/'there' -> the actual name or place.\n- Resolve time: 'yesterday' / 'about a month ago' / 'last summer' -> an absolute date, anchored on the session timestamp you can read from inputs/msgmem.jsonl. Compute it with `timecalc`, never in your head.\n- Join facts: if two records are only meaningful together, write one record that states the conclusion.\n- Infer: time questions need arithmetic; event questions need joining; personality and attribute questions need several scattered statements summarised into one.\n- Add a record for a conclusion no single library record states. List in `source` every id you reasoned from.\n- Keep it minimal. Enough records to answer the question, and nothing else. Delete records you pulled in that turned out to be irrelevant.\n- NEVER invent names, dates, places or ids. Everything must trace to something you actually read.\n\n# HOW TO WORK\n\n1. Work out what the question really asks (who / what / when / which) and what facts that requires.\n2. `search` with a query drawn from the question. Read the hits.\n3. **If the hits do not contain the answer, search the ACTUAL WORDS against the raw messages: `--source raw`.** Atoms are distilled and often generalise away the specific answer -- the strongest atom may only say \"Caroline wants to continue her education\" while the answer (\"counseling or mental health\") exists only in the message \"I'm keen on counseling or working in mental health\". Never conclude the answer is missing from the library before checking the raw messages by keyword.\n4. Move between the two corpora freely:\n   - **atom -> raw (trace back)**: every atom's `source` lists the message ids it came from. Read them to get the exact wording.\n   - **raw -> atom (spread out)**: `search \"KEYWORDS\" --source raw --derive` shows which atoms were extracted from a message.\n5. For any relative time, get the session's absolute timestamp from inputs/msgmem.jsonl and run `timecalc` to convert.\n5. **If the question asks for a SET** (\"what activities does X do?\", \"what are X's hobbies?\", \"who did X met?\"), do NOT rely on `search` alone -- similarity ranking cannot collect a scattered set (a member can sit at rank 100+). Enumerate with tags:\n     search --source base --tag-values --tag speaker:X --tag activity --tag topic\n   That lists every tag value and its count -- far cheaper than reading 100 hits. Then pull each promising value by tag:\n     search \"X\" -k 50 --source base --tag activity --tag topic:art --exclude-tag action:ask\n   Also try the answer's own words (`--source raw`, e.g. \"pottery camping painting swimming\") --    a set often spans several themes. **Review the WHOLE candidate list before writing**: the    failure mode is writing after the first few hits and missing members further down.\n6. WRITE the records -- rewritten, joined, or inferred as needed -- into evidence.jsonl, all at once.\n7. Re-read evidence.jsonl as if you had never seen the library. Does it answer the question by itself? Fix what does not, then stop calling tools.\n\n# TOOLS\n\n{{TOOLS}}\n\n# COMMAND-LINE TOOLS (use them through bash)\n\n{{COMMANDS}}\n\n# WORKSPACE\n\n{{WORKSPACE}}\n\n# RECORD SCHEMA\n\n{{SCHEMA}}\n\n# WRITING POLICY\n\n{{WRITING_POLICY}}\n\n# RULES\n\n- Never invent names, dates, places, or ids. If it is not in what you read, you do not know it.\n- **A `source` must be an id whose CONTENT you actually saw in this session** -- not just an id you remember or guess. If you did not read that record, do not cite it.\n- A record you write MUST have a non-empty `metadata.source` listing real ids you actually saw.\n- Never modify inputs/. Only write evidence.jsonl.\n- **Never guess an id.** If `jq select(.metadata.id==\"...\")` prints nothing, that id does not exist in that file. Print the real ids (`jq -r '.metadata.id' <file> | head -20`) or use `search` instead of retrying. Repeating a lookup that returned nothing will not make it work.\n- Never append the same record twice. Check with: jq -r '.metadata.id' evidence.jsonl\n- Do not pad the file with loosely related records. Every record must earn its place.\n- When evidence.jsonl is sufficient, reply with plain text (no JSON). That is how you finish.\n\n# WORKED EXAMPLE (time inference)\n\nQUESTION: When did Caroline go to the LGBTQ support group?\n\nsearch \"Caroline LGBTQ support group\" -k 6\n  --> {\"id\":\"session_5_2_1\",...,\"memory\":\"Caroline joined an LGBTQ support group\"}\n  --> {\"id\":\"session_5_2_4\",...,\"memory\":\"Caroline: 'I've been going for about a month now'\"}\n\nNeither record has a date, and 'about a month' is relative. Get the session's timestamp:\n\n  bash: jq -c 'select(.metadata.id==\"session_5_2\") | .metadata' inputs/msgmem.jsonl\n  --> {\"id\":\"session_5_2\",\"time\":\"2023-06-17T10:00:00\",...}\n\nThat is the anchor. Do the arithmetic with the tool, not your head:\n\n  bash: timecalc shift 2023-06-17 -1month\n  --> 2023-05-17\n\nNow WRITE a record that carries the answer. Do not copy the fragments -- their meaning does not survive alone:\n\n  write evidence.jsonl  (one record: memory \"Caroline joined an LGBTQ support group in May 2023, about a month before 2023-06-17\", time \"2023-05-17\", source [\"session_5_2_1\",\"session_5_2_4\",\"session_5_2\"], tag [\"speaker:Caroline\",\"topic:LGBTQ support group\"], type \"outer\", id \"evidence_3_1\")\n\nOne record that answers \"when\" with no further lookup. Done.\n\n# WORKED EXAMPLE (attribute inference)\n\nQUESTION: What fields would Caroline be likely to pursue in her education?\n\nSeveral records each hold one piece: a plan to continue education, research into adoption, a dream of having a family, excitement about the future. None of them says what field. What you must do is:\n\n1. search for the career/education records and read them in ONE pass;\n2. NOTICE that they only name 'career options' -- so search again for what she actually looked into;\n3. find the records that name counseling and mental health, then WRITE the joined result:\n\n  bash: jq -cs --slurpfile ids ids.json 'map(select(.metadata.id as $i | $ids[0] | index($i)))[]' inputs/atommem.jsonl > evidence.jsonl\n  (or simply) write evidence.jsonl  with records such as: memory \"Caroline is pursuing a career in counseling and mental health; she began looking into counseling and mental health career options around July 2023\", source [\"session_7_7_3\",\"session_4_11_2\"], tag [\"speaker:Caroline\",\"topic:career\"]\n\nLeave out the records that turned out to be irrelevant (horseback riding, general statements about being busy). They are not evidence for this question.\n\n# THE QUESTION YOU MUST ANSWER\n\n{{QUESTION}}",
+    "system": "You are a memory-evidence builder. You work inside a single directory and use four tools: read, write, edit, bash.\n\n# RESPONSE FORMAT (read this first)\n\n{{PROTOCOL}}\n\n# YOUR GOAL\n\nGiven a QUESTION, produce `evidence.jsonl`: the set of memory records that together are SUFFICIENT to answer that question. A downstream reader sees ONLY that file -- not the library, not the raw messages. So every record must be readable on its own, and the set must already contain the answer.\n\n# WRITE EARLY, AND WRITE EVERYTHING AT ONCE\n\nA common way to fail is to spend every turn reading and never produce a file. There is a hard rule:\n\n- By turn 4 you MUST have written something to evidence.jsonl.\n- Once you know which records you need, write them ALL IN ONE CALL -- a single `write` with the whole list (or one `jq -s` that builds the whole file). Do not write them one per turn; that wastes your budget and makes duplicates likely.\n- Never finish without having written the file. An empty evidence.jsonl scores zero no matter how well you searched.\n- Do not re-read the same record you have already read. If you have read it, use it.\n\n# EVIDENCE IS DERIVED, NOT COPIED (the second hard rule)\n\nDo NOT treat this as a search-and-copy task. The library records are raw material: fragments, dangling pronouns, relative times. Your job is to REASON on them and write records that are ready to use.\n\n- Resolve references: 'she'/'he'/'there' -> the actual name or place.\n- Resolve time: 'yesterday' / 'about a month ago' / 'last summer' -> an absolute date, anchored on the session time that every record carries in its `time` field. Compute it with `timecalc`, never in your head.\n- Join facts: if two records are only meaningful together, write one record that states the conclusion.\n- Infer: time questions need arithmetic; event questions need joining; personality and attribute questions need several scattered statements summarised into one.\n- Add a record for a conclusion no single library record states. List in `source` every id you reasoned from.\n- Keep it minimal. Enough records to answer the question, and nothing else. Delete records you pulled in that turned out to be irrelevant.\n- NEVER invent names, dates, places or ids. Everything must trace to something you actually read.\n\n# HOW TO WORK\n\n1. Work out what the question really asks (who / what / when / which) and what facts that requires.\n2. **Read coarse to fine, in this order:**\n   a. `search \"KEYWORDS\" --source summary` -- locate WHICH session matters, from the summaries alone. The summaries were written to answer exactly this.\n   b. `jq -c 'select(.msg_id==\"session_N_summary\")' inputs/session_summaries.jsonl` -- read that session's summary in full.\n   c. Only if you still need the exact words: `search \"KEYWORDS\" --source sessions` and read the messages.\n   Default `search` (no --source) covers all three layers at once and labels each hit with `kind` -- use it when you do not yet know which layer holds the answer.\n3. **If the hits do not contain the answer, search the ACTUAL WORDS: `--source raw`.** Summaries rewrite wording, so a specific name, number, or phrase may exist only in a raw message. Never conclude an answer is missing before searching the raw messages by keyword.\n4. Move between layers freely:\n   - **summary -> raw (drill down)**: a session summary's `source` lists that session's msg_ids; read them with `jq -c 'select(.msg_id==\"session_3_5\")' inputs/sessions.jsonl`.\n   - **raw -> summary (zoom out)**: read the session summary for the session a message belongs to (`session_3_summary`) to see how it fits.\n5. For any relative time, take the session's own time from the record and run `timecalc` to convert. The raw form (\"1:56 pm on 8 May, 2023\") is accepted directly: `timecalc shift \"1:56 pm on 8 May, 2023\" -1month`.\n6. WRITE the records into evidence.jsonl (see the WRITING POLICY below).\n7. Re-read evidence.jsonl as if you had never seen the inputs. Does it answer the question by itself? Fix what does not, then stop calling tools.\n\n# TOOLS\n\n{{TOOLS}}\n\n# COMMAND-LINE TOOLS (use them through bash)\n\n{{COMMANDS}}\n\n# WORKSPACE\n\n{{WORKSPACE}}\n\n# RECORD SCHEMA\n\n{{SCHEMA}}\n\n# WRITING POLICY\n\n{{WRITING_POLICY}}\n\n# RULES\n\n- Never invent names, dates, places, or ids. If it is not in what you read, you do not know it.\n- **A `source` must be an id whose CONTENT you actually saw in this session** -- not just an id you remember or guess. If you did not read that record, do not cite it.\n- A record you write MUST have a non-empty `metadata.source` listing real ids you actually saw.\n- Never modify inputs/. Only write evidence.jsonl.\n- **Never guess an id.** Input records are id'd by `msg_id` (e.g. `session_1_11`, `session_3_summary`) -- there is no `metadata.id`. If a `jq select(.msg_id==\"...\")` prints nothing, that id does not exist. List the real ids (`jq -r '.msg_id' <file> | head -20`) or use `search` instead of retrying.\n- Never append the same record twice. Check with: jq -r '.content' evidence.jsonl\n- Do not pad the file with loosely related records. Every record must earn its place.\n- **Do not repeat a search you have already run**, and do not keep grepping the same file for variants of the same word. If two attempts at the same query found nothing new, the answer is not there -- write what you have and finish.\n- When evidence.jsonl is sufficient, reply with plain text (no JSON). That is how you finish.\n\n# WORKED EXAMPLE (time inference)\n\nQUESTION: When did Caroline go to the LGBTQ support group?\n\nsearch \"Caroline LGBTQ support group\" -k 6\n  --> {\"id\":\"session_5_2_1\",...,\"memory\":\"Caroline joined an LGBTQ support group\"}\n  --> {\"id\":\"session_5_2_4\",...,\"memory\":\"Caroline: 'I've been going for about a month now'\"}\n\nNeither record has a date, and 'about a month' is relative. Get the session's timestamp:\n\n  bash: jq -c 'select(.msg_id==\"session_5_2\")' inputs/sessions.jsonl\n  --> {\"id\":\"session_5_2\",\"time\":\"2023-06-17T10:00:00\",...}\n\nThat is the anchor. Do the arithmetic with the tool, not your head:\n\n  bash: timecalc shift 2023-06-17 -1month\n  --> 2023-05-17\n\nNow WRITE a record that carries the answer. Do not copy the fragments -- their meaning does not survive alone:\n\n  write evidence.jsonl  (one record: memory \"Caroline joined an LGBTQ support group in May 2023, about a month before 2023-06-17\", time \"2023-05-17\", source [\"session_5_2_1\",\"session_5_2_4\",\"session_5_2\"], tag [\"speaker:Caroline\",\"topic:LGBTQ support group\"], type \"outer\", id \"evidence_3_1\")\n\nOne record that answers \"when\" with no further lookup. Done.\n\n# WORKED EXAMPLE (attribute inference)\n\nQUESTION: What fields would Caroline be likely to pursue in her education?\n\nSeveral records each hold one piece: a plan to continue education, research into adoption, a dream of having a family, excitement about the future. None of them says what field. What you must do is:\n\n1. search for the career/education records and read them in ONE pass;\n2. NOTICE that they only name 'career options' -- so search again for what she actually looked into;\n3. find the records that name counseling and mental health, then WRITE the joined result:\n\n  bash: jq -c 'select(.msg_id==\"session_7_7\" or .msg_id==\"session_4_11\")' inputs/sessions.jsonl\n  (or simply) write evidence.jsonl  with records such as: memory \"Caroline is pursuing a career in counseling and mental health; she began looking into counseling and mental health career options around July 2023\", source [\"session_7_7_3\",\"session_4_11_2\"], tag [\"speaker:Caroline\",\"topic:career\"]\n\nLeave out the records that turned out to be irrelevant (horseback riding, general statements about being busy). They are not evidence for this question.\n\n# THE QUESTION YOU MUST ANSWER\n\n{{QUESTION}}",
     "user_begin": "Begin. The working directory is empty except for inputs/. Create evidence.jsonl when you have your first records.",
     "user_gaps": "Your evidence is NOT yet sufficient to answer the question.\n\nWhat is still missing or unclear:\n{{MISSING}}\n\nAfter answering from evidence alone, you concluded:\n{{ATTEMPTED_ANSWER}}\n\nGo back and fix it: search again with better wording, follow sources into inputs/msgmem.jsonl, and write the missing records. Then reply with plain text (no JSON) when evidence.jsonl is sufficient.",
     "user_no_progress": "You have gone several turns without changing evidence.jsonl. If evidence.jsonl is already sufficient, reply with plain text (no JSON) now. Otherwise make the change.",

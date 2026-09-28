@@ -46,13 +46,20 @@ from typing import Any
 
 # 从 io 导入**唯一**的 PROJECT_ROOT，不要自己 parents[N] 推 ——
 # 本文件在子包里深度不同，重算会落到 src/ 而不是项目根。
-from ..io import PROJECT_ROOT
+from ..io import (
+    PROJECT_ROOT,
+    is_summary,
+    msg_content,
+    msg_id,
+    msg_role,
+    msg_time,
+)
 
 # 默认输出里带上 kind / source：**溯源是 agent 最常需要的下一步**（这条原子来自哪条原话），
 # 直接给出来能省掉一轮 jq。
 DEFAULT_FIELDS = ("id", "kind", "score", "rank_dense", "rank_bm25", "rank_tag", "memory", "source")
 ALL_FIELDS = ("id", "kind", "score", "rank_dense", "rank_bm25", "rank_tag", "memory",
-              "type", "time", "tag", "source", "derived_from")
+              "type", "time", "tag", "source")
 
 
 def _env(name: str, default: str = "") -> str:
@@ -91,30 +98,97 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _memory_id(memory: dict[str, Any]) -> str:
-    value = (memory.get("metadata") or {}).get("id")
-    return value if isinstance(value, str) else ""
+    """记录 id。统一走 ``io.msg_id``（兼容新的 msg_id 与旧的 metadata.id）。"""
+    return msg_id(memory)
+
+
+def _library_layers(source: str) -> tuple[str, ...]:
+    """``--source`` 决定读哪几层语料。
+
+    - ``all``（缺省）：三层全读 —— 概览与细节一起搜，按相关度统一排序。
+    - ``summary``：只读两层 summary。适合"先定位到哪次会话"的粗检索。
+    - ``sessions`` / ``raw``：只读原始消息。适合关键词检索具体原话
+      （summary 会改写措辞，精确的词不一定在里面）。
+    """
+    if source in ("summary", "summaries"):
+        return (LIBRARY_FILES[0], LIBRARY_FILES[1])
+    if source in ("sessions", "raw"):
+        return (LIBRARY_FILES[2],)
+    return LIBRARY_FILES
+
+
+def filter_by_tag(
+    pool: list[dict[str, Any]],
+    patterns: list[str],
+    *,
+    exclude: bool = False,
+) -> list[dict[str, Any]]:
+    """按 tag 过滤（子串匹配，大小写不敏感）。
+
+    **注意**：新的 session 记录格式**没有 tag 字段**（只有 msg_id/role/time/content），
+    所以这个过滤器在新语料上默认不命中任何东西。保留它是为了兼容旧产物，以及将来
+    summary 里若加上结构化标签时可以直接用。
+    """
+    if not patterns:
+        return pool
+    wanted = [pattern.strip().lower() for pattern in patterns if pattern.strip()]
+    if not wanted:
+        return pool
+
+    def matches(memory: dict[str, Any]) -> bool:
+        tags = [str(tag).lower() for tag in (memory.get("metadata") or {}).get("tag") or []]
+        # role 也算一路可匹配的标签（说话人名），与 searchmem.tag_terms 的处理一致
+        role = msg_role(memory)
+        if role:
+            tags.append(role.strip().lower())
+        return any(any(pattern in tag for tag in tags) for pattern in wanted)
+
+    return [memory for memory in pool if matches(memory) != exclude]
+
+
+def tag_value_counts(
+    pool: list[dict[str, Any]],
+    prefixes: list[str] | None = None,
+) -> list[tuple[str, int]]:
+    """统计 pool 里的 tag 值及出现次数，按次数降序。
+
+    集合型问题（"某人做过哪些 X"）的正解是**按标签值枚举**，而不是把 100 条检索结果
+    逐条读一遍 —— 后者对 8B 太重（实测 20KB 输出，它只读了前十几条就动笔）。
+    """
+    counts: dict[str, int] = {}
+    wanted = [p.strip().lower() for p in (prefixes or []) if p.strip()]
+    for memory in pool:
+        values: list[str] = []
+        role = msg_role(memory)
+        if role:
+            values.append(f"role:{role}")
+        values.extend(str(tag).strip() for tag in (memory.get("metadata") or {}).get("tag") or [])
+        for text in values:
+            if not text:
+                continue
+            lowered = text.lower()
+            if wanted and not any(p in lowered for p in wanted):
+                continue
+            counts[text] = counts.get(text, 0) + 1
+    return sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
 
 
 def merge_pool(
-    base: list[dict[str, Any]],
+    library: list[dict[str, Any]],
     evidence: list[dict[str, Any]],
     source: str,
-    raw: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """检索池。优先级：evidence > base（atommem）> raw（msgmem）。
+    """检索池。优先级：evidence > library（三层语料并集）。
 
-    为什么要能搜到 ``msgmem``：实测失败的典型形态是"答案在原话里，但**没有任何原子**
-    正面说出来"。例如 Caroline 被问到"想读什么方向"，原文是
-    ``I'm keen on counseling or working in mental health``（D1:11），而库里最强的原子只有
-    一句泛泛的 "continue her education and check out career options"。此时
-    agent 必须能**按原话关键词**找到那条消息 —— 否则它只能靠猜 id，实测就猜到了别的 session
-    然后空转到预算耗尽。
+    **library 是三层语料合并后的结果**（speakers summary / session summaries / 原始消息），
+    由 ``load_library`` 读取并按粒度从粗到细排列。为什么要一次全搜而不是分层分别搜：
+    agent 不该被迫记住"这个问题该查哪一层" —— 让检索把三层的命中混在一起排好序，
+    粗粒度的 summary 因为语义密度高天然排在前面（它是概览），细节需要时再往下看。
 
-    同 id 时保留高优先级那一份（evidence 侧是 agent 改过的，raw 侧是原话，不重叠）。
+    evidence 侧优先：那是 agent 自己写出来的、已经过推理的结论，比原始语料更贴题。
     """
     include_evidence = source in ("evidence", "all")
-    include_base = source in ("base", "all")
-    include_raw = source in ("raw", "all") and raw is not None
+    include_library = source in ("library", "base", "summary", "raw", "all")
 
     merged: dict[str, dict[str, Any]] = {}
     order: list[str] = []
@@ -130,92 +204,62 @@ def merge_pool(
 
     if include_evidence:
         add(evidence, allow_override=True)
-    if include_base:
-        add(base, allow_override=False)          # evidence 侧优先
-    if include_raw:
-        add(raw, allow_override=False)           # 已被前面收进来的不动
+    if include_library:
+        add(library, allow_override=False)      # evidence 侧优先
     return [merged[key] for key in order]
 
 
-def filter_by_tag(
-    pool: list[dict[str, Any]],
-    patterns: list[str],
-    *,
-    exclude: bool = False,
-) -> list[dict[str, Any]]:
-    """按 tag 过滤（子串匹配，大小写不敏感）。``--tag action: --exclude-tag topic:`` 之类。
+#: 三层语料文件名，**按粒度从粗到细**（概览 → 细节）。顺序有意义：
+#: 索引与检索都按这个顺序，粗粒度先出现，便于 agent 先看到概览。
+LIBRARY_FILES = (
+    "speakers_summary.jsonl",
+    "session_summaries.jsonl",
+    "sessions.jsonl",
+)
 
-    **为什么需要它**：有一类问题是"某人做过哪些 X"——答案是一个**集合**，散在几十条
-    记录里。稠密检索对这类问题结构性无能为力：它按与 query 的相似度排序，而"游泳"
-    这条记录与"Melanie 参加什么活动"的相似度并不高（实测 dense 排名 101），于是永远
-    进不了 top-k —— 把 k 调到 100 也救不回来，因为相关度天梯本身就不指向它。
 
-    但库里**已经有结构化标签**（``action:Swimming``、``topic:activities``）。按标签枚举
-    是这类问题的正确工具：先把候选收全，再由 agent 判断哪些算"活动"。所以给 agent 一个
-    按 tag 过滤的开关，而不是指望它用关键词把集合"检索"出来。
+def load_library(workspace: Path, names: tuple[str, ...] = LIBRARY_FILES) -> list[dict[str, Any]]:
+    """读三层语料并合并成检索库（不存在的文件跳过）。
+
+    合并进**一个**库而不是让 agent 选层：``--source`` 的粒度选择留给"只看原话"
+    （``--source raw``）这类明确需要，默认行为是三层一起搜、按相关度统一排序。
     """
-    if not patterns:
-        return pool
-    wanted = [pattern.strip().lower() for pattern in patterns if pattern.strip()]
-    if not wanted:
-        return pool
-
-    def matches(memory: dict[str, Any]) -> bool:
-        tags = [str(tag).lower() for tag in (memory.get("metadata") or {}).get("tag") or []]
-        return any(any(pattern in tag for tag in tags) for pattern in wanted)
-
-    return [memory for memory in pool if matches(memory) != exclude]
+    merged: list[dict[str, Any]] = []
+    for name in names:
+        merged.extend(read_jsonl(workspace / "inputs" / name))
+    return merged
 
 
-def tag_value_counts(
-    pool: list[dict[str, Any]],
-    prefixes: list[str] | None = None,
-) -> list[tuple[str, int]]:
-    """统计 pool 里的 tag 值及出现次数，按次数降序。
-
-    **为什么需要**：集合型问题（"某人做过哪些 X"）的正解是**按标签值枚举**，而不是把
-    100 条检索结果逐条读一遍 —— 实测 agent 拿到 `-k 100` 后只读了前十几条就动笔，
-    因为读完全部对 8B 来说太重了（20KB 输出）。
-
-    先看"池子里到底有哪些 activity/topic 值、各有多少条"，再按值逐个取，枚举才收得齐。
-    ``prefixes`` 为空时统计全部 tag；给定 ``["activity", "topic:activ"]`` 时只统计匹配的。
-    """
-    counts: dict[str, int] = {}
-    wanted = [p.strip().lower() for p in (prefixes or []) if p.strip()]
-    for memory in pool:
-        for tag in (memory.get("metadata") or {}).get("tag") or []:
-            text = str(tag).strip()
-            if not text:
-                continue
-            lowered = text.lower()
-            if wanted and not any(p in lowered for p in wanted):
-                continue
-            counts[text] = counts.get(text, 0) + 1
-    return sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
+def layer_of(memory: dict[str, Any]) -> str:
+    """判断一条记录属于哪一层（给检索结果标注，agent 据此决定下一步去哪）。"""
+    if is_summary(memory):
+        return "speakers_summary" if msg_id(memory) == "speakers_summary" else "session_summary"
+    return "session"
 
 
 def provenance_fields(memory: dict[str, Any]) -> dict[str, Any]:
-    """给检索结果补上**溯源/发散**所需的字段。
+    """给检索结果补上**层级与溯源**字段。
 
-    agent 拿到一条命中的原子后，最常问的下一句是"这条是从哪条原话来的？"——
-    ``source`` 就是答案（原子 → msgmem 消息）。反过来，``--source raw`` 让 agent 从原话
-    出发去找"哪些原子是从这句话抽出来的"（msgmem → 原子），即发散。
-    把这两个方向需要的字段直接放进结果里，省掉一轮 jq 查询。
+    agent 拿到命中后最常问的下一句是"这是概览还是原话？我要不要往下钻？"——
+    ``kind`` 与 ``source`` 直接回答它：
+
+    - ``kind=speakers_summary`` —— 整段关系的概览。适合定位"哪次会话"，细节要往下钻。
+    - ``kind=session_summary``  —— 某次会话的概览。``source`` 是该会话的消息 id 列表，
+      可以直接读原文。
+    - ``kind=session``          —— 原始消息。``source`` 为空（它就是源头）。
     """
     meta = memory.get("metadata") or {}
-    kind = meta.get("type")
-    if kind == "raw":
-        return {
-            "kind": "raw",           # msgmem：原话，可以直接引为证据
-            "source": [],            # raw 没有出处
-            "derived_from": [],      # 谁从这条抽出来的由 --derive 列
-            "time": meta.get("time", ""),
-        }
+    kind = layer_of(memory)
+    # summary 的 source 从正文里推不出来，靠 msg_id 的前缀给"这次会话包含哪些消息"
+    source = meta.get("source")
+    if not isinstance(source, list):
+        source = []
+    if kind == "session":
+        source = []
     return {
-        "kind": "atom",              # atommem：抽取出的原子，source 指向原话
-        "source": meta.get("source", []),
-        "derived_from": [],
-        "time": meta.get("time", ""),
+        "kind": kind,
+        "source": source,
+        "time": str(memory.get("time") or meta.get("time") or ""),
     }
 
 
@@ -236,12 +280,11 @@ async def _embed_query_evidence(
     return await embedder.embed(texts)
 
 
-def _render(scored: Any, fields: tuple[str, ...], derived: dict[str, list[str]] | None = None) -> dict[str, Any]:
+def _render(scored: Any, fields: tuple[str, ...]) -> dict[str, Any]:
     """把一条 ScoredMemory 渲染成输出行。``memory`` 默认截断到 400 字符，避免刷屏。
 
-    ``kind``/``source`` 是**溯源**用的：``kind=atom`` 表示这是抽出来的原子，``source``
-    指向它的原话消息；``kind=raw`` 表示这本身就是一条原话，可以直接引为证据。
-    ``derived_from`` 是**反向发散**（这条原话抽出了哪些原子），由 ``--derive`` 填。
+    ``kind`` / ``source`` 是**层级与溯源**：``kind`` 说明这是哪一层
+    （speakers_summary / session_summary / session），``source`` 给出往下钻的入口。
     """
     memory = scored.memory
     meta = memory.get("metadata") or {}
@@ -259,7 +302,6 @@ def _render(scored: Any, fields: tuple[str, ...], derived: dict[str, list[str]] 
         "time": provenance["time"],
         "tag": meta.get("tag", []),
         "source": provenance["source"],
-        "derived_from": (derived or {}).get(scored.id, []),
     }
     if "memory" in fields:
         limit = int(_env("CODEMEM_MEMORY_CHARS", "400"))
@@ -277,10 +319,9 @@ async def run_search(args: argparse.Namespace) -> int:
     if not index_dir.is_absolute():
         index_dir = workspace / index_dir
 
-    atoms_path = Path(args.atoms) if args.atoms else workspace / "inputs/atommem.jsonl"
     evidence_path = Path(args.evidence) if args.evidence else workspace / "evidence.jsonl"
-    # msgmem 也要能搜：答案常常只在原话里（没有任何原子正面说出来），见 merge_pool 的说明
-    raw_path = Path(args.raw) if args.raw else workspace / "inputs/msgmem.jsonl"
+    # library = 三层语料的并集（speakers summary / session summaries / 原始消息），
+    # 按粒度从粗到细排列。默认三层的命中混在一起统一排序（见 merge_pool 的说明）。
 
     # 索引只有 dense 通道需要。纯词法模式（--lexical，或没配嵌入服务）**不该**因为缺索引
     # 就退出 —— 那正是降级路径存在的意义（索引没建成时 harness 会切到词法模式）。
@@ -295,13 +336,18 @@ async def run_search(args: argparse.Namespace) -> int:
             print(f"search: 无法加载索引 {index_dir}: {exc}", file=sys.stderr)
             return 2
 
-    base = read_jsonl(atoms_path)
+    if args.library:
+        library = read_jsonl(Path(args.library))
+    else:
+        library = load_library(workspace, _library_layers(args.source))
     evidence = read_jsonl(evidence_path)
-    raw = read_jsonl(raw_path)
-    pool = merge_pool(base, evidence, args.source, raw=raw)
+    pool = merge_pool(library, evidence, args.source)
     if not pool:
-        print("search: 检索池为空（atommem / evidence / msgmem 都没有记录）",
-              file=sys.stderr)
+        print(
+            "search: 检索池为空（三层语料与 evidence 都没有记录）。"
+            "先确认 inputs/ 下有 sessions.jsonl / session_summaries.jsonl / speakers_summary.jsonl",
+            file=sys.stderr,
+        )
         return 3
 
     # --tag-values：只列标签值分布就退出（枚举型问题的第一步：先看清词表）
@@ -372,22 +418,9 @@ async def run_search(args: argparse.Namespace) -> int:
         k=args.rrf_k,
         extra_channels={"dense": dense_scores} if dense_scores is not None else None,
     )
-    # --derive：给命中的**原话**补上"这句话抽出了哪些原子"（msgmem → atommem 发散）。
-    # 只在需要时算（要扫一遍全库 atommem，没必要每次检索都付这个成本）。
-    derived: dict[str, list[str]] = {}
-    if args.derive:
-        for atom in base:
-            atom_meta = atom.get("metadata") or {}
-            atom_id = _memory_id(atom)
-            if not atom_id:
-                continue
-            for src in atom_meta.get("source") or []:
-                if isinstance(src, str) and src:
-                    derived.setdefault(src, []).append(atom_id)
-
     fields = tuple(args.fields.split(",")) if args.fields else DEFAULT_FIELDS
     for item in scored:
-        print(json.dumps(_render(item, fields, derived), ensure_ascii=False, default=str))
+        print(json.dumps(_render(item, fields), ensure_ascii=False, default=str))
     if not scored:
         print("search: 没有命中（试试别的措辞，或用 --source all 同时搜原话与原子）",
               file=sys.stderr)
@@ -402,7 +435,7 @@ async def run_index(args: argparse.Namespace) -> int:
     from .embedder import Embedder
 
     index_dir = Path(args.index)
-    atoms_path = Path(args.atoms)
+    atoms_path = Path(args.library or args.atoms)
     memories = read_jsonl(atoms_path)
     if not memories:
         print(f"searchctl: {atoms_path} 里没有记录", file=sys.stderr)
@@ -445,23 +478,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("query", nargs="?", default="", help="检索 query（--tag-values 时可省略）")
     parser.add_argument("-k", type=int, default=8, help="返回条数（缺省 8）")
-    parser.add_argument("--source", choices=("base", "evidence", "raw", "all"), default="all",
-                        help="检索池：base=atommem（原子）/ raw=msgmem（原话）/ evidence=已写出的证据"
-                             "/ all=三者并集（缺省）")
-    parser.add_argument("--raw", default="", help="msgmem 路径（缺省 inputs/msgmem.jsonl）")
-    parser.add_argument("--derive", action="store_true",
-                        help="给结果补 derived_from：这条原话抽出了哪些原子（msgmem → atommem 发散）")
+    parser.add_argument("--source", choices=("all", "library", "summary", "sessions", "raw", "evidence"),
+                        default="all",
+                        help="检索池：all=三层语料+evidence（缺省）/ library=只三层语料 / "
+                             "summary=只两层 summary（粗检索，用于定位哪次会话）/ "
+                             "sessions(或 raw)=只原始消息（按原话关键词搜）/ evidence=只自己写出的证据")
+    parser.add_argument("--library", default="",
+                        help="直接指定语料文件路径（缺省按 --source 从 inputs/ 读三层）")
     parser.add_argument("--tag", action="append", default=[],
-                        help="按 tag 子串过滤（可重复），如 `--tag action: --tag topic:activ`。"
-                             "用于**枚举型**问题（'某人做过哪些 X'）——这类问题的答案是一个"
-                             "集合，稠密检索捞不全，按标签枚举才收得齐")
+                        help="按 tag 子串过滤（可重复）。记录里没有 tag 字段时该过滤不命中任何东西")
     parser.add_argument("--exclude-tag", action="append", default=[],
-                        help="排除含这些 tag 子串的记录（可重复），如 `--exclude-tag speaker:Caroline`")
+                        help="排除含这些 tag 子串的记录（可重复）")
     parser.add_argument("--tag-values", action="store_true",
-                        help="不检索，只列出池子里的 tag 值及出现次数（按 --tag 前缀过滤）。"
-                             "枚举型问题先用它看清有哪些值，再逐个取值")
+                        help="不检索，只列出池子里的 tag 值及出现次数（按 --tag 前缀过滤）")
     parser.add_argument("--fields", default="", help="逗号分隔的输出字段（缺省常用集）")
-    parser.add_argument("--atoms", default="", help="base 库路径（缺省 inputs/atommem.jsonl）")
     parser.add_argument("--evidence", default="", help="evidence 路径（缺省 evidence.jsonl）")
     parser.add_argument("--index", default="", help="索引目录（缺省 $CODEMEM_INDEX）")
     parser.add_argument("--lexical", action="store_true", help="只用 BM25 + tag，不调 embedding")

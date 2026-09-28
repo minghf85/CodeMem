@@ -294,7 +294,59 @@ def default_config_path(name: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# memory item
+# session 记录（session_template.jsonl 的格式）
+# ---------------------------------------------------------------------------
+
+def msg_id(record: dict[str, Any]) -> str:
+    """取 ``msg_id``。（旧的 ``metadata.id`` 形态也兼容，便于读历史产物。）"""
+    value = record.get("msg_id")
+    if isinstance(value, str) and value:
+        return value
+    return memory_id(record)
+
+
+def msg_role(record: dict[str, Any]) -> str:
+    """发言者。原始消息是说话人名字；两层 summary 的产物是 ``"summary"``。"""
+    value = record.get("role")
+    return value if isinstance(value, str) else ""
+
+
+def msg_content(record: dict[str, Any]) -> str:
+    """正文。兼容旧的 ``memory`` 字段。"""
+    for key in ("content", "memory", "text"):
+        value = record.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def msg_time(record: dict[str, Any]) -> str:
+    """时间。**保留原始形式**（如 ``"1:56 pm on 8 May, 2023"``），不做归一化。
+
+    为什么不在这一步归一化：原始形式里的信息量比一个被猜出来的 ISO 串更可靠，
+    而且猜错会把错误固化进下游。需要绝对日期的地方（相对时间推理）用
+    ``search/timecalc`` 现场折算 —— 那里是确定性的算术，且调用方能看见折算过程。
+    """
+    value = record.get("time")
+    if isinstance(value, str):
+        return value
+    return memory_time(record)
+
+
+def is_summary(record: dict[str, Any]) -> bool:
+    """是不是 summary 记录（两层 summary 的产物，相对原始消息而言）。"""
+    return msg_role(record).lower() == "summary" or str(record.get("msg_id", "")).endswith("_summary")
+
+
+def make_session_record(
+    msg_id_value: str, role: str, content: str, time: str = ""
+) -> dict[str, Any]:
+    """建一条 session_template 记录。字段顺序固定，便于 diff 与人工阅读。"""
+    return {"msg_id": msg_id_value, "role": role, "time": time, "content": content}
+
+
+# ---------------------------------------------------------------------------
+# memory item（旧格式，仅为读历史产物保留）
 # ---------------------------------------------------------------------------
 
 def memory_id(item: dict[str, Any]) -> str:

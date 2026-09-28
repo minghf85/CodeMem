@@ -4,7 +4,7 @@
 步骤之间**只通过数据文件耦合**（不互相 import）：
 
 ```
-add ──► msgmem.jsonl ──► atommem.jsonl
+add ──► sessions.jsonl ──► session_summaries.jsonl ──► speakers_summary.jsonl
                              │
                              ▼
 search ──────────────► evidence.jsonl          （question + 记忆库 → 能回答该问题的记忆列表）
@@ -18,8 +18,8 @@ eval ────────────────► eval.jsonl / summary.js
 
 | 步骤 | 做什么 | 入口 |
 |---|---|---|
-| **add** | 一段对话记忆 → `msgmem`（raw message memory）→ `atommem`（原子记忆） | `python -m codemem.add` |
-| **search** | question + `atommem` → `evidence.jsonl`（一个 code agent 自主检索/推理/写作） | `python -m codemem.search` |
+| **add** | 一段对话记忆 → 原始消息 → 两层 summary（session / speakers） | `python -m codemem.add` |
+| **search** | question + 三层语料 → `evidence.jsonl`（code agent 由粗到细检索/推理/写作） | `python -m codemem.search` |
 | **answer** | question + `evidence.jsonl` → 答案（只用证据，不检索） | `python -m codemem.answer` |
 | **eval** | 答案正确性 + 指标（judge / token F1 / evidence recall / 失败归类） | `python -m codemem.eval` |
 
@@ -48,7 +48,9 @@ data/
   correct_locomo10.json        # 原始对话数据（含 QA 与 evidence 标注）
   {speaker_a}_{speaker_b}/
     msgmem.jsonl               # add 产物：raw message memory（只读输入）
-    atommem.jsonl              # add 产物：原子记忆（search 的输入）
+    sessions.jsonl             # add 产物：原始消息（search 的输入）
+    session_summaries.jsonl    # 每个 session 一份 summary
+    speakers_summary.jsonl     # 整段关系的顶层 summary
   search_runs/{experiment}_{ts}/   # search/answer/eval 的运行目录
     {dir}/inputs/                   只读输入（硬链）+ 预建索引 + search/timecalc 包装
     {dir}/qa_{idx}/evidence.jsonl   search 的产物
@@ -58,7 +60,7 @@ data/
   eval_runs/                   # 三个 baseline 评测脚本的输出
 src/codemem/
   io.py llm.py log.py dataset.py    # 共享层：四个步骤都依赖，自身不依赖任何步骤
-  add/    msgmem.py atommem.py dpo.py __main__.py
+  add/    session.py summary.py __main__.py
   search/ runner.py agent.py tools.py toolcfg.py verifier.py evidence.py
           searchmem.py index.py embedder.py searchctl.py timecalc.py __main__.py
   answer/ answer.py __main__.py
@@ -84,39 +86,46 @@ docs/search.md                      # search 步骤的设计文档
 
 ---
 
-## 1. add — 把对话记忆添加进来
+## 1. add — 把对话记忆添加进来（两层 summary）
 
 ```bash
-python -m codemem.add                        # 两步都跑，全部目录
-python -m codemem.add Caroline_Melanie       # 只处理指定目录
-python -m codemem.add --stage msgmem         # 只跑第一步（纯 CPU，不调模型）
-python -m codemem.add --stage atommem --limit 3   # 只跑第二步，每目录前 3 条（调试）
-python -m codemem.add --stage atommem --resume    # 断点续跑，只重试失败项
+python -m codemem.add                      # session + 两层 summary，全部目录
+python -m codemem.add Caroline_Melanie     # 只处理指定目录
+python -m codemem.add --stage session      # 只跑第一步（纯 CPU，不调模型）
+python -m codemem.add --stage summary --limit-sessions 3   # 只跑前 3 个 session（调试）
+python -m codemem.add --stage speakers     # 只重跑顶层 summary
 ```
 
-**第一步 `msgmem`** —— 把 `correct_locomo10.json` 的每个 session 摊平成 raw memory：
+**两步，产出三层语料**（都在 `data/{speaker_a}_{speaker_b}/` 下）：
 
-| 字段 | 值 |
-|---|---|
-| `memory` | 原始消息文本 |
-| `id` | `session_{会话号}_{消息号}` |
-| `type` | `raw` |
-| `time` | **会话首条**为该会话真实时间（ISO-8601）；其余为 `few minutes in {会话时间}` |
-| `tag` | `["speaker:<name>"]` |
-| `source` | `[]`（raw 无出处） |
-| `changelog` | `[{"time": <真实创建时间>, "content": "created"}]` |
+| 文件 | 内容 | 条数（Caroline_Melanie） |
+|---|---|---|
+| `sessions.jsonl` | 原始消息，一条一行 | 419 |
+| `session_summaries.jsonl` | 每个 session 一份 summary | 19 |
+| `speakers_summary.jsonl` | 整段关系的顶层 summary | 1 |
 
-> `time` 的这条设计是故意的：让 search 阶段的 agent 从**任何一条**消息都能推出所在会话的
-> 绝对时间 —— 相对时间推理（"about a month ago"）的锚点就是这么来的。
+记录格式统一为 `session_template.jsonl`：`{"msg_id", "role", "time", "content"}` ——
+summary 记录只是把 `role` 标成 `"summary"`。**agent 只需理解一种格式**。
 
-**第二步 `atommem`** —— 逐条读 raw、带上下文窗口调模型抽原子记忆（`context_window: 4` 表示前后各 4 条）。
-`id`（`{raw_id}_{n}`）与 `changelog` 由系统补全；解析失败或截断的条目写入 `atom_errors.log`，
-不影响其它条。`msgmem.jsonl` 始终保持不变。
+三个刻意的取舍：
 
-`--stage dpo` 是可选的偏好训练数据生成（强模型出 chosen、弱模型出 rejected），
-配置在 `configs/add.yaml` 的 `strong`/`weak` 两段。
+- **`msg_id` 用 1-indexed**（`session_1_1`），与 LoCoMo 的 `dia_id`（`D1:1`）对齐 ——
+  这样 evidence 映射是恒等变换，不需要每处 ±1（那是 bug 的温床）。
+- **`role` 用真实人名**（`Caroline`/`Melanie`）而不是 `speaker1`/`speaker2` ——
+  指代消解（"she"是谁）依赖它，丢掉就等于让 agent 从对话里猜。
+- **`time` 保留原始形式**（`"1:56 pm on 8 May, 2023"`），不转 ISO ——
+  原始形式是数据里唯一无歧义的时间来源；转换错误会被固化进下游。
+  `timecalc` 能直接解析它：`timecalc shift "1:56 pm on 8 May, 2023" -1month`。
 
----
+**为什么用两层 summary 而不是原子记忆**：原子把会话结构打碎了 —— 一条条孤立事实无法回答
+"他们什么时候认识的""这段关系怎么发展的"。session summary 保留"这次谈了什么、什么变了"；
+speakers summary 再串成整段关系的**轨迹**（实测产出："Their relationship evolved from
+mutual admiration and shared interests to a deeper understanding of each other's goals"）。
+层级还给检索一个**由粗到细**的入口：先读 speakers summary 定位到哪次会话，再进那次会话的
+summary 与原文。
+
+> 旧的 `atommem`（原子抽取）与 `dpo`（为抽取模型造偏好数据）已删除 ——
+> 它们训练的是不再使用的抽取模型。需要时从 commit `b1b5283` 取回。
 
 ## 2. search — 生成 evidence.jsonl
 
@@ -136,7 +145,7 @@ python -m codemem.search --experiment search
 
 | 参数 | 说明 |
 |---|---|
-| `dirs` / `--sample NAME` | speaker 目录名或路径；缺省处理全部含 `atommem.jsonl` 的目录 |
+| `dirs` / `--sample NAME` | speaker 目录名或路径；缺省处理全部含 `sessions.jsonl` 的目录 |
 | `--config PATH` / `--tool-config PATH` | 配置（默认 `configs/search.yaml` / `configs/tool.json`） |
 | `--qa 3,7,12` | **只跑指定的 QA 原始下标**（逗号/空格分隔）。优先于 `--max-qa` 与步数预算：点名了就一定跑完。配 `--list-qa` 查下标 |
 | `--repeat N` | 每条 QA 重复跑 N 次（默认 1）。用来反复测同一条 QA 看结果稳不稳、定位偶发问题 |
@@ -160,12 +169,12 @@ ADD 0 / DELETE 0`，库净变化 `+0 ~81 -0` —— 只会原地改写、从不�
 `jq` 吐出的**原始 JSONL 行**，从来没有"展示串"这个概念 —— v2 把
 `[id] (time) Speaker | type |` 抄进正文的格式 bug 从根上不可能发生。
 
-### 3.1 核心抽象
+### 2.2 核心抽象
 
 ```
 每条 QA 一个私有目录（QA 之间零共享 → QA 级并发；base 库只读）
 
-  <run>/{dir}/inputs/{atommem,msgmem}.jsonl   只读（硬链自 data/{dir}/）
+  <run>/{dir}/inputs/{sessions,session_summaries,speakers_summary}.jsonl  只读硬链
   <run>/{dir}/inputs/index -> .index_cache/   检索索引（符号链接，跨运行共享，见 §2.3）
   <run>/{dir}/inputs/search                   search CLI 包装（PATH 里直接调）
   <run>/{dir}/qa_{idx}/                       agent 的工作目录（bash 的 cwd）
@@ -184,7 +193,7 @@ ADD 0 / DELETE 0`，库净变化 `+0 ~81 -0` —— 只会原地改写、从不�
 就是 oracle 泄漏（RL 会学会猜答案，推理时也拿不到答案键）—— 闸门检验**可回答性**，正确性只在
 评测/奖励时用 judge 算。它输出的 `missing[]` 是下一轮最有效的观测，这就是"探索"的实际含义。
 
-### 3.2 工具与 `configs/tool.json`
+### 2.3 工具与 `configs/tool.json`
 
 四个内置工具（`src/codemem/tools.py`）的执行语义**对齐 `reference/tools.py`**（含 2000 行/50KB
 截断、`edit` 的唯一性校验、bash 的 `shell_command_prefix`、超时杀进程组），并加了两处约束：
@@ -219,7 +228,7 @@ search "support group" -k 8 --lexical                  # 嵌入服务挂了时�
 空转到预算耗尽（实测 12 步、evidence 0 条）。让 `search` 覆盖原话，并按问题关键词检索，
 这条 QA 现在 8 步内以正确答案收敛。
 
-### 2.2 集合型问题要靠标签枚举，不能靠相似度
+### 2.4 集合型问题要靠标签枚举，不能靠相似度
 
 有一类问题的答案是**一个集合**："Melanie 参加哪些活动？"、"Caroline 有哪些爱好？"。
 稠密检索对这类问题**结构性无能为力**：它按与 query 的相似度排序，而"她要去游泳了"
@@ -346,7 +355,7 @@ source: ["session_1_9_1","session_1_9_2","session_2_8_1","session_2_8_2","sessio
   `jq` 自然产物：**一行一个数组**（`jq -s`）与**整份美化 JSON**（`jq -s` 不加 `-c`）——
   后者以前会让 `write_normalized` 把证据**全部删掉**。
 
-### 2.3 存储：索引跨运行共享，产物分层存放
+### 2.5 存储：索引跨运行共享，产物分层存放
 
 一次 search 的产物里**索引占了 99%**：一个目录 1688 条 × 2560 维 float32 ≈ **17MB**，
 而它只取决于 `(语料, 嵌入模型)` —— 与哪次运行、哪条 QA 完全无关。早期实现把它建在**每次
@@ -417,7 +426,7 @@ source: ["session_1_9_1","session_1_9_2","session_2_8_1","session_2_8_2","sessio
   删了下次要重嵌几十秒，且不属于任何单次运行）。实测清理 27 个调试跑次回收 **24.5MB**
   （`40M → 29M`）。
 
-### 2.4 两条产物稳健性的实测坑
+### 2.6 两条产物稳健性的实测坑
 
 - **被 `max_tokens` 截断的数组必须抢救**。模型一次 `write` 写出 39 条记录、末尾的 `]`
   被截掉（7687 字节处断）。旧实现逐行读只看到"1 行、解析失败"，于是**把全部证据判成空** ——
@@ -455,7 +464,7 @@ source: ["session_1_3_1", "session_1_3"]
 一条记录，直接回答"什么时候"，下游不需要再做任何解析。**注意第 3→6 步的变化**：库里的
 `yesterday` 在证据里变成了绝对日期 —— 这就是 §6.2.2 说的"推导"。
 
-### 3.3 用法
+### 2.7 用法
 
 ```bash
 # **先 dry-run**：只建 inputs/ + 渲染 system prompt 打印出来，不调模型
@@ -473,7 +482,7 @@ python scripts/test_evomem_v3.py
 
 | 参数 | 说明 |
 |---|---|
-| `dirs` / `--sample NAME` | speaker 目录名或路径；缺省处理全部含 `atommem.jsonl` 的目录 |
+| `dirs` / `--sample NAME` | speaker 目录名或路径；缺省处理全部含 `sessions.jsonl` 的目录 |
 | `--config PATH` | 演化配置（默认 `configs/evomem_v3.yaml`） |
 | `--tool-config PATH` | 工具配置（默认 `configs/tool.json`） |
 | `--max-qa N` | **调试闸门**：每个目录最多处理前 N 条 QA（0=全部） |
@@ -483,7 +492,7 @@ python scripts/test_evomem_v3.py
 | `--dry-run` | 只渲染 prompt 后打印，不调模型 |
 | `--log-level` / `--log-output` | 覆盖 `log.level` / `log.output` |
 
-### 3.4 不变量（CPU 侧强制，违反即拒绝该动作、不中断 QA）
+### 2.8 不变量（CPU 侧强制，违反即拒绝该动作、不中断 QA）
 
 | # | 不变量 | 动机 |
 |---|---|---|
@@ -495,7 +504,7 @@ python scripts/test_evomem_v3.py
 | 6 | 连续 `no_progress_patience` 步**唯一记录指纹**没有变化 → **提前收尾**（判据是唯一记录集合，不是行数/字节数；见 §6.2.3） | 把空转变成机制而不是 prompt 请求 |
 | 7 | 产物解析容忍两种 `jq` 自然输出：一行一个数组、整份美化 JSON（否则规范化会把证据全删） | `jq` 是 agent 的主要工具，它的自然输出必须能被接住 |
 
-### 3.5 输出与日志
+### 2.9 输出与日志
 
 `data/evomem_runs/{experiment}_{ts}/`：
 
@@ -533,7 +542,7 @@ python scripts/test_evomem_v3.py
 
 ---
 
-### 2.5 首次全量跑（Caroline_Melanie，152 QA）的实测结论
+### 2.10 首次全量跑（Caroline_Melanie，152 QA）的实测结论
 
 ```
 search   152/152 QA，0 错误，verifier 判"足够" 64%，473 条 evidence

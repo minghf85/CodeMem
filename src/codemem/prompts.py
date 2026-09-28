@@ -379,85 +379,86 @@ Format:
 
 REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing else."""
 
+
 # ---------------------------------------------------------------------------
-# EvoMem：逐步演化原子记忆
+# 两层 summary：session summary -> speakers summary
 # ---------------------------------------------------------------------------
-# 一次调用 = 一条原子的一轮演化：给出**这一条**目标记忆 + 召回的相关记忆（附源消息
-# 上下文）+ 这条原子之前各轮已经做过的动作，要求模型输出**一个**动作块。同一条原子
-# 反复调用直到 NOOP（或到 max_evomem_turn），然后游标移到下一条原子。
 #
-# 四个占位符，都由 evomem.build_messages 填充：
-#   {{QUESTION}} 这一轮要回答的问题（为什么这条原子此刻被演化）
-#   {{CURRENT}}  当前要精修的那一条（单条，不是整个库）
-#   {{RECALLED}} 召回的证据（源消息 + 前后上下文）
-#   {{HISTORY}}  这条原子之前几轮的动作与执行结果
-#   {{SCHEMA}}   字段定义，由 memory_template_evomem.json 生成
-#
-# **{{QUESTION}} 是 QA 驱动演化与旧版（逐条走库）的关键区别**：旧版的演化目标是
-# "把这条原子改得更自足"，新版的演化目标是"让这组候选原子足以回答这个问题"。问题文本
-# 是判定 UPDATE / ADD 值不值得做的唯一依据 —— 没有它，模型只能凭"这条记忆看起来不够好"
-# 来改，那正是旧版成本高、收益低的原因。
+# 为什么需要 summary（而不是继续抽原子）：实测 152 条 QA 里 multi_hop 只有 43%、
+# 单跳之外的推理普遍吃力。根因是**原子丢失了会话结构** —— 一条条孤立的事实无法回答
+# "他们什么时候认识的""这段关系怎么发展的"这类问题。summary 保留的正是结构：
+# 一次会话谈了什么、什么变了、谁对谁说了什么。层级也给了 agent 一个**由粗到细的检索
+# 入口**（先看 speakers summary 定位到哪次会话，再进那次会话的 summary 和原文）。
 
-EVOMEM_PROMPT = """Output exactly one tag: <ADD>...</ADD>, <UPDATE>...</UPDATE>, <DELETE>...</DELETE>, or <NOOP></NOOP>. No other text.
+SESSION_SUMMARY_SYSTEM_PROMPT = """CRITICAL: Your response must be ONLY a JSON object. No explanation, no reasoning, no markdown fences, no text before or after the JSON.
 
-# STOP — check {{HISTORY}} first
-{{HISTORY}}
-If history shows REJECTED, IDENTICAL, or 2+ consecutive failures → <NOOP></NOOP>
+You summarize ONE conversation session between {speaker_a} and {speaker_b}.
 
-# TASK
-Refine one memory atom so that the candidate set can answer the QUESTION below.
-Make it accurate, self-contained, connected.
-Do NOT change meaning unless evidence proves it wrong.
+## What a session summary must capture
+- **Who**: every person, pet, or group mentioned, and how they relate to the speakers.
+- **What happened**: the events, plans, and decisions actually discussed.
+- **What changed**: any change in state, plan, belief, or relationship during this session. This matters most -- a summary that only lists topics has failed.
+- **Time anchors**: keep the session's time exactly as given, and note any relative time the speakers use ("last week", "three years ago") together with what it refers to in this session.
+- **Relationship signal**: what this session reveals about how {speaker_a} and {speaker_b} relate (support, advice, shared activity, conflict, distance).
 
-## QUESTION (why this entry is being refined)
-{{QUESTION}}
-The goal is to make the candidate set sufficient to answer this question.
-If the target is irrelevant to the QUESTION, prefer <NOOP></NOOP> over cosmetic edits.
+## Rules
+- Write in third person, naming people explicitly. Never use a pronoun whose referent is not in the same sentence.
+- Preserve the session's own wording for emotions and nuance ("she was nervous about it") -- do not flatten everything into neutral statements.
+- Include concrete specifics: names, places, numbers, durations, titles. A summary with no specifics is useless.
+- Do NOT invent anything not stated or clearly implied. If something is unclear, leave it out rather than guessing.
+- Do NOT summarize the conversation turn by turn -- synthesize what a reader needs in order to later retrieve and reason over this session.
+- Keep it dense: 120-300 words. Shorter for a trivial session; do not pad.
 
-## TARGET
-{{CURRENT}}
+## Output
+Your entire response must be ONLY this JSON object, starting with {{ and ending with }}:
 
-## EVIDENCE (sole source of truth)
-{{RECALLED}}
+{{"summary": "<the session summary>", "key_facts": ["<fact 1>", "<fact 2>", ...], "time": "<the session time, exactly as given>"}}
 
-## DECIDE — first match wins
-1. **WRONG/OUTDATED**: Evidence contradicts target → UPDATE.
-2. **NOT SELF-CONTAINED**: Uses "yesterday"/"he"/"there" etc → UPDATE with absolute values.
-3. **SPLIT/IMPLICIT**: Target + evidence only make sense together → UPDATE one or ADD bridge. Clear implication missing → ADD it.
-4. **REDUNDANT**: Evidence states exact same fact → DELETE target. Same info ≠ same topic.
-5. **ELSE** → <NOOP></NOOP>
+- "key_facts": 3-8 short, self-contained facts a retrieval system could match a question against.
+  Each must name its subject. These are the highest-value retrieval hooks, so make them specific.
+"""
 
-## FORMATS
-<ADD>[{"memory":"...","metadata":{"id":"","type":"outer","time":"","tag":["speaker:X"],"source":[],"changelog":[]}}]</ADD>
-<UPDATE>[{"memory":"...","metadata":{"id":"EXACT_ID","type":"...","time":"...","tag":[...],"source":[...],"changelog":[]}}]</UPDATE>
-<DELETE>[{"memory":"exact text","metadata":{"id":"EXACT_ID","type":"...","time":"...","tag":[...],"source":[...],"changelog":[]}}]</DELETE>
-<NOOP></NOOP>
+SESSION_SUMMARY_USER_PROMPT = """## Session {session_index} of the conversation
+Time: {session_time}
 
-## RULES
-- UPDATE: token-F1≥0.6 vs original. id must match. No paraphrase-only rewrites.
-- ADD: id="", source non-empty. Max 3. Must add new info, not copy target.
-- DELETE: id + memory must match stored entry. Only when evidence already says same thing.
-- NOOP is default. Don't force changes.
-- Never invent names/dates/places. Source must reference real IDs.
-- Fields: {{SCHEMA}}"""
+## Messages ({message_count} total, in order)
+{messages}
+
+Summarize this session.
+"""
 
 
-# 「当前要精修的那一条原子」的标题。evomem 按 id 顺序逐条处理，prompt 里只有这一条是
-# 目标，其余（recalled）只是证据。所以不要叫 "Library" —— 模型会以为它看见了整个库，
-# 进而对着看不见的全集去删（实测过的乱删就是这么来的）。
-#
-# 这个标题属于 **prompt 模板**（写在 EVOMEM_PROMPT 的 `# TARGET` 段里），不属于被替换
-# 进去的值：值里再带一个二级标题会让结构看起来错乱。这里保留常量供 format_current 在
-# 空值分支复用。
-EVOMEM_CURRENT_PLACEHOLDER = "{{CURRENT}}"
-EVOMEM_CURRENT_HEADER = "## Target entry"
+SPEAKERS_SUMMARY_SYSTEM_PROMPT = """CRITICAL: Your response must be ONLY a JSON object. No explanation, no reasoning, no markdown fences, no text after the JSON.
 
-EVOMEM_HISTORY_EMPTY = "(nothing yet - this is the first attempt on this entry)"
+You write the TOP-LEVEL summary of an entire relationship between {speaker_a} and {speaker_b}, from the per-session summaries of their whole conversation history.
 
-# QA 驱动演化时 {{QUESTION}} 的占位。question 为空（兼容旧调用 / 纯原子精修）时用它 ——
-# 明确写出"没有问题"而不是留空，否则模型会对着一个空标题猜优化目标。
-EVOMEM_QUESTION_EMPTY = "(no question - standalone refinement)"
+This is the first thing a retrieval system reads, so it must answer "what is in here, and where".
 
-EVOMEM_USER_SUFFIX = (
-    "Produce the single action block now, following the format exactly."
-)
+## What the speakers summary must capture
+- **Who each person is**: identity, life situation, work, family, and how they changed over the whole period.
+- **What they do together**: recurring activities, shared interests, the nature of the relationship.
+- **The trajectory**: how the relationship and each person's life developed from the first session to the last. A list of topics is not a trajectory -- show the arc.
+- **What is unresolved**: open plans, ongoing situations, questions left hanging. These are prime retrieval targets.
+- **Time span**: the range covered, and which session numbers carry which major events (so a reader can go look).
+
+## Rules
+- Third person, explicit names, no dangling pronouns. Plain text, not bullet soup.
+- Stay faithful to the session summaries. Do NOT add anything not present in them.
+- Merge repeated themes into one statement rather than repeating the same fact per session.
+- Dense and specific: 250-500 words. Cover the arc; do not pad with generic description.
+
+## Output
+Your entire response must be ONLY this JSON object:
+
+{{"summary": "<the speakers-level summary>", "people": ["<name>: <who they are>", ...], "arc": "<one sentence on how things developed>"}}
+"""
+
+SPEAKERS_SUMMARY_USER_PROMPT = """## Conversation between {speaker_a} and {speaker_b}
+Sessions: {session_count} (sessions {first_session}-{last_session})
+Time span: {time_span}
+
+## Per-session summaries
+{session_summaries}
+
+Write the top-level speakers summary.
+"""

@@ -43,13 +43,64 @@ class TimeCalcError(ValueError):
     """入参无法解析。调用方把它渲染成一条错误观测，模型自己改。"""
 
 
+# LoCoMo 的原始会话时间形如 ``"1:56 pm on 8 May, 2023"``。会话记录里的 time 字段
+# **保留这个原始形式**（见 io.msg_time 的说明），所以 timecalc 必须能直接吃它 ——
+# 否则 agent 拿到锚点却算不了，相对时间推理就断了。
+_LOCOMO_RE = re.compile(
+    r"^(\d{1,2}):(\d{2})\s*(am|pm)\s+on\s+(\d{1,2})\s+([A-Za-z]+),?\s*(\d{4})",
+    re.IGNORECASE,
+)
+_MONTH_NAMES = {
+    name.lower(): index
+    for index, name in enumerate(
+        ["January", "February", "March", "April", "May", "June",
+         "July", "August", "September", "October", "November", "December"], 1
+    )
+}
+
+
 def parse_datetime(text: str) -> datetime:
-    """解析 ISO-8601（允许只给日期）。带时区的输入按字面本地时间处理，不做转换。"""
-    value = text.strip().replace("Z", "")
+    """解析日期。接受三种写法：
+
+    - ISO-8601：``2023-05-08`` / ``2023-05-08T13:56[:00]``（带时区按字面本地时间处理）
+    - **LoCoMo 原始形式**：``1:56 pm on 8 May, 2023``（会话记录里的 ``time`` 就是这个）
+    - 只给年月日或只有月份：``May 2023``（日取 1）
+
+    支持原始形式是必需的：``msg_time`` 刻意不做归一化，所以锚点常常就是这个串。
+    """
+    value = text.strip().replace("Z", "").strip()
+    if not value:
+        raise TimeCalcError("cannot parse an empty date")
+
+    locomo = _LOCOMO_RE.match(value)
+    if locomo:
+        hour = int(locomo.group(1)) % 12
+        if locomo.group(3).lower() == "pm":
+            hour += 12
+        month = _MONTH_NAMES.get(locomo.group(5).lower())
+        if month is None:
+            raise TimeCalcError(f"unknown month in {text!r}")
+        try:
+            return datetime(
+                int(locomo.group(6)), month, int(locomo.group(4)),
+                hour, int(locomo.group(2)),
+            )
+        except ValueError as exc:
+            raise TimeCalcError(f"invalid date {text!r}: {exc}") from exc
+
     match = _DATE_RE.match(value)
     if not match:
+        # 兜底：``8 May 2023`` 这类缺时分的形式
+        alt = re.match(r"^(\d{1,2})\s+([A-Za-z]+),?\s+(\d{4})$", value)
+        if alt and alt.group(2).lower() in _MONTH_NAMES:
+            try:
+                return datetime(int(alt.group(3)), _MONTH_NAMES[alt.group(2).lower()],
+                                int(alt.group(1)))
+            except ValueError as exc:
+                raise TimeCalcError(f"invalid date {text!r}: {exc}") from exc
         raise TimeCalcError(
-            f"cannot parse date {text!r}: expected YYYY-MM-DD or YYYY-MM-DDThh:mm[:ss]"
+            f"cannot parse date {text!r}: expected YYYY-MM-DD, YYYY-MM-DDThh:mm[:ss], "
+            f"or '1:56 pm on 8 May, 2023'"
         )
     year, month, day = (int(match.group(i)) for i in (1, 2, 3))
     hour = int(match.group(4) or 0)

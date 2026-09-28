@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from ..io import msg_content, msg_id
+
 PRIMARY = "vectors.f32"
 
 # 纯 Python 的点积（无 numpy 依赖）。1273 × 4096 实测约 0.75s —— 每次 search 一次，可接受。
@@ -52,10 +54,9 @@ def corpus_sha256(memories: list[dict[str, Any]]) -> str:
     """语料指纹：按 id + memory 文本算，与文件顺序无关。"""
     digest = hashlib.sha256()
     for memory in memories:
-        meta = memory.get("metadata") or {}
-        digest.update(str(meta.get("id", "")).encode())
+        digest.update(msg_id(memory).encode())
         digest.update(b"\x00")
-        digest.update(str(memory.get("memory", "")).encode())
+        digest.update(msg_content(memory).encode())
         digest.update(b"\x01")
     return digest.hexdigest()[:16]
 
@@ -119,13 +120,13 @@ async def build_index(
     ids: list[str] = []
     texts: list[str] = []
     for memory in memories:
-        meta = memory.get("metadata") or {}
-        memory_id = meta.get("id")
-        if not isinstance(memory_id, str) or not memory_id:
+        # 走 io 的访问器：新版记录是 msg_id/content，旧版是 metadata.id/memory。
+        # 这里曾经硬读 metadata.id，于是新语料（全部没有该字段）被判成"空语料"。
+        memory_id = msg_id(memory)
+        if not memory_id:
             continue
         ids.append(memory_id)
-        text = memory.get("memory")
-        texts.append(text if isinstance(text, str) else "")
+        texts.append(msg_content(memory))
 
     if not ids:
         raise ValueError("语料为空，无法建索引")

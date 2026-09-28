@@ -33,6 +33,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable, Sequence
 
+from ..io import msg_content, msg_id, msg_role
+
 # 英文停用词（LoCoMo 是英文对话语料）。只去高频虚词，不做过度的语言学处理 ——
 # 目的是让 BM25 不被 "the/a/is" 这类词主导，而不是追求完美的分词。
 STOPWORDS = frozenset("""
@@ -73,13 +75,17 @@ class ScoredMemory:
 
     @property
     def id(self) -> str:
-        value = (self.memory.get("metadata") or {}).get("id")
-        return value if isinstance(value, str) else ""
+        """记录 id。走 ``io.msg_id``，兼容新的 ``msg_id`` 与旧的 ``metadata.id``。"""
+        from ..io import msg_id
+
+        return msg_id(self.memory)
 
     @property
     def text(self) -> str:
-        value = self.memory.get("memory")
-        return value if isinstance(value, str) else ""
+        """正文。走 ``io.msg_content``，兼容新的 ``content`` 与旧的 ``memory``。"""
+        from ..io import msg_content
+
+        return msg_content(self.memory)
 
     def describe(self) -> str:
         ranks = " ".join(f"{name}={rank}" for name, rank in sorted(self.channels.items()))
@@ -165,6 +171,11 @@ def tag_terms(memory: dict[str, Any]) -> set[str]:
     刻意**不去停用词**（"topic"/"speaker" 这些 key 本身是有效信号），只做小写规范化。
     """
     terms: set[str] = set()
+    # 新的 session 格式没有 metadata.tag，但有 role（说话人）—— 它同样是有用的匹配信号，
+    # 且问题里常常直接出现人名。这里把它并进 tag 通道，旧的 tag 列表继续支持。
+    role = msg_role(memory)
+    if role:
+        terms.add(role.strip().lower())
     for tag in (memory.get("metadata") or {}).get("tag") or []:
         if not isinstance(tag, str):
             continue
@@ -266,8 +277,8 @@ def rrf_fuse(
 # ---------------------------------------------------------------------------
 
 def _memory_id(memory: dict[str, Any]) -> str:
-    value = (memory.get("metadata") or {}).get("id")
-    return value if isinstance(value, str) else ""
+    """记录 id（统一走 io.msg_id，兼容新旧格式）。"""
+    return msg_id(memory)
 
 
 def dedupe_by_id(memories: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -321,10 +332,7 @@ async def search_scored(
         active_weights.update(weights)
     tag_query = set(tokenize(query)) if query_tags is None else set(query_tags)
 
-    texts: list[str] = []
-    for memory in memories:
-        value = memory.get("memory")
-        texts.append(value if isinstance(value, str) else "")
+    texts: list[str] = [msg_content(memory) for memory in memories]
     rankings: dict[str, Any] = {}
 
     def add_channel(name: str, scores: Sequence[float]) -> None:

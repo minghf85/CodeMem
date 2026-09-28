@@ -106,8 +106,21 @@ class EvidenceReport:
 
 
 def _id_of(memory: dict[str, Any]) -> str:
+    """取记录标识。**新格式的 evidence 没有 id 字段** —— 用 ``content`` 当标识。
+
+    为什么 content 可以当键：evidence 的语义就是"一条独立成立的证据陈述"，
+    两条 content 完全相同的记录本来就是同一条（该去重）。旧格式的 ``metadata.id``
+    仍然优先使用，兼容历史产物。
+    """
     value = (memory.get("metadata") or {}).get("id")
-    return value if isinstance(value, str) else ""
+    if isinstance(value, str) and value:
+        return value
+    text = memory.get("content")
+    if isinstance(text, str) and text.strip():
+        # 归一化空白，避免只差空格的两条被判成不同
+        return " ".join(text.split())
+    legacy = memory.get("memory")
+    return " ".join(legacy.split()) if isinstance(legacy, str) else ""
 
 
 def _now() -> str:
@@ -115,39 +128,37 @@ def _now() -> str:
 
 
 def normalize(memory: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
-    """校验单条记录。返回 ``(规范化后的记录, 拒绝原因)``；原因为 None 表示通过。
+    """校验一条 evidence 记录（``evidence_template.jsonl`` 格式）::
 
-    只在**系统自有字段**上做规范化：``changelog`` 缺失或非法 → 补 ``created``；
-    ``metadata`` 里多余的键原样保留（不删，避免抹掉 agent 的意图）。
+        {"content": "...", "metadata": {"source": ["session_1_1"], "score": 0.87,
+                                        "changelog": [...]}}
+
+    返回 ``(规范化后的记录, 拒绝原因)``；原因为 ``None`` 表示通过。
+
+    **只补系统自有字段**：``changelog``（创建时间）与 ``score``（缺失时给中位默认值）。
+    其余一律不替 agent 修 —— 补一个编造的 ``source`` 会掩盖"证据没有出处"这个真问题，
+    让评测数字好看而 agent 没学会。这条界线是刻意的。
+
+    与旧格式的区别：旧版要求 ``memory``/``metadata.id``/``type``/``tag``（原子记忆的字段）；
+    新版是 ``content`` + ``metadata.{source,score,changelog}``。两个格式都接受 ——
+    旧产物要能继续读，新产物是主路径。
     """
     if not isinstance(memory, dict):
         return {}, f"not a JSON object ({type(memory).__name__})"
 
-    text = memory.get("memory")
+    # ---- 正文：新版 content，兼容旧版 memory ----
+    text = memory.get("content")
     if not isinstance(text, str) or not text.strip():
-        return {}, "memory must be a non-empty string"
-
+        legacy = memory.get("memory")
+        if isinstance(legacy, str) and legacy.strip():
+            text = legacy
+        else:
+            return {}, "content must be a non-empty string"
     meta = memory.get("metadata")
     if not isinstance(meta, dict):
         return {}, "metadata must be an object"
 
-    for key in REQUIRED_META:
-        if key not in meta:
-            return {}, f"metadata.{key} is missing"
-
-    memory_id = meta.get("id")
-    if not isinstance(memory_id, str) or not memory_id.strip():
-        return {}, "metadata.id must be a non-empty string"
-
-    if meta.get("type") not in VALID_TYPES:
-        return {}, f"metadata.type must be one of {list(VALID_TYPES)}, got {meta.get('type')!r}"
-
-    tags = meta.get("tag")
-    if not isinstance(tags, list) or not tags:
-        return {}, "metadata.tag must be a non-empty array"
-    if not any(isinstance(t, str) and t.startswith("speaker:") for t in tags):
-        return {}, "metadata.tag must include at least one 'speaker:<name>'"
-
+    # ---- source：**必须非空**，这是反幻觉护栏 ----
     source = meta.get("source")
     if not isinstance(source, list) or not source:
         return {}, "metadata.source must be a non-empty array (provenance is required)"
@@ -155,15 +166,39 @@ def normalize(memory: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     if bad:
         return {}, f"metadata.source contains non-string/empty entries: {bad[:3]}"
 
-    # 只有系统自有字段会被补全。
+    normalized = {"content": text.strip(), "metadata": dict(meta)}
+    repaired = False
+
+    # ---- score：系统可补。缺失时给 0.5（"未评估"）而不是 0（"完全无关"）----
+    score = meta.get("score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        normalized["metadata"]["score"] = 0.5
+        repaired = True
+    else:
+        # 夹到 [0,1]。模型可能给 0-10 或 0-100 的刻度，按量级判断而不是一律当百分比：
+        #   > 10 → 当百分比（87 → 0.87）
+        #   1 < v ≤ 10 → 当 0-10 刻度（5 → 0.5）
+        # 用 10 做分界而不是 1，是因为 0-10 刻度在"打分"语境里比百分比更常见。
+        value = float(score)
+        if value > 10.0:
+            value /= 100.0
+        elif value > 1.0:
+            value /= 10.0
+        normalized["metadata"]["score"] = round(max(0.0, min(1.0, value)), 4)
+
+    # ---- changelog：系统自有字段，缺失就补 ----
     changelog = meta.get("changelog")
     if not isinstance(changelog, list) or not changelog:
-        meta = dict(meta)
-        meta["changelog"] = [{"time": _now(), "content": "created"}]
-        memory = {**memory, "metadata": meta}
-        return memory, "REPAIRED"
+        normalized["metadata"]["changelog"] = [{"time": _now(), "content": "created"}]
+        repaired = True
 
-    return memory, None
+    if repaired:
+        return normalized, "REPAIRED"
+    # 旧格式的 id/type/tag 顺带保留（它们不影响新链路，但别丢）
+    for key in ("id", "type", "tag", "time"):
+        if key in meta and key not in normalized["metadata"]:
+            normalized["metadata"][key] = meta[key]
+    return normalized, None
 
 
 @dataclass
@@ -273,14 +308,17 @@ def read_evidence_state(path: Path) -> EvidenceState:
     unique_records: list[tuple[str, str]] = []
     for record in parsed.records:
         state.lines += 1
-        memory_id = (record.get("metadata") or {}).get("id")
-        if not isinstance(memory_id, str) or not memory_id:
+        memory_id = _id_of(record)
+        if not memory_id:
             continue
         if memory_id in seen:
             state.duplicate_lines += 1
             continue
         seen.add(memory_id)
-        body = record.get("memory")
+        # 指纹用 content（新）或 memory（旧）—— 正文变了就该算进展
+        body = record.get("content")
+        if not isinstance(body, str):
+            body = record.get("memory")
         unique_records.append((memory_id, body if isinstance(body, str) else ""))
     state.unique_ids = len(seen)
     if unique_records:
@@ -292,68 +330,6 @@ def read_evidence_state(path: Path) -> EvidenceState:
             digest.update(b"\x01")
         state.fingerprint = digest.hexdigest()[:16]
     return state
-
-
-def validate_file(path: Path) -> EvidenceReport:
-    """逐行校验产物文件。文件不存在 → 空报告（不是错误：agent 可能什么都没写）。
-
-    解析走 ``_iter_records``（与 ``read_evidence_state`` **同一套**），所以对"文件坏没坏"
-    的判断两边永远一致。**整体 JSON 兜底**是必要的容错 —— ``jq -s`` 不加 ``-c`` 时输出是
-    **多行美化**的，逐行读会得到一堆"解析失败"碎行，而 ``write_normalized`` 随后会把它们
-    全部丢掉，**等于把证据删了**。实测的 dedupe 命令就踩到了这个坑。
-    """
-    report = EvidenceReport(path=str(path))
-    if not path.exists():
-        return report
-
-    text = path.read_text(encoding="utf-8", errors="replace")
-    parsed = _iter_records(text)
-    records = parsed.records
-    report.empty_lines = parsed.empty_lines
-    report.multi_record_lines = parsed.multi_record_lines
-    report.whole_file_fallback = parsed.fallback_used
-    report.salvaged = parsed.salvaged
-    report.dropped_fragments = parsed.dropped_fragments
-    report.total_lines = len(records)
-    if parsed.bad_lines:
-        report.parse_errors = [
-            {"line": index + 1, "error": "line is not valid JSON on its own"}
-            for index in range(min(parsed.bad_lines, 5))
-        ]
-
-    seen_ids: dict[str, int] = {}
-    for position, record in enumerate(records, start=1):
-        memory, reason = normalize(record)
-        if reason == "REPAIRED":
-            memory_id = _id_of(memory)
-            if memory_id in seen_ids:
-                report.rejected.append({
-                    "line": position, "id": memory_id,
-                    "reason": f"duplicate metadata.id {memory_id!r}",
-                })
-                continue
-            seen_ids[memory_id] = position
-            report.repaired.append(memory)
-            report.valid.append(memory)
-            continue
-        if reason is not None:
-            report.rejected.append({
-                "line": position,
-                "id": _id_of(record),
-                "reason": reason,
-            })
-            continue
-        memory_id = _id_of(memory)
-        if memory_id in seen_ids:
-            report.rejected.append({
-                "line": position, "id": memory_id,
-                "reason": f"duplicate metadata.id {memory_id!r}",
-            })
-            continue
-        seen_ids[memory_id] = position
-        report.valid.append(memory)
-
-    return report
 
 
 def validate_file(path: Path) -> EvidenceReport:

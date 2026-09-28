@@ -77,7 +77,7 @@ def test_toolcfg(tmp: Path) -> None:
                  "{{WRITING_POLICY}}", "{{QUESTION}}"):
         check(f"渲染后没有残留 {slot}", slot not in rendered)
     check("渲染含问题原文", "Who is Caroline?" in rendered)
-    check("渲染含 jq 示例", "jq -c 'select(.metadata.id==" in rendered)
+    check("渲染含 jq 示例（新格式用 msg_id）", "jq -c 'select(.msg_id==" in rendered)
     check("渲染含 search 用法", "search \"QUERY\"" in rendered)
     check("渲染含 timecalc 用法", "timecalc shift" in rendered)
     check("渲染含 schema 字段", "metadata.source" in rendered)
@@ -87,8 +87,8 @@ def test_toolcfg(tmp: Path) -> None:
     check("策略提到时间推理", "timecalc" in rendered and "absolute" in rendered.lower())
     check("策略提到事件/性格推理", "Join facts" in rendered and "Infer" in rendered)
     check("策略允许改写 memory 正文", "REWRITE" in rendered)
-    check("schema 说明可以改写 memory", "REWRITE THE LIBRARY TEXT" in rendered)
-    check("schema 说明要解析相对时间", "RESOLVE relative times" in rendered)
+    check("schema 说明可以改写 content", "YOU MAY REWRITE" in rendered)
+    check("schema 要求 source 非空", "NON-EMPTY array of the msg_ids" in rendered)
     check("有 worked example（时间推理）", "timecalc shift 2023-06-17 -1month" in rendered)
 
     # 响应解析
@@ -465,43 +465,68 @@ async def test_search(tmp: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def test_evidence(tmp: Path) -> None:
-    section("4. evidence：逐行校验与规范化")
+    section("4. evidence：逐行校验与规范化（新 evidence_template 格式）")
     path = tmp / "evidence.jsonl"
-    good = make_memory("e1", "Caroline joined a support group")
-    good["metadata"]["changelog"] = [{"time": "2026-01-01T00:00:00Z", "content": "created"}]
-    repaired = make_memory("e2", "Caroline has been going for a month")
-    repaired["metadata"]["changelog"] = []          # 缺系统自有字段 -> 补全
-    no_source = make_memory("e3", "no provenance")
-    no_source["metadata"]["source"] = []
-    dup = make_memory("e1", "duplicate id")
-    bad_type = make_memory("e5", "bad type")
-    bad_type["metadata"]["type"] = "wrong"
-    no_speaker = make_memory("e6", "no speaker tag")
-    no_speaker["metadata"]["tag"] = ["topic:x"]
-    empty_memory = make_memory("e7", "")
+
+    def ev(content, source=None, score=None, changelog=None):
+        meta = {"source": ["session_1_1"] if source is None else source}
+        if score is not None:
+            meta["score"] = score
+        meta["changelog"] = [{"time": "2026-01-01T00:00:00Z", "content": "created"}] \
+            if changelog is None else changelog
+        return {"content": content, "metadata": meta}
+
+    good = ev("Caroline joined a support group", score=0.9)
+    repaired = ev("Caroline has been going for a month", score=0.8, changelog=[])
+    no_source = ev("no provenance", source=[])
+    dup = ev("Caroline joined a support group", score=0.9)      # 与 good 同 content
+    empty = ev("", score=0.5)
+    bad_source = ev("bad source", source=["ok", ""])
     lines = [
         json.dumps(good), json.dumps(repaired), json.dumps(no_source), json.dumps(dup),
-        json.dumps(bad_type), json.dumps(no_speaker), json.dumps(empty_memory),
+        json.dumps(empty), json.dumps(bad_source),
         "{not json", "", json.dumps(good),
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     report = evidence_mod.validate_file(path)
-    # total_lines 是**解析出的记录数**（一行一数组会展开、美化 JSON 算一批），
-    # 不是原始行数。这里 9 行里有 1 行坏 JSON、1 行空 → 8 条记录。
-    check("记录数统计正确", report.total_lines == 8, str(report.total_lines))
+    check("记录数统计正确（9 行 - 1 坏 - 1 空）", report.total_lines == 7,
+          str(report.total_lines))
     check("空行被计数", report.empty_lines == 1)
     check("解析失败被计数", len(report.parse_errors) == 1)
-    check("补全被计数", len(report.repaired) == 1)
+    check("补全被计数（score/changelog 缺失）", len(report.repaired) == 1, report.summary())
     check("补全后 changelog 非空", report.repaired[0]["metadata"]["changelog"] != [])
-    check("交付数正确", len(report.valid) == 2, report.summary())
-    check("重复 id 被拒", any("duplicate" in item["reason"] for item in report.rejected))
+    check("交付数正确（good + repaired）", len(report.valid) == 2, report.summary())
+    check("重复 content 被拒",
+          any("duplicate" in item["reason"] for item in report.rejected),
+          str([i["reason"] for i in report.rejected]))
     check("缺 source 被拒", any("source" in item["reason"] for item in report.rejected))
-    check("坏 type 被拒", any("type" in item["reason"] for item in report.rejected))
-    check("缺 speaker 被拒", any("speaker" in item["reason"] for item in report.rejected))
-    check("空 memory 被拒", any("memory" in item["reason"] for item in report.rejected))
-    check("拒绝数正确", len(report.rejected) == 6, str(len(report.rejected)))
+    check("空 content 被拒", any("content" in item["reason"] for item in report.rejected))
+    check("source 里有空串被拒",
+          any("source" in item["reason"] for item in report.rejected))
     check("summary 可读", "交付 2" in report.summary(), report.summary())
+
+    # score 的规范化：缺失补 0.5；超范围夹到 [0,1]
+    _, reason = evidence_mod.normalize({"content": "x", "metadata": {"source": ["s"]}})
+    check("缺 score 被补全", reason == "REPAIRED")
+    norm, _ = evidence_mod.normalize(
+        {"content": "x", "metadata": {"source": ["s"], "score": 87,
+                                      "changelog": [{"time": "t", "content": "c"}]}})
+    check("百分比 score 被夹到 0-1", norm["metadata"]["score"] == 0.87, str(norm["metadata"]))
+    norm, _ = evidence_mod.normalize(
+        {"content": "x", "metadata": {"source": ["s"], "score": 5,
+                                      "changelog": [{"time": "t", "content": "c"}]}})
+    check("0-10 刻度被折算（5 -> 0.5）", norm["metadata"]["score"] == 0.5, str(norm["metadata"]))
+    norm, _ = evidence_mod.normalize(
+        {"content": "x", "metadata": {"source": ["s"], "score": 200,
+                                      "changelog": [{"time": "t", "content": "c"}]}})
+    check("越界 score 被夹到 1.0", norm["metadata"]["score"] == 1.0, str(norm["metadata"]))
+    # 旧格式仍可读（历史产物）
+    legacy = {"memory": "old atom", "metadata": {"id": "a1", "source": ["s", "t"],
+                                                 "changelog": [{"time": "t", "content": "c"}]}}
+    # 旧格式仍被接受（缺 score 会被补全，所以是 REPAIRED 而非拒绝）
+    check("旧格式仍被接受（补 score）", evidence_mod.normalize(legacy)[1] == "REPAIRED",
+          str(evidence_mod.normalize(legacy)[1]))
 
     # 规范化写回 + 备份
     evidence_mod.write_normalized(path, report)
@@ -1290,7 +1315,8 @@ async def test_searchctl_cli(tmp: Path) -> None:
 
     # 词法模式**不需要**索引：索引只有 dense 通道要。这正是降级路径的意义。
     code = await asyncio.to_thread(searchctl_main, ["LGBTQ support group", "-k", "2",
-                                                    "--lexical", "--atoms", str(ws / "inputs/atommem.jsonl"),
+                                                    "--lexical",
+                                                    "--library", str(ws / "inputs/atommem.jsonl"),
                                                     "--evidence", str(ws / "evidence.jsonl"),
                                                     "--index", str(tmp / "nope_idx")])
     check("词法模式缺索引也能跑（退出码 0）", code == 0, str(code))
@@ -1300,7 +1326,7 @@ async def test_searchctl_cli(tmp: Path) -> None:
     try:
         code = await asyncio.to_thread(
             searchctl_main, ["LGBTQ support group", "-k", "2",
-                             "--atoms", str(ws / "inputs/atommem.jsonl"),
+                             "--library", str(ws / "inputs/atommem.jsonl"),
                              "--evidence", str(ws / "evidence.jsonl"),
                              "--index", str(tmp / "nope_idx")]
         )
@@ -1310,17 +1336,39 @@ async def test_searchctl_cli(tmp: Path) -> None:
 
     # 无 CODEMEM_INDEX 但给一个空索引也不行；改用模块内函数直接验证 merge_pool
     from codemem.search import searchctl
-    raws = [make_memory("r1", "raw message one"), make_memory("r2", "raw message two")]
-    pool = searchctl.merge_pool(corpus, [make_memory("e9", "Caroline started the group")], "all", raw=raws)
-    check("pool 合并 base+evidence+raw", len(pool) == 6, str(len(pool)))
-    pool_ev = searchctl.merge_pool(corpus, [make_memory("a1", "overridden")], "all", raw=raws)
+    raw_layer = [make_memory("r1", "raw message one"), make_memory("r2", "raw message two")]
+    library = [*corpus, *raw_layer]        # 三层语料并成一个 library
+    ev = [make_memory("e9", "Caroline started the group")]
+    pool = searchctl.merge_pool(library, ev, "all")
+    check("pool 合并 library + evidence", len(pool) == 6, str(len(pool)))
+    pool_ev = searchctl.merge_pool(library, [make_memory("a1", "overridden")], "all")
     check("同 id 时 evidence 侧优先", pool_ev[0]["memory"] == "overridden")
-    pool_base = searchctl.merge_pool(corpus, [make_memory("e9", "x")], "base", raw=raws)
-    check("--source base 排除 evidence 与 raw", len(pool_base) == 3, str(len(pool_base)))
-    pool_raw = searchctl.merge_pool(corpus, [], "raw", raw=raws)
-    check("--source raw 只搜原话", [m["metadata"]["id"] for m in pool_raw] == ["r1", "r2"],
-          str([m["metadata"]["id"] for m in pool_raw]))
-    check("--source raw 无 raw 语料时为空", searchctl.merge_pool(corpus, [], "raw") == [])
+    pool_lib = searchctl.merge_pool(library, ev, "library")
+    check("--source library 排除 evidence", len(pool_lib) == 5, str(len(pool_lib)))
+
+    # 三层语料的读取与层级判定
+    check("LIBRARY_FILES 从粗到细", searchctl.LIBRARY_FILES == (
+        "speakers_summary.jsonl", "session_summaries.jsonl", "sessions.jsonl"),
+        str(searchctl.LIBRARY_FILES))
+    check("--source summary 只读两层 summary",
+          set(searchctl._library_layers("summary")) == {"speakers_summary.jsonl",
+                                                       "session_summaries.jsonl"},
+          str(searchctl._library_layers("summary")))
+    check("--source raw 只读原始消息",
+          searchctl._library_layers("raw") == ("sessions.jsonl",))
+    check("--source all 读三层", len(searchctl._library_layers("all")) == 3)
+
+    # 层级判定：这是 agent 决定"要不要往下钻"的依据
+    summary_rec = {"msg_id": "session_3_summary", "role": "summary", "content": "s"}
+    speakers_rec = {"msg_id": "speakers_summary", "role": "summary", "content": "s"}
+    session_rec = {"msg_id": "session_3_1", "role": "Caroline", "content": "c"}
+    check("识别 session summary", searchctl.layer_of(summary_rec) == "session_summary")
+    check("识别 speakers summary", searchctl.layer_of(speakers_rec) == "speakers_summary")
+    check("识别原始消息", searchctl.layer_of(session_rec) == "session")
+    check("summary 的 kind 进 provenance",
+          searchctl.provenance_fields(speakers_rec)["kind"] == "speakers_summary")
+    check("原始消息的 source 为空",
+          searchctl.provenance_fields(session_rec)["source"] == [])
 
     # --tag 过滤（枚举型问题的关键工具）
     tagged = [
@@ -1359,22 +1407,14 @@ async def test_searchctl_cli(tmp: Path) -> None:
           [t for t, _ in searchctl.tag_value_counts(tagged, ["speaker"])] == ["speaker:Melanie"])
     check("tag_value_counts 空池返回空", searchctl.tag_value_counts([]) == [])
 
-    # 溯源/发散字段
-    atom = make_memory("session_1_11_1", "keen on counseling", source=["session_1_11"])
-    prov = searchctl.provenance_fields(atom)
-    check("原子的 kind=atom 且 source 指向原话",
-          prov["kind"] == "atom" and prov["source"] == ["session_1_11"], str(prov))
-    raw_record = make_memory("session_1_11", "original words", source=[], kind="raw")
-    raw_prov = searchctl.provenance_fields(raw_record)
-    check("原话的 kind=raw 且 source 为空",
-          raw_prov["kind"] == "raw" and raw_prov["source"] == [], str(raw_prov))
+    # 层级与溯源（见上面的 layer_of 检查）：summary 与原始消息要能区分开
 
     # 环境变量（由 harness 注入）不应影响词法检索。searchctl_main 内部会 asyncio.run，
     # 而本函数本身跑在事件循环里，所以直接 await 它的异步实现。
     from codemem.search import searchctl as searchctl_mod
 
     args = searchctl_mod.parse_args(
-        ["x", "-k", "1", "--lexical", "--atoms", str(ws / "inputs/atommem.jsonl"),
+        ["x", "-k", "1", "--lexical", "--library", str(ws / "inputs/atommem.jsonl"),
          "--evidence", str(ws / "evidence.jsonl"), "--index", str(tmp / "nope_idx")]
     )
     rc = await searchctl_mod.run_search(args)
@@ -1396,12 +1436,22 @@ async def test_end_to_end(tmp: Path) -> None:
         make_memory("a1", "Caroline joined an LGBTQ support group"),
         make_memory("a2", "Caroline has been going for about a month"),
     ]
-    (sample_dir / "atommem.jsonl").write_text(
-        "".join(json.dumps(m) + "\n" for m in corpus), encoding="utf-8"
+    # 新语料：三层（speakers summary / session summaries / 原始消息）
+    def sess(mid, role, content, time=""):
+        return {"msg_id": mid, "role": role, "time": time, "content": content}
+
+    (sample_dir / "sessions.jsonl").write_text(
+        "".join(json.dumps(sess(f"session_1_{i}", "Caroline" if i % 2 else "Melanie",
+                                f"raw message {i}", "1:56 pm on 8 May, 2023")) + "\n"
+                for i in range(1, 4)), encoding="utf-8"
     )
-    (sample_dir / "msgmem.jsonl").write_text(
-        "".join(json.dumps(make_memory(f"s{i}", f"raw message {i}", source=[])) + "\n"
-                for i in range(3)), encoding="utf-8"
+    (sample_dir / "session_summaries.jsonl").write_text(
+        json.dumps(sess("session_1_summary", "summary", "They discussed the support group.",
+                        "1:56 pm on 8 May, 2023")) + "\n", encoding="utf-8"
+    )
+    (sample_dir / "speakers_summary.jsonl").write_text(
+        json.dumps(sess("speakers_summary", "summary", "Caroline and Melanie are close friends.")) + "\n",
+        encoding="utf-8"
     )
 
     run_dir = tmp / "runs"
@@ -1416,9 +1466,12 @@ async def test_end_to_end(tmp: Path) -> None:
     inputs_dir, index_dir, search_bin, lexical = await evomem_v3.build_inputs(
         sample_dir, run_dir, config, embedder=None, log=log
     )
-    check("inputs 已建立", (inputs_dir / "atommem.jsonl").exists())
+    check("inputs 已建立", (inputs_dir / "sessions.jsonl").exists())
+    check("三层语料都硬链进 inputs",
+          all((inputs_dir / n).exists() for n in
+              ("sessions.jsonl", "session_summaries.jsonl", "speakers_summary.jsonl")))
     check("inputs 是硬链（同一 inode）",
-          (inputs_dir / "atommem.jsonl").stat().st_ino == (sample_dir / "atommem.jsonl").stat().st_ino)
+          (inputs_dir / "sessions.jsonl").stat().st_ino == (sample_dir / "sessions.jsonl").stat().st_ino)
     check("search 包装可执行", search_bin.exists() and (search_bin.stat().st_mode & 0o111))
     check("无 embedding -> lexical 降级", lexical is True)
 
@@ -1437,9 +1490,13 @@ async def test_end_to_end(tmp: Path) -> None:
                 return '{"sufficient": true, "answer": "about a month before June 2023", "missing": []}'
             self.agent_turns += 1
             if self.agent_turns == 1:
+                # 写一条**合法 evidence**（新格式：content + metadata.source/score）。
+                # 注意不能直接抄 inputs 的记录 —— 那没有 source，会被正确地拒绝。
+                rec = {"content": "Caroline joined the group in June 2023.",
+                       "metadata": {"source": ["session_1_summary"], "score": 0.9}}
                 return json.dumps({"tool": "bash", "args": {
-                    "command": "jq -c . inputs/atommem.jsonl >> evidence.jsonl && "
-                               "jq -s length evidence.jsonl",
+                    "command": "printf '%s\\n' " + json.dumps(json.dumps(rec)) +
+                               " >> evidence.jsonl && jq -s length evidence.jsonl",
                     "description": "Assembling evidence"}})
             if self.agent_turns == 2:
                 return json.dumps({"tool": "bash", "args": {
@@ -1456,7 +1513,7 @@ async def test_end_to_end(tmp: Path) -> None:
         config=config, catalog=catalog, model=model, embedder=None, lexical=lexical,
         log=log, semaphore=asyncio.Semaphore(1),
     )
-    check("QA 记录有 evidence", record.evidence_count == 2, str(record.evidence_count))
+    check("QA 记录有 evidence", record.evidence_count == 1, str(record.evidence_count))
     check("QA 记录了 2 轮", len(record.rounds) == 2, str(len(record.rounds)))
     check("第 1 轮注入缺口后续跑", len(record.verifications) == 2)
     check("最终判定为足够", record.sufficient is True, record.stop_reason)
@@ -1464,7 +1521,10 @@ async def test_end_to_end(tmp: Path) -> None:
     check("stop_reason=sufficient", record.stop_reason == "sufficient", record.stop_reason)
     check("工具调用被记账", record.tool_calls >= 2, str(record.tool_calls))
     check("未篡改只读输入", record.tampered is False)
-    check("evidence ids 正确", record.evidence_ids == ["a1", "a2"], str(record.evidence_ids))
+    # evidence 没有 id 字段，标识取 content（见 evidence._id_of）
+    check("evidence 标识取自 content",
+          record.evidence_ids == ["Caroline joined the group in June 2023."],
+          str(record.evidence_ids))
 
     # --- 篡改检测：手写一个 QA，模型去改 inputs/ ---
     class TamperingModel:
@@ -1476,9 +1536,9 @@ async def test_end_to_end(tmp: Path) -> None:
                 return '{"sufficient": true, "answer": "x", "missing": []}'
             self.turn += 1
             if self.turn == 1:
-                # 软链逃逸：写 inputs/atommem.jsonl（resolve 后在外，应被拒）
+                # 软链逃逸：写 inputs/sessions.jsonl（resolve 后在外，应被拒）
                 return json.dumps({"tool": "write", "args": {
-                    "path": "inputs/atommem.jsonl", "content": "{}"}})
+                    "path": "inputs/sessions.jsonl", "content": "{}"}})
             return "done"
 
     record2 = await evomem_v3.run_qa(
@@ -1488,8 +1548,8 @@ async def test_end_to_end(tmp: Path) -> None:
         log=log, semaphore=asyncio.Semaphore(1),
     )
     check("写只读输入被拒（未篡改）", record2.tampered is False)
-    check("原 atommem.jsonl 未被改动",
-          "LGBTQ" in (inputs_dir / "atommem.jsonl").read_text())
+    check("原 sessions.jsonl 未被改动",
+          "raw message" in (inputs_dir / "sessions.jsonl").read_text())
     check("工具错误被记账", record2.rounds[0]["steps"][0]["ok"] is False
           or not record2.rounds[0]["steps"][0]["result_text"] == "")
 
