@@ -1,4 +1,4 @@
-"""EvoMem v3：code-agent 式证据构建（编排层）。
+"""search：code-agent 式证据构建（编排层）。
 
 设计见 ``docs/search.md``。一句话流程：
 
@@ -12,13 +12,17 @@
 产物：
 
     data/search_runs/{experiment}_{ts}/{dir}/
-        inputs/{sessions,session_summaries,speakers_summary}.jsonl  只读输入（硬链）
-        inputs/index/                   预建检索索引（dense 不可用时为空）
+        inputs/{sessions,session_summaries}.jsonl   只读输入（硬链）
+        inputs/index/                   预建检索索引（只有 --embed 时用得到）
         inputs/search                   可执行的 search 包装（PATH 里就能直接调）
+        inputs/timecalc                 确定性日期算术
         qa_{idx}/evidence.jsonl         **唯一产物**
         {dir}.qa_trajectories.jsonl     每 QA 一行（含完整步记录）
         {dir}.steps.jsonl               每次模型调用的原始输出（排错用）
         summary.json
+
+**语料只有两层**（原始消息 + session summary）。曾经的顶层 speakers summary 已取消：
+它是一条没有 msg_id 可回溯的合成文本，`source` 指不到原始消息，破掉溯源不变量。
 
 **为什么 QA 级并发是安全的**：旧版必须目录内串行，只因为所有 QA 共享一份可变的记忆库；
 现在 base 库只读、产物 per-QA，QA 之间零共享 —— 唯一的共享是只读索引与 embedding 服务。
@@ -60,14 +64,17 @@ DATA_DIR = PROJECT_ROOT / "data"
 CONFIG_FILE = PROJECT_ROOT / "configs" / "search.yaml"
 TOOL_CONFIG_FILE = PROJECT_ROOT / "configs" / "tool.json"
 
-#: 三层语料文件名（与 searchctl.LIBRARY_FILES 一致）。索引、篡改校验、来源描述都用它。
-CORPUS_FILES = ("sessions.jsonl", "session_summaries.jsonl", "speakers_summary.jsonl")
+#: 两层语料文件名（与 searchctl.LIBRARY_FILES 一致）。索引、篡改校验、来源描述都用它。
+CORPUS_FILES = ("sessions.jsonl", "session_summaries.jsonl")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "generator": {"base_url": "http://127.0.0.1:30000/v1", "api_key": "sglang", "model": "local",
                   "temperature": 0.2, "max_tokens": 4096, "enable_thinking": False},
     "embedding": {"base_url": "http://127.0.0.1:30001/v1", "api_key": "sglang", "model": "local",
                   "chunk_size": 32, "allow_lexical_fallback": True},
+    # 是否预建语义索引（search --embed 用它）。关闭则 search 只提供关键词模式，
+    # 省掉一次几十秒的嵌入。默认开着：让 agent 在关键词搜不到时有的可选。
+    "build_index": True,
     "search": {"rrf_k": 60, "weights": {"dense": 1.0, "bm25": 1.0, "tag": 0.5},
                "memory_chars": 400},
     "max_steps": 30,
@@ -276,12 +283,52 @@ def link_or_copy(source: Path, target: Path) -> None:
         shutil.copy2(source, target)
 
 
+def link_dir_or_copy(source: Path, target: Path) -> str:
+    """让 ``target`` 指向目录 ``source``。返回实际用的方式（``symlink`` / ``hardlink``）。
+
+    优先**符号链接**，因为它顺带提供了只读保护：工具层的路径约束会 ``resolve()``，
+    解析后落在工作目录之外，所以 agent 写 ``inputs/...`` 会被直接拒绝。
+
+    退路是**逐个硬链语料文件**。为什么不是整目录拷贝：拷贝出来的文件在 workspace 内，
+    `resolve()` 之后仍落在里面，路径约束同样失效，还白占一份磁盘。硬链保留了两件事：
+
+    ① ``bash >>`` 写穿链接会改到**源文件**，而收尾的 sha256 篡改校验能抓到它（这一条实测
+       验证过：bash 追加后源文件指纹确实变了）；
+    ② 磁盘上不产生重复数据。
+
+    丢掉的只有 ``write`` / ``edit`` 那一层的前置拦截：它们的**原子替换**（临时文件 +
+    ``os.replace``）会先 unlink 再 rename，结果是悄悄把链接换成新 inode，既不报错也不影响
+    源文件 —— agent 只是看坏了自己那份 inputs 视图，基座语料是安全的。
+
+    之所以需要退路：Windows 上创建符号链接需要开发者模式或管理员权限，普通账户会拿到
+    ``WinError 1314``。让整条链路因为一个目录链接就用不了，代价太大。
+    """
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+    elif target.exists():
+        shutil.rmtree(target)
+    try:
+        target.symlink_to(source, target_is_directory=True)
+        return "symlink"
+    except OSError:
+        pass
+    target.mkdir(parents=True, exist_ok=True)
+    for item in sorted(source.iterdir()):
+        if item.is_file():
+            destination = target / item.name
+            try:
+                os.link(item, destination)
+            except OSError:
+                shutil.copy2(item, destination)
+    return "hardlink"
+
+
 def build_shell_prefix(
     *,
     inputs_dir: Path,
     index_dir: Path,
     config: dict[str, Any],
-    lexical: bool,
+    embed_ready: bool,
 ) -> str:
     """注入给每条 bash 命令的环境：PATH（让 ``search`` 与 ``timecalc`` 成为命令）
     + 索引 + 嵌入服务参数。"""
@@ -309,13 +356,16 @@ def build_shell_prefix(
         f'export CODEMEM_MEMORY_CHARS="{int(search.get("memory_chars", 400))}"',
         f"export CODEMEM_SEARCH_WEIGHTS='{weights_json}'",
     ]
-    if not lexical:
-        lines += [
-            f'export CODEMEM_EMBED_URL="{embed.get("base_url", "")}"',
-            f'export CODEMEM_EMBED_KEY="{embed.get("api_key", "")}"',
-            f'export CODEMEM_EMBED_MODEL="{embed.get("model", "")}"',
-            f'export CODEMEM_EMBED_CHUNK="{int(embed.get("chunk_size", 32))}"',
-        ]
+    if not embed_ready:
+        # 索引没建起来：**不导出嵌入服务参数**。这样 `search --embed` 会在 searchctl 里
+        # 拿到一句明确的 "CODEMEM_EMBED_URL 未设置"，而不是一个连不上的地址。
+        return "\n".join(lines)
+    lines += [
+        f'export CODEMEM_EMBED_URL="{embed.get("base_url", "")}"',
+        f'export CODEMEM_EMBED_KEY="{embed.get("api_key", "")}"',
+        f'export CODEMEM_EMBED_MODEL="{embed.get("model", "")}"',
+        f'export CODEMEM_EMBED_CHUNK="{int(embed.get("chunk_size", 32))}"',
+    ]
     return "\n".join(lines)
 
 
@@ -324,8 +374,9 @@ def write_search_wrapper(inputs_dir: Path) -> Path:
     wrapper = inputs_dir / "search"
     wrapper.write_text(
         "#!/usr/bin/env bash\n"
-        "# EvoMem 检索入口：混合检索（dense + BM25 + tag，RRF），每行输出一条 JSON。\n"
-        "# 由 codemem.search.runner 生成。用法：search \"QUERY\" [-k N] [--source evidence] [--lexical]\n"
+        "# 检索入口：两层语料（session summaries + 原始消息），每行输出一条 JSON。\n"
+        "# 默认关键词（BM25 + tag）；加 --embed 才走语义。\n"
+        '# 由 codemem.search.runner 生成。用法：search "QUERY" [-k N] [--source summary|raw|evidence|all]\n'
         f'exec python -m codemem.search.searchctl "$@"\n',
         encoding="utf-8",
     )
@@ -425,7 +476,7 @@ async def run_qa(
     catalog: toolcfg.ToolCatalog,
     model: ModelRunner,
     embedder: Any,
-    lexical: bool,
+    embed_ready: bool,
     log: Logger,
     semaphore: asyncio.Semaphore,
     repeat: int = 1,
@@ -464,24 +515,19 @@ async def run_qa(
         )
         workspace_root.mkdir(parents=True, exist_ok=True)
 
-        # qa_{idx}/inputs 是**一个**指向公共 inputs/ 的符号链接（不是每 QA 建一整套软链）。
+        # qa_{idx}/inputs 是**一个**指向公共 inputs/ 的链接（不是每 QA 建一整套软链）。
         #
-        # 为什么不把 5 个文件逐个软链进来：那些文件在**一个运行目录内对每个 QA 都完全相同**，
+        # 为什么不把每个文件逐个软链进来：那些文件在**一个运行目录内对每个 QA 都完全相同**，
         # 逐个建链等于把同一组链接复制 152 遍。每个目录项占一个 4K 块，实测 152 个 QA
         # 就浪费 4.2MB（目录 458 个 + 软链 608 个），而真实证据总共才 45KB。
-        # 整目录一个软链把每 QA 的 6 个条目压到 1 个。
+        # 整目录一个链接把每 QA 的 6 个条目压到 1 个。
         #
-        # 只读性不变：工具的路径约束会 `resolve()`，软链解析后落在 qa_{idx}/ 之外，
-        # 所以写 `inputs/...` 仍被拦下；绕过约束的写入由收尾的 sha256 校验兜底。
+        # 优先符号链接（顺带提供只读保护），不支持时退回逐文件硬链 —— 见 link_dir_or_copy。
         qa_inputs = workspace_root / "inputs"
-        if qa_inputs.is_symlink() or qa_inputs.is_file():
-            qa_inputs.unlink()
-        elif qa_inputs.exists():
-            shutil.rmtree(qa_inputs)
-        qa_inputs.symlink_to(inputs_dir, target_is_directory=True)
+        link_dir_or_copy(inputs_dir, qa_inputs)
 
         shell_prefix = build_shell_prefix(
-            inputs_dir=inputs_dir, index_dir=index_dir, config=config, lexical=lexical
+            inputs_dir=inputs_dir, index_dir=index_dir, config=config, embed_ready=embed_ready
         )
         workspace = Workspace(root=workspace_root, inputs=qa_inputs,
                               evidence=evidence_path, shell_prefix=shell_prefix)
@@ -811,15 +857,14 @@ async def run_dir(
 
     label = directory.name
     log = log.bind(label)
-    # 需要的输入：原始消息 + 两层 summary。缺 summary 时**只警告不跳过** ——
+    # 需要的输入：原始消息 + session summary。缺 summary 时**只警告不跳过** ——
     # 原始消息本身是可检索的，退化成"没有概览"总比整个目录跑不了好。
     sessions_path = directory / "sessions.jsonl"
     if not sessions_path.exists():
         log.warn("跳过：缺少 sessions.jsonl（先跑 `python -m codemem.add --stage session`）")
         return {"dir": label, "status": "SKIPPED", "reason": "missing sessions.jsonl"}
     missing_summaries = [
-        name for name in ("session_summaries.jsonl", "speakers_summary.jsonl")
-        if not (directory / name).exists()
+        name for name in ("session_summaries.jsonl",) if not (directory / name).exists()
     ]
     if missing_summaries:
         log.warn(
@@ -829,7 +874,7 @@ async def run_dir(
 
     out_dir = run_dir / label
     out_dir.mkdir(parents=True, exist_ok=True)
-    inputs_dir, index_dir, _search_bin, lexical = await build_inputs(
+    inputs_dir, index_dir, _search_bin, embed_ready = await build_inputs(
         directory, run_dir, config, embedder, log
     )
 
@@ -857,7 +902,7 @@ async def run_dir(
         + (f"（跳过 {skipped} 条）" if skipped else "")
         + f" / 步上限 {config.get('max_steps')} / verifier≤{config.get('max_verify_rounds')} "
         f"/ 并发 {config.get('concurrency')}"
-        + (f" / 检索=词法（无 dense）" if lexical else "")
+        + ("" if embed_ready else " / 无索引（--embed 不可用）")
         + ("".join(f" / {note}" for note in selection.notes))
     )
 
@@ -890,7 +935,7 @@ async def run_dir(
                 run_qa(
                     qa_index=index, qa=qa, directory=directory, run_dir=run_dir,
                     inputs_dir=inputs_dir, index_dir=index_dir, config=config,
-                    catalog=catalog, model=model, embedder=embedder, lexical=lexical,
+                    catalog=catalog, model=model, embedder=embedder, embed_ready=embed_ready,
                     log=log, semaphore=semaphore, repeat=run,
                 )
             )
@@ -914,7 +959,7 @@ async def run_dir(
 
     # 按 (QA 下标, 重复次数) 稳定排序，同一条 QA 的多次运行排在一起便于对比
     records.sort(key=lambda item: (item.qa_index, item.repeat))
-    summary = summarize_dir(label, records, model, len(usable), skipped, lexical)
+    summary = summarize_dir(label, records, model, len(usable), skipped, embed_ready)
     log.info(
         f"完成：QA {summary['qa_done']}/{len(usable)}"
         + (f"×{repeats}" if repeats > 1 else "")
@@ -973,8 +1018,9 @@ async def build_inputs(
 ) -> tuple[Path, Path, Path, bool]:
     """建 ``<run>/{dir}/inputs/``：硬链两个 jsonl、写 search 包装、准备检索索引。
 
-    返回 ``(inputs_dir, index_dir, search_bin, lexical)``。``lexical=True`` 表示 dense 不可用
-    （嵌入服务挂了且配置允许降级）—— 此时 search 只能走 BM25 + tag，日志里大声告警。
+    返回 ``(inputs_dir, index_dir, search_bin, embed_ready)``。``embed_ready=True`` 表示
+    索引已就绪、``search --embed`` 可用；False 时 search 只有关键词模式（**这是默认路径**，
+    不是降级 —— 见 ``searchctl`` 模块开头）。
 
     **存储优化（重要）**：索引（float32 向量）是这一步最大的产物 —— 一个目录
     1688 条 × 2560 维 ≈ **17MB**，而它只取决于 ``(语料, 嵌入模型)``，与哪次运行、哪条 QA
@@ -993,11 +1039,10 @@ async def build_inputs(
     """
     inputs_dir = run_dir / directory.name / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
-    # 三层语料，粒度递减（agent 由粗到细地检索）：
-    #   speakers_summary     整段关系的顶层概览（1 条）
-    #   session_summaries    每次会话一份
-    #   sessions             原始消息
-    for name in ("sessions.jsonl", "session_summaries.jsonl", "speakers_summary.jsonl"):
+    # 两层语料，粒度递减（agent 由粗到细地检索）：
+    #   session_summaries    每次会话一份（粗筛：定位到哪次会话）
+    #   sessions             原始消息（精确措辞、时间锚点）
+    for name in CORPUS_FILES:
         source = directory / name
         if source.exists():
             link_or_copy(source, inputs_dir / name)
@@ -1009,19 +1054,25 @@ async def build_inputs(
     model = str(embed_cfg.get("model", ""))
     index_dir = inputs_dir / "index"
 
-    # 索引覆盖**三层语料全部**：summary 是概览（粗检索），原始消息是细节（精检索），
-    # 只索引其中一层会让另一层永远搜不到。三份 id 不重叠（summary 的 id 带 _summary 后缀）。
-    speakers_summaries = read_jsonl(inputs_dir / "speakers_summary.jsonl")
-    session_summaries = read_jsonl(inputs_dir / "session_summaries.jsonl")
-    sessions = read_jsonl(inputs_dir / "sessions.jsonl")
-    memories = [*speakers_summaries, *session_summaries, *sessions]
-
-    if not have_embed or embedder is None:
+    # 索引**只为 --embed 服务**。默认检索是关键词（BM25 + tag），不需要向量 ——
+    # 所以没有嵌入服务时不再是"降级"，只是少了一条 agent 主动选择才会用的通道。
+    if not have_embed or embedder is None or not bool(config.get("build_index", True)):
         if not allow_fallback:
             raise RuntimeError("没有可用的 embedding 配置，且 allow_lexical_fallback=false")
-        log.warn("没有可用的 embedding 服务，检索降级为**词法模式**（BM25 + tag），search 需带 --lexical")
+        log.info(
+            "不建语义索引：search 走关键词模式（默认）。"
+            + ("" if have_embed else "未配置 embedding。")
+            + ("" if bool(config.get("build_index", True)) else "build_index=false。")
+            + "（--embed 因此不可用）"
+        )
         _link_index(index_dir, None)
-        return inputs_dir, index_dir, search_bin, True
+        return inputs_dir, index_dir, search_bin, False
+
+    # 索引覆盖**两层语料全部**：summary 是概览（粗筛），原始消息是细节（精检索），
+    # 只索引其中一层会让另一层永远搜不到。两层的 id 不重叠（summary 带 _summary 后缀）。
+    session_summaries = read_jsonl(inputs_dir / "session_summaries.jsonl")
+    sessions = read_jsonl(inputs_dir / "sessions.jsonl")
+    memories = [*session_summaries, *sessions]
 
     cache_root = Path(config.get("index_cache_dir") or (run_dir.parent / ".index_cache"))
     shared = index_mod.shared_index_dir(cache_root, memories, model)
@@ -1029,14 +1080,12 @@ async def build_inputs(
     if index_mod.index_is_usable(shared, memories, model):
         log.info(
             f"复用共享索引缓存：{len(memories)} 条 × {index_mod.load_index(shared).dim} 维 "
-            f"（speakers {len(speakers_summaries)} + session {len(session_summaries)} + "
-            f"消息 {len(sessions)}）"
+            f"（session summary {len(session_summaries)} + 消息 {len(sessions)}）"
         )
     else:
         log.info(
             f"建检索索引：{len(memories)} 条"
-            f"（speakers summary {len(speakers_summaries)} + "
-            f"session summary {len(session_summaries)} + 原始消息 {len(sessions)}）"
+            f"（session summary {len(session_summaries)} + 原始消息 {len(sessions)}）"
             f" -> 共享缓存 {shared}"
         )
         try:
@@ -1051,14 +1100,15 @@ async def build_inputs(
             if not allow_fallback:
                 raise
             log.warn(
-                f"建索引失败（{type(exc).__name__}: {exc}），检索降级为**词法模式**（BM25 + tag）"
+                f"建索引失败（{type(exc).__name__}: {exc}），search 走关键词模式"
+                f"（默认行为；--embed 将不可用）"
             )
             _link_index(index_dir, None)
-            return inputs_dir, index_dir, search_bin, True
+            return inputs_dir, index_dir, search_bin, False
         log.info(f"索引完成：{len(built)} 条 × {built.dim} 维 -> {shared}")
 
     _link_index(index_dir, shared)
-    return inputs_dir, index_dir, search_bin, False
+    return inputs_dir, index_dir, search_bin, True
 
 
 def _link_index(index_dir: Path, shared: Path | None) -> None:
@@ -1086,7 +1136,7 @@ def summarize_dir(
     model: ModelRunner,
     qa_total: int,
     skipped: int,
-    lexical: bool,
+    embed_ready: bool,
 ) -> dict[str, Any]:
     done = [r for r in records if not r.error]
     sufficient = [r for r in records if r.sufficient]
@@ -1106,7 +1156,7 @@ def summarize_dir(
         "steps_mean": round(steps / len(records), 2) if records else 0.0,
         "tool_calls_total": sum(r.tool_calls for r in records),
         "tampered": sum(1 for r in records if r.tampered),
-        "lexical_fallback": lexical,
+        "embed_available": embed_ready,
         "model_calls": model.stats()["calls"],
         "model_failures": model.stats()["failures"],
         # --repeat：逐条 QA 的多次运行是否一致（单次跑时为 1，没有意义）
@@ -1339,7 +1389,7 @@ async def async_main(args: argparse.Namespace) -> None:
 
     embedder = make_embedder(config, gen_log)
     if embedder is None:
-        gen_log.warn("未配置可用的 embedding，检索将降级为词法模式")
+        gen_log.info("未配置可用的 embedding：search 只提供关键词模式（--embed 不可用）")
     generator = openai.AsyncOpenAI(
         base_url=gen_cfg.get("base_url"), api_key=gen_cfg.get("api_key") or "none"
     )

@@ -571,6 +571,22 @@ def create_edit_tool(*, cwd: Path, confine: bool = True) -> ToolDefinition:
 # bash
 # ---------------------------------------------------------------------------
 
+def _shell_executable() -> str | None:
+    """本机 bash 的绝对路径；找不到返回 ``None``。
+
+    这是名为 ``bash`` 的工具，命令就该由 bash 解释 —— 尤其是引号规则（``'.content="x"'``
+    这类在 POSIX shell 里合法、在 Windows ``cmd.exe`` 里会被吃掉引号）。只有当本机确实
+    没有 bash 时才退回 ``create_subprocess_shell``（POSIX 上是 ``/bin/sh``，Windows 上是
+    ``cmd.exe``）—— 那里命令的语法就不保证了，但至少不是直接崩。
+
+    路径必须是**绝对路径**：POSIX 上 ``execvp`` 会查 PATH，Windows 的 ``CreateProcess``
+    不会（它要求带扩展名），裸 ``bash`` 直接 ``WinError 2``。
+    """
+    import shutil
+
+    return shutil.which("bash")
+
+
 def create_bash_tool(
     *,
     cwd: Path,
@@ -580,6 +596,7 @@ def create_bash_tool(
     max_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
 ) -> ToolDefinition:
     prefix = shell_command_prefix.strip() if shell_command_prefix else None
+    shell_executable = _shell_executable()
 
     async def execute(arguments: Mapping[str, Any]) -> ToolResult:
         command = _str_arg(arguments, "command")
@@ -587,17 +604,31 @@ def create_bash_tool(
         if timeout is not None and timeout <= 0:
             raise ToolError("timeout must be greater than 0")
         effective_timeout = timeout if timeout is not None else default_timeout
-        shell_command = f"{prefix}\n{command}" if prefix else command
-
         start = monotonic()
-        process = await asyncio.create_subprocess_shell(
-            shell_command,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=(os.name == "posix"),
-            executable="bash" if prefix else None,
-        )
+        # 用 ``bash -c`` 执行，而不是 create_subprocess_shell(executable=...)。
+        #
+        # 两个理由：① 前缀里是 POSIX 语法（``export PATH="a:b"``），只有 bash 会解释；
+        # ② Windows 上 ``create_subprocess_shell`` 会把 executable 拼进 ``cmd.exe /c``
+        # 的命令行 —— 实测 ``C:\Program Files\...\bash.EXE`` 被拆成 ``/c/Program: Files\...``
+        # 直接 "No such file or directory"。走 bash -c 没有这一层：脚本是**一个参数**，
+        # 引号规则由我们自己定。
+        if shell_executable:
+            argv = [shell_executable, "-c", f"{prefix}\n{command}" if prefix else command]
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=(os.name == "posix"),
+            )
+        else:
+            process = await asyncio.create_subprocess_shell(
+                f"{prefix}\n{command}" if prefix else command,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=(os.name == "posix"),
+            )
         communicate = asyncio.create_task(process.communicate())
         timed_out = False
         try:

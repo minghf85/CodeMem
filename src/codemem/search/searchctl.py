@@ -1,28 +1,34 @@
-"""``search`` —— 把混合检索做成一条终端命令。
+"""``search`` —— 把检索做成一条终端命令。
 
     search "when did Caroline go to the LGBTQ support group" -k 8
+    search "pottery" --source summary -k 5
     search "support group" -k 5 --source evidence
-    search "support group" -k 8 --lexical          # 嵌入服务挂了时的词法回退
+    search "counseling" --embed -k 8            # 关键词搜不到时的语义兜底
 
 输出的每一行是一条 JSON（按 RRF 分降序），直接喂给 ``jq``：
 
-    {"id":"session_5_2_1","score":0.0328,"rank_dense":1,"rank_bm25":4,"rank_tag":null,
-     "memory":"Caroline joined an LGBTQ support group","type":"outer"}
+    {"id":"session_5_2_1","kind":"session","session":"session_5","score":0.0328,
+     "time":"2023-06-17","memory":"Caroline joined an LGBTQ support group"}
+
+**默认是关键词模式**（BM25 + tag 两路，不加载索引、不调嵌入服务）。这是刻意的：
+① 它快且确定 —— 没有网络、没有冷启动，agent 想调几次调几次；② 关键词**多跳**检索
+（从一条命中里抠出新人名/新词再搜一轮）才是这个 agent 的主力动作；③ 嵌入服务挂了
+不再等于检索挂了。只有关键词确实搜不到时才加 ``--embed`` 打开 dense 一路 ——
+语义匹配对"换一种说法问同一件事"更有用，但它是**兜底**，不是默认。
 
 **为什么做成 CLI 而不是一个"检索工具"**：让它能和 ``jq`` / ``grep`` / ``head`` 自由组合，
 而这正是这个 agent 唯一需要学的思维模型 —— 一切都是一条对 JSONL 文件的命令。代价有两条，
-都可接受：① 每次调用要 load 一次预建索引（float32，1273×4096 ≈ 20MB，约 50ms）；
+都可接受：① ``--embed`` 时每次调用要 load 一次预建索引（float32，约 20MB，约 50ms）；
 ② 检索失败以子进程失败的形式暴露 —— 这反而**比旧版更好**：旧版 embedding 挂了就直接终止
-整个目录，现在 agent 看得见 ``search: embedding service unreachable``，可以改用
-``--lexical`` 绕过去。
+整个目录，现在 agent 看得见 ``search: embedding service unreachable``，改用关键词模式
+（默认行为）绕过去。
 
-**检索池 = base 库 ∪ 当前 evidence.jsonl**（按 id 去重，evidence 侧优先）。所以 agent 自己
-写出的新记忆立刻可被检索到，不需要重建索引 —— evidence 通常只有几条，实时嵌入即可。
+**检索池 = 两层语料 ∪ 当前 evidence.jsonl**（按 id 去重，evidence 侧优先）。
 
 本模块也可用来**建索引**（``--index-only``）：
 
-    python -m codemem.searchctl --index-only \\
-        --atoms data/Caroline_Melanie/atommem.jsonl --index /tmp/idx
+    python -m codemem.search.searchctl --index-only \\
+        --atoms data/Caroline_Melanie/session_summaries.jsonl --index /tmp/idx
 
 环境变量（由 harness 通过 bash 的 ``shell_command_prefix`` 注入）：
 
@@ -40,6 +46,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -55,11 +62,25 @@ from ..io import (
     msg_time,
 )
 
-# 默认输出里带上 kind / source：**溯源是 agent 最常需要的下一步**（这条原子来自哪条原话），
-# 直接给出来能省掉一轮 jq。
-DEFAULT_FIELDS = ("id", "kind", "score", "rank_dense", "rank_bm25", "rank_tag", "memory", "source")
-ALL_FIELDS = ("id", "kind", "score", "rank_dense", "rank_bm25", "rank_tag", "memory",
-              "type", "time", "tag", "source")
+# 默认输出只保留**决定下一步所需**的字段。为什么砍掉 rank_* 这几列：agent 不会用它们
+# 做决策（它看的是 memory 正文），而每个字段每行都要占上下文 —— 一次 -k 8 就是 8 行。
+# 排错要看通道明细时用 ``--all-fields``。
+DEFAULT_FIELDS = ("id", "kind", "session", "time", "score", "memory")
+ALL_FIELDS = ("id", "kind", "session", "score", "rank_dense", "rank_bm25", "rank_tag",
+              "memory", "type", "time", "tag", "source")
+
+#: 关键词模式的权重：只用 BM25 + tag。dense 权重为 0 → 不加载索引、不请求嵌入服务。
+KEYWORD_WEIGHTS: dict[str, float] = {"dense": 0.0, "bm25": 1.0, "tag": 0.5}
+
+#: 从 ``session_5_2`` / ``session_5_summary`` 里抠出会话前缀 ``session_5``。
+_SESSION_PREFIX_RE = re.compile(r"^(session_\d+)")
+
+#: 两层语料文件名，**按粒度从粗到细**（概览 → 细节）。顺序有意义：
+#: 索引与检索都按这个顺序，粗粒度先出现，便于 agent 先定位再下钻。
+LIBRARY_FILES = (
+    "session_summaries.jsonl",
+    "sessions.jsonl",
+)
 
 
 def _env(name: str, default: str = "") -> str:
@@ -103,17 +124,17 @@ def _memory_id(memory: dict[str, Any]) -> str:
 
 
 def _library_layers(source: str) -> tuple[str, ...]:
-    """``--source`` 决定读哪几层语料。
+    """``--source`` 决定读哪层语料。
 
-    - ``all``（缺省）：三层全读 —— 概览与细节一起搜，按相关度统一排序。
-    - ``summary``：只读两层 summary。适合"先定位到哪次会话"的粗检索。
+    - ``all``（缺省）：两层全读 —— 先看概览、细节也能搜到，按相关度统一排序。
+    - ``summary``：只读 session summary。**粗筛的第一步**：定位"哪次会话谈过这件事"。
     - ``sessions`` / ``raw``：只读原始消息。适合关键词检索具体原话
       （summary 会改写措辞，精确的词不一定在里面）。
     """
     if source in ("summary", "summaries"):
-        return (LIBRARY_FILES[0], LIBRARY_FILES[1])
+        return (LIBRARY_FILES[0],)
     if source in ("sessions", "raw"):
-        return (LIBRARY_FILES[2],)
+        return (LIBRARY_FILES[1],)
     return LIBRARY_FILES
 
 
@@ -178,12 +199,12 @@ def merge_pool(
     evidence: list[dict[str, Any]],
     source: str,
 ) -> list[dict[str, Any]]:
-    """检索池。优先级：evidence > library（三层语料并集）。
+    """检索池。优先级：evidence > library（两层语料并集）。
 
-    **library 是三层语料合并后的结果**（speakers summary / session summaries / 原始消息），
-    由 ``load_library`` 读取并按粒度从粗到细排列。为什么要一次全搜而不是分层分别搜：
-    agent 不该被迫记住"这个问题该查哪一层" —— 让检索把三层的命中混在一起排好序，
-    粗粒度的 summary 因为语义密度高天然排在前面（它是概览），细节需要时再往下看。
+    **library 是两层语料合并后的结果**（session summaries / 原始消息），由 ``load_library``
+    读取并按粒度从粗到细排列。为什么不一次全搜、也不分层分别搜：agent 不该被迫记住
+    "这个问题该查哪一层" —— 让检索把两层的命中混在一起排好序，粗粒度的 summary 因为
+    语义密度高天然排在前面（它是概览），细节需要时再往下看。
 
     evidence 侧优先：那是 agent 自己写出来的、已经过推理的结论，比原始语料更贴题。
     """
@@ -209,20 +230,12 @@ def merge_pool(
     return [merged[key] for key in order]
 
 
-#: 三层语料文件名，**按粒度从粗到细**（概览 → 细节）。顺序有意义：
-#: 索引与检索都按这个顺序，粗粒度先出现，便于 agent 先看到概览。
-LIBRARY_FILES = (
-    "speakers_summary.jsonl",
-    "session_summaries.jsonl",
-    "sessions.jsonl",
-)
-
-
+#: 两层语料（session summary / 原始消息），按粒度从粗到细。见模块开头的说明。
 def load_library(workspace: Path, names: tuple[str, ...] = LIBRARY_FILES) -> list[dict[str, Any]]:
-    """读三层语料并合并成检索库（不存在的文件跳过）。
+    """读两层语料并合并成检索库（不存在的文件跳过）。
 
     合并进**一个**库而不是让 agent 选层：``--source`` 的粒度选择留给"只看原话"
-    （``--source raw``）这类明确需要，默认行为是三层一起搜、按相关度统一排序。
+    （``--source raw``）这类明确需要，默认行为是两层一起搜、按相关度统一排序。
     """
     merged: list[dict[str, Any]] = []
     for name in names:
@@ -230,27 +243,35 @@ def load_library(workspace: Path, names: tuple[str, ...] = LIBRARY_FILES) -> lis
     return merged
 
 
+#: 会话前缀：``session_5_2`` / ``session_5_summary`` -> ``session_5``。
+#: agent 拿它去读"同一次会话的其它消息"，这是多跳检索最常用的一步 ——
+#: 所以直接算好给它，省一轮 jq。
+def session_of(memory: dict[str, Any]) -> str:
+    """记录所属会话的 id 前缀；解析不出返回空串。"""
+    match = _SESSION_PREFIX_RE.match(msg_id(memory))
+    return match.group(1) if match else ""
+
+
 def layer_of(memory: dict[str, Any]) -> str:
     """判断一条记录属于哪一层（给检索结果标注，agent 据此决定下一步去哪）。"""
     if is_summary(memory):
-        return "speakers_summary" if msg_id(memory) == "speakers_summary" else "session_summary"
+        return "session_summary"
     return "session"
 
 
 def provenance_fields(memory: dict[str, Any]) -> dict[str, Any]:
-    """给检索结果补上**层级与溯源**字段。
+    """给检索结果补上**层级、会话归属与时间**。
 
     agent 拿到命中后最常问的下一句是"这是概览还是原话？我要不要往下钻？"——
-    ``kind`` 与 ``source`` 直接回答它：
+    ``kind`` / ``session`` / ``time`` 直接回答它：
 
-    - ``kind=speakers_summary`` —— 整段关系的概览。适合定位"哪次会话"，细节要往下钻。
-    - ``kind=session_summary``  —— 某次会话的概览。``source`` 是该会话的消息 id 列表，
-      可以直接读原文。
-    - ``kind=session``          —— 原始消息。``source`` 为空（它就是源头）。
+    - ``kind=session_summary`` —— 某次会话的概览。``session`` 是它属于哪次会话，
+      读原文用 ``jq -c 'select(.msg_id|startswith("session_8_"))' inputs/sessions.jsonl``。
+    - ``kind=session``        —— 原始消息，``session`` 同样是所属会话（原始消息的
+      ``time`` 就是会话时间，相对时间推理的锚点）。
     """
     meta = memory.get("metadata") or {}
     kind = layer_of(memory)
-    # summary 的 source 从正文里推不出来，靠 msg_id 的前缀给"这次会话包含哪些消息"
     source = meta.get("source")
     if not isinstance(source, list):
         source = []
@@ -259,6 +280,7 @@ def provenance_fields(memory: dict[str, Any]) -> dict[str, Any]:
     return {
         "kind": kind,
         "source": source,
+        "session": session_of(memory),
         "time": str(memory.get("time") or meta.get("time") or ""),
     }
 
@@ -283,8 +305,9 @@ async def _embed_query_evidence(
 def _render(scored: Any, fields: tuple[str, ...]) -> dict[str, Any]:
     """把一条 ScoredMemory 渲染成输出行。``memory`` 默认截断到 400 字符，避免刷屏。
 
-    ``kind`` / ``source`` 是**层级与溯源**：``kind`` 说明这是哪一层
-    （speakers_summary / session_summary / session），``source`` 给出往下钻的入口。
+    ``kind`` / ``session`` / ``time`` 是**层级、归属与时间锚点**：``kind`` 说明这是哪一层
+    （session_summary / session），``session`` 给出往下钻（读原文）的入口，``time`` 是
+    相对时间推理的锚点。这三样都是 agent 下一步马上要用的，所以给在默认输出里。
     """
     memory = scored.memory
     meta = memory.get("metadata") or {}
@@ -293,6 +316,7 @@ def _render(scored: Any, fields: tuple[str, ...]) -> dict[str, Any]:
     row: dict[str, Any] = {
         "id": scored.id,
         "kind": provenance["kind"],
+        "session": provenance["session"],
         "score": round(float(scored.score), 6),
         "rank_dense": channels.get("dense"),
         "rank_bm25": channels.get("bm25"),
@@ -320,20 +344,37 @@ async def run_search(args: argparse.Namespace) -> int:
         index_dir = workspace / index_dir
 
     evidence_path = Path(args.evidence) if args.evidence else workspace / "evidence.jsonl"
-    # library = 三层语料的并集（speakers summary / session summaries / 原始消息），
-    # 按粒度从粗到细排列。默认三层的命中混在一起统一排序（见 merge_pool 的说明）。
+    # library = 两层语料的并集（session summaries / 原始消息），按粒度从粗到细排列。
+    # 默认两层的命中混在一起统一排序（见 merge_pool 的说明）。
 
-    # 索引只有 dense 通道需要。纯词法模式（--lexical，或没配嵌入服务）**不该**因为缺索引
-    # 就退出 —— 那正是降级路径存在的意义（索引没建成时 harness 会切到词法模式）。
-    weights = searchmem.DEFAULT_WEIGHTS if args.lexical else _weights_from_env()
-    needs_dense = not args.lexical and float((weights or {}).get("dense", 1.0) or 0.0) != 0.0
+    # ---- 关键词模式是**默认**；dense 只有显式 --embed 才打开 ----
+    #
+    # 这不是"降级"，而是主路径：关键词检索快、确定、不依赖网络，而且 agent 的多跳
+    # 恰恰靠关键词（从一条命中里抠出新人名再搜）。硬要它默认走 dense 会带来两个实际
+    # 代价：每次调用都要 load 索引 + 请求嵌入服务，以及嵌入服务一挂整个检索就不可用。
+    use_dense = bool(args.embed)
+    weights = _weights_from_env() if use_dense else None
+    if not use_dense:
+        weights = dict(KEYWORD_WEIGHTS)
+
     embed_url = _env("CODEMEM_EMBED_URL")
     loaded: Any = None
-    if needs_dense and embed_url:
+    if use_dense:
+        if not embed_url:
+            print(
+                "search: --embed 需要嵌入服务，但 CODEMEM_EMBED_URL 未设置。"
+                "去掉 --embed 即可用关键词检索。",
+                file=sys.stderr,
+            )
+            return 2
         try:
             loaded = index_mod.load_index(index_dir)
         except (FileNotFoundError, ValueError) as exc:
-            print(f"search: 无法加载索引 {index_dir}: {exc}", file=sys.stderr)
+            print(
+                f"search: --embed 需要预建索引，但无法加载 {index_dir}: {exc}。"
+                f"去掉 --embed 即可用关键词检索。",
+                file=sys.stderr,
+            )
             return 2
 
     if args.library:
@@ -344,8 +385,8 @@ async def run_search(args: argparse.Namespace) -> int:
     pool = merge_pool(library, evidence, args.source)
     if not pool:
         print(
-            "search: 检索池为空（三层语料与 evidence 都没有记录）。"
-            "先确认 inputs/ 下有 sessions.jsonl / session_summaries.jsonl / speakers_summary.jsonl",
+            "search: 检索池为空（两层语料与 evidence 都没有记录）。"
+            "先确认 inputs/ 下有 sessions.jsonl 与 session_summaries.jsonl",
             file=sys.stderr,
         )
         return 3
@@ -366,7 +407,7 @@ async def run_search(args: argparse.Namespace) -> int:
             print(
                 f"search: --tag 过滤后没有候选（原 {before} 条；"
                 f"--tag {args.tag} --exclude-tag {args.exclude_tag}）。"
-                f"先看看有哪些 tag：jq -r '.metadata.tag[]' inputs/atommem.jsonl | sort | uniq -c",
+                f"先看看有哪些 tag：search --tag-values",
                 file=sys.stderr,
             )
             return 3
@@ -387,10 +428,10 @@ async def run_search(args: argparse.Namespace) -> int:
                 api_key=_env("CODEMEM_EMBED_KEY"),
                 model=_env("CODEMEM_EMBED_MODEL"),
             )
-        except Exception as exc:  # noqa: BLE001 - 明确告诉 agent 哪里坏了，它会改用 --lexical
+        except Exception as exc:  # noqa: BLE001 - 明确告诉 agent 哪里坏了，它会改用关键词
             print(
                 f"search: embedding service unreachable ({type(exc).__name__}: {exc}). "
-                f"Retry, or use `--lexical` for keyword-only search.",
+                f"Retry, or drop --embed for keyword-only search (the default).",
                 file=sys.stderr,
             )
             return 4
@@ -403,11 +444,6 @@ async def run_search(args: argparse.Namespace) -> int:
             dense_scores[position] = (
                 sum(a * b for a, b in zip(query_vector, vector)) / (query_norm * vector_norm)
             )
-    elif needs_dense:
-        print(
-            "search: CODEMEM_EMBED_URL 未设置，退化为词法检索（BM25 + tag）",
-            file=sys.stderr,
-        )
 
     # ---- 用 searchmem 的三路 RRF 融合。search_scored 会把 cosine 当"分数"重排名次，
     # 这里传 dense=None 并把已知的 dense 分数作为一路显式注入，避免重复请求 embedding。
@@ -424,8 +460,7 @@ async def run_search(args: argparse.Namespace) -> int:
     for item in scored:
         print(json.dumps(_render(item, fields), ensure_ascii=False, default=str))
     if not scored:
-        print("search: 没有命中（试试别的措辞，或用 --source all 同时搜原话与原子）",
-              file=sys.stderr)
+        print("search: 没有命中（试试别的措辞，或加 --embed 用语义匹配）", file=sys.stderr)
         return 1
     return 0
 
@@ -476,17 +511,18 @@ async def run_index(args: argparse.Namespace) -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="search",
-        description="混合检索（dense + BM25 + tag，RRF 融合），每行输出一条 JSON",
+        description="检索两层语料（session summaries + 原始消息），每行输出一条 JSON。"
+                    "默认关键词（BM25 + tag）；--embed 打开语义通道。",
     )
     parser.add_argument("query", nargs="?", default="", help="检索 query（--tag-values 时可省略）")
     parser.add_argument("-k", type=int, default=8, help="返回条数（缺省 8）")
     parser.add_argument("--source", choices=("all", "library", "summary", "sessions", "raw", "evidence"),
                         default="all",
-                        help="检索池：all=三层语料+evidence（缺省）/ library=只三层语料 / "
-                             "summary=只两层 summary（粗检索，用于定位哪次会话）/ "
+                        help="检索池：all=两层语料+evidence（缺省）/ library=只两层语料 / "
+                             "summary=只 session summaries（粗筛，用于定位哪次会话）/ "
                              "sessions(或 raw)=只原始消息（按原话关键词搜）/ evidence=只自己写出的证据")
     parser.add_argument("--library", default="",
-                        help="直接指定语料文件路径（缺省按 --source 从 inputs/ 读三层）")
+                        help="直接指定语料文件路径（缺省按 --source 从 inputs/ 读两层）")
     parser.add_argument("--tag", action="append", default=[],
                         help="按 tag 子串过滤（可重复）。记录里没有 tag 字段时该过滤不命中任何东西")
     parser.add_argument("--exclude-tag", action="append", default=[],
@@ -496,9 +532,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fields", default="", help="逗号分隔的输出字段（缺省常用集）")
     parser.add_argument("--evidence", default="", help="evidence 路径（缺省 evidence.jsonl）")
     parser.add_argument("--index", default="", help="索引目录（缺省 $CODEMEM_INDEX）")
-    parser.add_argument("--lexical", action="store_true", help="只用 BM25 + tag，不调 embedding")
+    parser.add_argument("--embed", action="store_true",
+                        help="打开 dense 语义通道（需要预建索引 + 嵌入服务）。"
+                             "**默认关闭**：关键词检索是主路径，语义只在关键词搜不到时兜底")
     parser.add_argument("--rrf-k", type=int, default=int(_env("CODEMEM_RRF_K", "60") or 60))
-    parser.add_argument("--all-fields", action="store_true", help="输出全部字段（默认集之上再加 time/tag/source）")
+    parser.add_argument("--all-fields", action="store_true", help="输出全部字段（默认集之上再加 rank_*/source/tag/type）")
 
     index_group = parser.add_argument_group("建索引（离线跑一次）")
     index_group.add_argument("--index-only", action="store_true", help="只建索引、不检索")
@@ -519,7 +557,7 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(run_index(args))
     # --tag-values 不需要 query（它只统计标签词表）
     if not args.query.strip() and not args.tag_values:
-        print('search: 缺少 query。用法：search "QUERY" [-k N] [--source base|raw|evidence|all]',
+        print('search: 缺少 query。用法：search "QUERY" [-k N] [--source summary|raw|evidence|all]',
               file=sys.stderr)
         return 2
     return asyncio.run(run_search(args))

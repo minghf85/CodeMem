@@ -1,27 +1,24 @@
-"""add · 第二步：两层 summary（session → speakers）。
+"""add · 第二步：session summary（每个 session 一份）。
 
      每个 session  ──►  session summary（session_{n}_summary）
-     全部 session summaries ──►  speakers summary（speakers_summary）
 
-**为什么要两层、而不是继续抽原子**：实测 152 条 QA 里 multi_hop 只有 43%。根因是原子
-**丢掉了会话结构** —— 一条条孤立事实无法回答"他们什么时候认识的""这段关系怎么发展的"。
-session summary 保留"这次谈了什么、什么变了、谁对谁说了什么"；speakers summary 再把
-这些串成整段关系的**轨迹**。层级同时给了检索一个由粗到细的入口：
-先读 speakers summary 定位到哪次会话，再进那次会话的 summary 与原文。
+**这一层是 search 的粗筛入口**：检索时先读 session summary 定位到"哪次会话谈过这件事"，
+再进那次会话的原始消息拿精确措辞（由粗到细，见 ``docs/search.md``）。
 
-**两层都用同一份 session 记录格式**（``session_template.jsonl``），只把 ``role`` 标记成
-``"summary"``。好处是 agent 只需要理解一种记录格式，工具/模板/解析全部复用；代价是
-读的时候要靠 ``role`` 区分粒度 —— 比让 agent 学两种格式划算。
+**为什么不再做 speakers summary（顶层关系概览）**：实测它的边际收益不足以抵消成本 ——
+① 它把 19 份 summary 再压成 1 条，而检索真正需要的是"定位到哪次会话"，那是 session
+summary 就有的粒度；② 它是一条**没有 msg_id 可回溯**的合成文本，`source` 只能指向别的
+summary 而非原始消息，破掉了"证据必须能溯源到原话"这条不变量；③ 每加一层就多一次模型
+调用与一次全量重跑。删掉之后语料就是干净的两层：``sessions.jsonl`` + ``session_summaries.jsonl``。
 
-**speakers summary 耗时相关**：它需要全部 session summary 都就绪，所以这一层必须等
-第一层全部完成。给定 ``--limit-sessions`` 时只用前 N 个 session（调试用）。
+**记录格式统一**（``session_template.jsonl``），只把 ``role`` 标记成 ``"summary"``。
+好处是 agent 只需要理解一种记录格式，工具/模板/解析全部复用。
 
 用法::
 
-    python -m codemem.add.summary                       # 全部目录，两层都跑
-    python -m codemem.add.summary --stage session        # 只跑第一层
-    python -m codemem.add.summary Caroline_Melanie
-    python -m codemem.add.summary --limit-sessions 3     # 每个目录只跑前 3 个 session
+    python -m codemem.add --stage summary                # 全部目录
+    python -m codemem.add --stage summary Caroline_Melanie
+    python -m codemem.add --stage summary --limit-sessions 3   # 每个目录只跑前 3 个 session
 """
 
 from __future__ import annotations
@@ -51,21 +48,18 @@ from ..io import (
 from ..prompts import (
     SESSION_SUMMARY_SYSTEM_PROMPT,
     SESSION_SUMMARY_USER_PROMPT,
-    SPEAKERS_SUMMARY_SYSTEM_PROMPT,
-    SPEAKERS_SUMMARY_USER_PROMPT,
 )
 from .session import OUTPUT_NAME as SESSIONS_NAME
 
 CONFIG_FILE = PROJECT_ROOT / "configs" / "add.yaml"
 SESSION_OUTPUT = "session_summaries.jsonl"
-SPEAKERS_OUTPUT = "speakers_summary.jsonl"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "local",
     "base_url": "http://127.0.0.1:30000/v1",
     "api_key": "sglang",
     "temperature": 0.2,
-    # summary 比原子抽取长得多（session 120-300 词、speakers 250-500 词），给足空间
+    # summary 比原子抽取长得多（session 120-300 词），给足空间
     "max_tokens": 4096,
     "concurrency": 4,
     "timeout": 300,
@@ -188,7 +182,7 @@ def key_facts(parsed: dict[str, Any]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# 第一层：session summary
+# 第一层（也是唯一一层）：session summary
 # ---------------------------------------------------------------------------
 
 def build_session_messages(
@@ -256,78 +250,6 @@ async def summarize_session(
 
 
 # ---------------------------------------------------------------------------
-# 第二层：speakers summary
-# ---------------------------------------------------------------------------
-
-def build_speakers_messages(
-    session_summaries: list[dict[str, Any]],
-    speaker_a: str,
-    speaker_b: str,
-) -> list[dict[str, str]]:
-    numbers: list[int] = []
-    for record in session_summaries:
-        match = SESSION_NUMBER_RE.match(msg_id(record))
-        if match:
-            numbers.append(int(match.group(1)))
-    blocks = [
-        f"### {msg_id(record)}  ({msg_time(record) or 'unknown time'})\n{msg_content(record)}"
-        for record in session_summaries
-    ]
-    first = min(numbers) if numbers else 1
-    last = max(numbers) if numbers else len(session_summaries)
-    times = [msg_time(r) for r in session_summaries if msg_time(r)]
-    return [
-        {
-            "role": "system",
-            "content": SPEAKERS_SUMMARY_SYSTEM_PROMPT.format(
-                speaker_a=speaker_a, speaker_b=speaker_b
-            ),
-        },
-        {
-            "role": "user",
-            "content": SPEAKERS_SUMMARY_USER_PROMPT.format(
-                speaker_a=speaker_a,
-                speaker_b=speaker_b,
-                session_count=len(session_summaries),
-                first_session=first,
-                last_session=last,
-                time_span=f"{times[0]} .. {times[-1]}" if times else "(unknown)",
-                session_summaries="\n\n".join(blocks),
-            ),
-        },
-    ]
-
-
-async def summarize_speakers(
-    session_summaries: list[dict[str, Any]],
-    speaker_a: str,
-    speaker_b: str,
-    config: dict[str, Any],
-    client: Any,
-) -> dict[str, Any]:
-    """跑 speakers summary，返回 session 记录（``msg_id="speakers_summary"``）。"""
-    prompt = build_speakers_messages(session_summaries, speaker_a, speaker_b)
-    try:
-        raw = await llm.chat_completion(client, config, prompt)
-    except Exception as exc:  # noqa: BLE001
-        return make_session_record(
-            "speakers_summary", "summary",
-            f"[speakers summary failed: {type(exc).__name__}: {exc}]", "",
-        )
-    parsed = parse_json_object(raw) or {}
-    text = summary_text(parsed)
-    if not text:
-        text = raw.strip()
-    people = parsed.get("people")
-    if isinstance(people, list) and people:
-        text += "\n\nPeople:\n" + "\n".join(f"- {p}" for p in people)
-    arc = parsed.get("arc")
-    if isinstance(arc, str) and arc.strip():
-        text += f"\n\nArc: {arc.strip()}"
-    return make_session_record("speakers_summary", "summary", text, "")
-
-
-# ---------------------------------------------------------------------------
 # 单个目录
 # ---------------------------------------------------------------------------
 
@@ -355,15 +277,25 @@ async def run_dir(
     config: dict[str, Any],
     client: Any,
     limit_sessions: int = 0,
-    stages: tuple[str, ...] = ("session", "speakers"),
     log_prefix: str = "",
 ) -> dict[str, Any]:
-    """对一个目录跑两层 summary。返回小结 dict。"""
+    """对一个目录跑 session summary。返回小结 dict。
+
+    **幂等**：重跑时覆盖 ``session_summaries.jsonl``，并顺手删掉历史遗留的
+    ``speakers_summary.jsonl``（那一层已取消，见模块注释）。
+    """
     label = directory.name
     sessions_path = directory / SESSIONS_NAME
     if not sessions_path.exists():
         print(f"[skip] {label}: 没有 {SESSIONS_NAME}（先跑 add --stage session）", file=sys.stderr)
         return {"dir": label, "status": "SKIPPED", "reason": f"no {SESSIONS_NAME}"}
+
+    # 历史遗留：speakers summary 层已删。留着它会让 search 的 inputs/ 里多一份没人用的
+    # 语料，且它的 source 无法回溯到原始消息 —— 直接清掉，不静默留在磁盘上。
+    stale = directory / "speakers_summary.jsonl"
+    if stale.exists():
+        stale.unlink()
+        print(f"  [{label}] 删除历史遗留的 {stale.name}（该层已取消）", flush=True)
 
     records = read_jsonl(sessions_path)
     # 只对**原始消息**做 summary；文件里若已有 summary，不作为输入（幂等重跑）
@@ -376,52 +308,29 @@ async def run_dir(
 
     speaker_a, speaker_b = parse_dir_label(label)
     concurrency = max(1, int(config.get("concurrency", 4)))
-    summary_count = 0
 
-    if "session" in stages:
-        # 第一层：session summary（会话之间互相独立，可并发）
-        semaphore = asyncio.Semaphore(concurrency)
+    # session summary：会话之间互相独立，可并发
+    semaphore = asyncio.Semaphore(concurrency)
 
-        async def one(index: int, messages: list[dict[str, Any]]) -> dict[str, Any]:
-            async with semaphore:
-                session_time = next((msg_time(m) for m in messages if msg_time(m)), "")
-                result = await summarize_session(
-                    messages, index, session_time, speaker_a, speaker_b, config, client
-                )
-                print(f"  [{label}] session {index} summary ({len(messages)} 条消息)", flush=True)
-                return result
+    async def one(index: int, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        async with semaphore:
+            session_time = next((msg_time(m) for m in messages if msg_time(m)), "")
+            result = await summarize_session(
+                messages, index, session_time, speaker_a, speaker_b, config, client
+            )
+            print(f"  [{label}] session {index} summary ({len(messages)} 条消息)", flush=True)
+            return result
 
-        session_summaries = list(
-            await asyncio.gather(*(one(index, messages) for index, messages in groups))
-        )
-        write_jsonl(directory / SESSION_OUTPUT, session_summaries)
-        summary_count = len(session_summaries)
-    else:
-        session_summaries = read_jsonl(directory / SESSION_OUTPUT)
-        if not session_summaries:
-            session_summaries = [
-                make_session_record(f"session_{index}_summary", "summary", "", "")
-                for index, _ in groups
-            ]
-
-    speakers_path = directory / SPEAKERS_OUTPUT
-    if "speakers" in stages:
-        # 第二层：必须等第一层全部就绪（它消费所有 session summary）
-        result = await summarize_speakers(
-            session_summaries, speaker_a, speaker_b, config, client
-        )
-        write_jsonl(speakers_path, [result])
-        print(f"  [{label}] speakers summary（基于 {len(session_summaries)} 个 session summary）",
-              flush=True)
-    else:
-        result = None
+    session_summaries = list(
+        await asyncio.gather(*(one(index, messages) for index, messages in groups))
+    )
+    write_jsonl(directory / SESSION_OUTPUT, session_summaries)
 
     return {
         "dir": label,
         "status": "OK",
         "sessions": len(groups),
-        "session_summaries": summary_count,
-        "speakers_summary": bool(result),
+        "session_summaries": len(session_summaries),
     }
 
 
@@ -453,12 +362,10 @@ def resolve_targets(dirs: list[str]) -> list[Path]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m codemem.add.summary",
-        description="两层 summary：session summary → speakers summary",
+        description="每个 session 生成一份 session summary",
     )
     parser.add_argument("dirs", nargs="*", help="speaker 目录名；缺省处理全部")
     parser.add_argument("--config", default=str(CONFIG_FILE), help="配置（默认 configs/add.yaml）")
-    parser.add_argument("--stage", choices=("session", "speakers", "all"), default="all",
-                        help="只跑某一层（speakers 需要 session 层已就绪）")
     parser.add_argument("--limit-sessions", type=int, default=0,
                         help="每个目录只跑前 N 个 session（调试用）")
     parser.add_argument("--concurrency", type=int, default=None, help="覆盖并发数")
@@ -477,16 +384,12 @@ def main(argv: list[str] | None = None) -> None:
               file=sys.stderr)
         return
 
-    stages = ("session", "speakers") if args.stage == "all" else (args.stage,)
     client = llm.make_client(config)
 
     async def run_all() -> list[dict[str, Any]]:
         try:
             return [
-                await run_dir(
-                    directory, config, client,
-                    limit_sessions=args.limit_sessions, stages=stages,
-                )
+                await run_dir(directory, config, client, limit_sessions=args.limit_sessions)
                 for directory in targets
             ]
         finally:
@@ -495,11 +398,8 @@ def main(argv: list[str] | None = None) -> None:
     results = asyncio.run(run_all())
     for item in results:
         if item.get("status") == "OK":
-            print(
-                f"summary   {item['dir']}: {item['sessions']} 个 session -> "
-                f"{item['session_summaries']} 条 summary"
-                + (" + speakers summary" if item["speakers_summary"] else "")
-            )
+            print(f"summary   {item['dir']}: {item['sessions']} 个 session -> "
+                  f"{item['session_summaries']} 条 summary")
         else:
             print(f"summary   {item['dir']}: {item.get('status')} — {item.get('reason', '')}")
 

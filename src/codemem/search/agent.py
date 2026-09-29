@@ -86,15 +86,14 @@ def repeat_notice(call: ToolCall, count: int) -> str:
         f"ERROR: you already ran this exact {call.tool} call {count} times "
         f"({call.describe()}). Running it again cannot change the result.\n"
         f"Do something DIFFERENT. Common reasons you are stuck:\n"
-        f"- The id is NOT in that file. ids differ by file: records in inputs/atommem.jsonl end "
-        f"in a sequence number (session_1_3_1); MESSAGES in inputs/msgmem.jsonl do not "
-        f"(session_1_3). A jq select that matches nothing prints NOTHING and still exits 0.\n"
-        f"- To resolve a relative time, read the session's timestamp from inputs/msgmem.jsonl:\n"
-        f"    jq -c 'select(.metadata.id==\"session_1_3\") | {{id:.metadata.id,time:.metadata.time}}' "
-        f"inputs/msgmem.jsonl\n"
-
-        f"  then run timecalc on it. Do not guess the date.\n"
-        f"- To see what you already have: jq -r '.metadata.id' evidence.jsonl\n"
+        f"- The id is NOT in that file. `jq select(...)` that matches nothing prints NOTHING and "
+        f"still exits 0. Print the real ids to check: "
+        f"jq -r '.msg_id' inputs/sessions.jsonl | head -20\n"
+        f"- To resolve a relative time, read the session timestamp off any message in that "
+        f"session (jq -c 'select(.msg_id==\"session_1_3\")' inputs/sessions.jsonl), then run "
+        f"timecalc on it. Do not guess the date.\n"
+        f"- To see what you already have: jq -r '.content' evidence.jsonl\n"
+        f"- To hop: search a NEW name or word you read, e.g. search \"Melanie husband\" -k 5\n"
         f"When the evidence already answers the question, reply with plain text (no JSON) to finish."
     )
 
@@ -156,10 +155,8 @@ def no_output_notice(call: ToolCall) -> str:
         return "\n\n[(no output). If that is unexpected, re-check the command.]"
     return (
         "\n\n[(no output). For jq this usually means the selector matched NOTHING -- the file may "
-        "not contain that id. Remember ids differ by file: inputs/atommem.jsonl records are "
-        "session_1_3_1 (with a sequence number), while inputs/msgmem.jsonl MESSAGES are session_1_3 "
-        "(without). Print the real ids to check: "
-        "jq -r '.metadata.id' inputs/msgmem.jsonl | head -20]"
+        "not contain that id. Print the real ids to check: "
+        "jq -r '.msg_id' inputs/sessions.jsonl | head -20 -- or use `search` instead.]"
     )
 
 
@@ -372,12 +369,13 @@ def compact_messages(
                 continue
             tools_used.append(call.tool)
             command = str(call.args.get("command") or call.args.get("path") or "")
-            for name in ("atommem.jsonl", "msgmem.jsonl", "evidence.jsonl"):
+            for name in ("session_summaries.jsonl", "sessions.jsonl", "evidence.jsonl"):
                 if name in command:
                     notes.append(name)
-            # 抓出命令里提到的 id（形如 "session_1_3_1"），它们是最该记住的东西
+            # 抓出命令里提到的 id（形如 "session_1_3"），它们是最该记住的东西 ——
+            # 模型忘了自己搜过什么，就会重复检索、反复追加同样的记录。
             for token in command.replace('"', " ").replace("'", " ").split():
-                if token.count("_") >= 2 and token[0].isalpha():
+                if token.count("_") >= 1 and token[0].isalpha():
                     if token not in ids_seen:
                         ids_seen.append(token)
 

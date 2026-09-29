@@ -1,16 +1,19 @@
 """Verifier：对"这份 evidence 能不能回答这个问题"做独立判定。
 
-设计见 ``docs/evomem_plan_v3.md`` §6。三条不可省的约束：
+设计见 ``docs/search.md``。三条不可省的约束：
 
 1. **只看 ``(question, evidence)``**，看不到 agent 的对话、检索过程、编辑历史。一个既能编辑
    又能宣布成功的 agent，最省力的动作永远是宣布成功 —— 旧版 NOOP 泛滥就是这一偏差的温和版本。
 2. **不给参考答案**。用 reference 当闸门就是 oracle 泄漏：RL 会直接学会猜答案，推理时也拿不到
    答案键。所以闸门检验的是**可回答性**，不是正确性；正确性只在评测/奖励时用 judge 算。
 3. **必须输出 ``missing[]``**。这是下一轮 agent 最有效的观测，也是"探索"的实际含义 ——
-   它把"差在哪里"变成一个具体、可检索的目标。
+   它把"差在哪里"变成一个具体、可检索的目标（下一轮的关键词就从这里来）。
 
 本模块只负责：构造 prompt、调模型、**稳健解析**、以及在解析失败时**保守地判为"不足"**
 （而不是"足够"）—— 假阳性会让 agent 提前收工，假阴性只多花一轮。
+
+**prompt 里没有 few-shot 示例**：判定规则本身很短（能否从记录里读出答案），而示例会让
+每条 QA 多背几百 token。唯一的例外是下面那条**等价性**说明 —— 它是判错最多的一种情形。
 """
 
 from __future__ import annotations
@@ -23,21 +26,22 @@ from typing import Any, Awaitable, Callable
 from ..io import msg_content, msg_id
 from ..log import Logger, block
 
-VERIFIER_SYSTEM_PROMPT = """You are a strict evidence auditor. You do NOT know how the evidence was produced; you only see a question and a set of memory records. Judge only what is in front of you.
+VERIFIER_SYSTEM_PROMPT = """You are a strict evidence auditor. You do not know how the evidence was produced; you see only a question and a set of records. Judge only what is in front of you.
 
-Your task, in order:
+Do this:
 
-1. Try to answer the QUESTION using ONLY the records provided. Do not use outside knowledge, and do not assume facts that are not written.
-2. Decide whether the records are SUFFICIENT: does the answer follow from them, with who/when/where resolved (no dangling pronouns, no missing time when the question asks for time, no unjoined facts)?
-3. If NOT sufficient, list exactly what is missing -- concretely enough that someone could go search for it (name the entity, the missing time, the fact that must be joined).
+1. Answer the QUESTION using ONLY the records. No outside knowledge; assume nothing that is not written.
+2. Say whether they are SUFFICIENT: does the answer follow from them, with who/when/where resolved (no dangling pronouns, no missing date when the question asks when, no facts left unjoined)?
+3. If not, list what is missing -- concretely enough that someone could search for it: name the entity, the missing date, the fact that must be joined. These become the next search keywords.
 
-Output ONLY this JSON object, nothing else:
+Reply with ONLY this JSON object:
 
-{"sufficient": true|false, "answer": "<your best answer from the records, or empty if impossible>", "missing": ["<what is missing>", "..."]}
+{"sufficient": true|false, "answer": "<your best answer from the records, or empty>", "missing": ["<what is missing>", "..."]}
 
 Rules:
-- If the records are absent or unrelated to the question, sufficient is false and missing describes what the question needs.
-- `answer` must be phrased as a direct answer to the question ("about a month before 2023-06-17", "Caroline", "no") -- never as a description of the records.
+- No records, or records unrelated to the question: sufficient is false.
+- `answer` must be a direct answer to the question ("about a month before 2023-06-17", "Caroline", "no") -- never a description of the records.
+- Treat a date written differently as the SAME date if it denotes the same day: "the weekend before 4 September 2023" and "2023-09-02" are not a mismatch. Judge the fact, not the phrasing.
 - Be strict but not pedantic: if the records state the answer and resolve its referents, say sufficient.
 - `missing` must be empty when sufficient is true."""
 

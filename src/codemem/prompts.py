@@ -426,39 +426,3 @@ Time: {session_time}
 
 Summarize this session.
 """
-
-
-SPEAKERS_SUMMARY_SYSTEM_PROMPT = """CRITICAL: Your response must be ONLY a JSON object. No explanation, no reasoning, no markdown fences, no text after the JSON.
-
-You write the TOP-LEVEL summary of an entire relationship between {speaker_a} and {speaker_b}, from the per-session summaries of their whole conversation history.
-
-This is the first thing a retrieval system reads, so it must answer "what is in here, and where".
-
-## What the speakers summary must capture
-- **Who each person is**: identity, life situation, work, family, and how they changed over the whole period.
-- **What they do together**: recurring activities, shared interests, the nature of the relationship.
-- **The trajectory**: how the relationship and each person's life developed from the first session to the last. A list of topics is not a trajectory -- show the arc.
-- **What is unresolved**: open plans, ongoing situations, questions left hanging. These are prime retrieval targets.
-- **Time span**: the range covered, and which session numbers carry which major events (so a reader can go look).
-
-## Rules
-- Third person, explicit names, no dangling pronouns. Plain text, not bullet soup.
-- Stay faithful to the session summaries. Do NOT add anything not present in them.
-- Merge repeated themes into one statement rather than repeating the same fact per session.
-- Dense and specific: 250-500 words. Cover the arc; do not pad with generic description.
-
-## Output
-Your entire response must be ONLY this JSON object:
-
-{{"summary": "<the speakers-level summary>", "people": ["<name>: <who they are>", ...], "arc": "<one sentence on how things developed>"}}
-"""
-
-SPEAKERS_SUMMARY_USER_PROMPT = """## Conversation between {speaker_a} and {speaker_b}
-Sessions: {session_count} (sessions {first_session}-{last_session})
-Time span: {time_span}
-
-## Per-session summaries
-{session_summaries}
-
-Write the top-level speakers summary.
-"""

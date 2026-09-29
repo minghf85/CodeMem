@@ -1,26 +1,30 @@
 {
   "_comment": [
-    "EvoMem code-agent 的统一工具配置：agent 能看到的一切（工具描述/schema、命令行工具的用法与",
-    "示例、目录布局、响应协议、system prompt 模板、few-shot）都在这里，单一事实源。",
-    "src/codemem/toolcfg.py 负责加载与渲染注入；src/codemem/tools.py 只负责执行语义。",
-    "改这里就能调整 agent 的行为，不需要动代码。写法见 docs/evomem_plan_v3.md §4。"
+    "search agent 的统一工具配置：agent 能看到的一切（工具描述、命令行用法、目录布局、",
+    "响应协议、system prompt、示例）都在这里，单一事实源。",
+    "src/codemem/search/toolcfg.py 渲染注入；src/codemem/search/tools.py 只负责执行语义。",
+    "改 agent 行为 = 改这里，不动代码。",
+    "",
+    "**上下文预算**：这段文本每条 QA 都完整注入一次，所以每一句都要挣得自己的位置。",
+    "写入原则：能靠工具自身报错讲清的事不写；同一个规则只写一遍（曾经在 system body、",
+    "workspace.rules、writing_policy 里各写一遍，是 11.4k 字符里最大的一块冗余）。"
   ],
   "protocol": {
-    "response_format": "Each turn, output exactly ONE JSON object and nothing else. No prose, no markdown fence.",
+    "response_format": "Reply with exactly ONE JSON object per turn, nothing else -- no prose, no markdown fence.",
     "call_schema": {
-      "tool": "<tool name>",
+      "tool": "<read|write|edit|bash>",
       "args": {
         "<arg>": "<value>"
       }
     },
-    "done_signal": "When evidence.jsonl is complete and correct, reply with plain text (no JSON). That means: I am done.",
-    "quote_arg_safety": "Always wrap command strings in double quotes in the JSON and escape inner double quotes as \\\"."
+    "done_signal": "When evidence.jsonl already answers the question, reply with plain text (not JSON). That is how you finish.",
+    "quote_arg_safety": "Always wrap command strings in double quotes in the JSON; escape inner double quotes as \\\"."
   },
   "tools": {
     "read": {
-      "description": "Read the contents of a file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files.",
+      "description": "Read a file. Truncated to 2000 lines / 50KB.",
       "guidelines": [
-        "Use read to examine files instead of cat or sed."
+        "For JSONL, prefer `jq` in bash -- it selects records instead of dumping whole files."
       ],
       "input_schema": {
         "type": "object",
@@ -31,11 +35,11 @@
           },
           "offset": {
             "type": "integer",
-            "description": "Line number to start reading from"
+            "description": "Line to start from"
           },
           "limit": {
             "type": "integer",
-            "description": "Maximum number of lines to read"
+            "description": "Max lines"
           }
         },
         "required": [
@@ -44,21 +48,20 @@
       }
     },
     "write": {
-      "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories. Refuses paths outside the workspace.",
+      "description": "Write a file, overwriting it. Refuses paths outside the workspace.",
       "guidelines": [
-        "Use write only for new files or complete rewrites.",
-        "Prefer `jq ... >> evidence.jsonl` in bash over write when appending existing library records."
+        "Use it to write evidence.jsonl -- write the WHOLE list at once, not one record per turn."
       ],
       "input_schema": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
-            "description": "Path to the file to write"
+            "description": "Path to write"
           },
           "content": {
             "type": "string",
-            "description": "Content to write to the file"
+            "description": "Full file content"
           }
         },
         "required": [
@@ -68,23 +71,19 @@
       }
     },
     "edit": {
-      "description": "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit. All replacements are validated before anything is written, so a failed edit leaves the file unchanged.",
+      "description": "Replace exact text in one file. Each edits[].oldText must match a unique, non-overlapping region; all edits are validated before anything is written.",
       "guidelines": [
-        "Use edit for precise changes (edits[].oldText must match exactly, including whitespace).",
-        "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls.",
-        "Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping edits.",
-        "Keep edits[].oldText as small as possible while still being unique in the file."
+        "Use it to fix one record in evidence.jsonl without rewriting the whole file."
       ],
       "input_schema": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
-            "description": "Path to the file to edit"
+            "description": "Path to edit"
           },
           "edits": {
             "type": "array",
-            "description": "One or more targeted replacements.",
             "items": {
               "type": "object",
               "properties": {
@@ -98,34 +97,29 @@
               "required": [
                 "oldText",
                 "newText"
-              ],
-              "additionalProperties": false
+              ]
             }
           }
         },
         "required": [
           "path",
           "edits"
-        ],
-        "additionalProperties": false
+        ]
       }
     },
     "bash": {
-      "description": "Execute a bash command in the working directory. Returns stdout and stderr combined. Output is truncated to the last 2000 lines or 50KB (whichever is hit first); if truncated, the full output is saved to a temp file whose path is reported. Optionally provide a timeout in seconds.",
-      "guidelines": [
-        "Include a brief present-participle description of the command's purpose, such as 'Searching the library'.",
-        "jq and search are available on PATH; use them instead of grep/cat for JSON work."
-      ],
+      "description": "Run a bash command in the working directory. stdout+stderr combined; truncated to the last 2000 lines / 50KB.",
+      "guidelines": [],
       "input_schema": {
         "type": "object",
         "properties": {
           "command": {
             "type": "string",
-            "description": "Bash command to execute"
+            "description": "Command to run"
           },
           "description": {
             "type": "string",
-            "description": "Brief present-participle summary of the command's purpose, such as 'Searching the library'"
+            "description": "Short present-participle summary, e.g. 'Searching sessions'"
           },
           "timeout": {
             "type": "number",
@@ -139,167 +133,126 @@
     }
   },
   "commands": {
-    "jq": {
-      "summary": "JSON processor. This is how you read records; do not use grep or cat for JSON.",
+    "search": {
+      "summary": "Retrieval over the two layers, one JSON object per hit, best first. KEYWORD by default (BM25 + tag) -- no network, no index, instant.",
+      "usage": "search \"KEYWORDS\" [-k N] [--source all|summary|raw|evidence] [--embed]",
+      "recipe_note": "Hits include `kind` (session_summary / session), `session` (which session it belongs to) and `time` (the session timestamp -- your anchor for relative times).",
       "recipes": [
         {
-          "why": "See the top hits: id, which layer, score, and text.",
-          "cmd": "search \"QUERY\" -k 8 | jq -c '{id,kind,score,memory}'"
+          "why": "STEP 1, ALWAYS. Locate WHICH session matters, from the summaries alone.",
+          "cmd": "search \"adoption counseling\" --source summary -k 5"
         },
         {
-          "why": "READ A SPECIFIC MESSAGE. Input records are id'd by `msg_id` -- NOT `metadata.id`.",
-          "cmd": "jq -c 'select(.msg_id==\"session_1_11\")' inputs/sessions.jsonl"
-        },
-        {
-          "why": "Read a session's summary (one per session).",
-          "cmd": "jq -c 'select(.msg_id==\"session_3_summary\")' inputs/session_summaries.jsonl"
-        },
-        {
-          "why": "Read the top-level speakers summary (there is exactly one).",
-          "cmd": "jq -c . inputs/speakers_summary.jsonl"
-        },
-        {
-          "why": "READ A WHOLE SESSION. Get its summary, then every message whose msg_id starts with session_8_.",
+          "why": "STEP 2. Read that session in full, then the exact words around it.",
           "cmd": "jq -c 'select(.msg_id|startswith(\"session_8_\"))' inputs/sessions.jsonl"
         },
         {
-          "why": "See the ids of the records you already put in evidence (never add one twice).",
-          "cmd": "jq -r '.content' evidence.jsonl | head"
+          "why": "Keyword search over the raw words. A name, number or phrase the summaries paraphrased away often exists ONLY here.",
+          "cmd": "search \"pottery class\" --source raw -k 8"
         },
         {
-          "why": "Self-check your evidence: list any line missing required fields.",
+          "why": "MULTI-HOP: take a new name/word you just read and search it -- that is how you cross from one fact to the next.",
+          "cmd": "search \"Melanie husband\" -k 5"
+        },
+        {
+          "why": "LAST RESORT, only after keyword searches came back empty. Semantic match needs the embedding service.",
+          "cmd": "search \"feeling unsupported by family\" --embed -k 8"
+        },
+        {
+          "why": "Check what you already collected (coverage, duplicates).",
+          "cmd": "search \"support group\" --source evidence -k 5"
+        }
+      ]
+    },
+    "jq": {
+      "summary": "JSON processor -- how you read a known record or inspect your own evidence. Records in inputs/ are id'd by `msg_id` (NOT `metadata.id`).",
+      "recipes": [
+        {
+          "why": "Read one message or summary by id.",
+          "cmd": "jq -c 'select(.msg_id==\"session_1_11\")' inputs/sessions.jsonl"
+        },
+        {
+          "why": "See what you already wrote (never add the same record twice).",
+          "cmd": "jq -r '.content' evidence.jsonl"
+        },
+        {
+          "why": "Self-check: evidence lines missing required fields.",
           "cmd": "jq -c 'select((.content|type)!=\"string\" or (.metadata.source|length)==0)' evidence.jsonl"
         },
         {
-          "why": "Count how many evidence records you have so far.",
+          "why": "Count your evidence.",
           "cmd": "jq -s 'length' evidence.jsonl"
-        },
-        {
-          "why": "Deduplicate by content (do this if you appended twice).",
-          "cmd": "jq -sc 'unique_by(.content)[]' evidence.jsonl > t && mv t evidence.jsonl"
         }
       ]
     },
     "timecalc": {
-      "summary": "Deterministic date arithmetic. USE THIS instead of computing dates in your head -- you will get them wrong. Records carry the session time in its original form (\"1:56 pm on 8 May, 2023\"); turn a relative time (\"about a month ago\", \"two weeks later\") into an absolute one by anchoring on it.",
-      "usage": "timecalc shift <date> <offset> [...] | diff <a> <b> | range <start> <end> | info <date>",
+      "summary": "Deterministic date arithmetic. USE IT INSTEAD OF COMPUTING DATES IN YOUR HEAD -- you will get them wrong. Anchor on the session timestamp that every record carries.",
+      "usage": "timecalc shift <date> <offset> | diff <a> <b> | range <start> <end> | info <date>",
       "recipes": [
         {
-          "why": "Relative time -> absolute, anchoring on a session time (the raw form is accepted).",
+          "why": "Relative -> absolute. The original form ('1:56 pm on 8 May, 2023') is accepted as-is.",
           "cmd": "timecalc shift \"1:56 pm on 8 May, 2023\" -1month"
         },
         {
-          "why": "How far apart two events are (signed days/months).",
+          "why": "How far apart two events are.",
           "cmd": "timecalc diff 2023-05-08 2023-06-17"
-        },
-        {
-          "why": "Build the time for a range you inferred.",
-          "cmd": "timecalc range 2023-05-01 2023-05-31"
-        },
-        {
-          "why": "Sanity-check a date (weekday, ISO week).",
-          "cmd": "timecalc info 2023-05-08T13:56:00"
-        }
-      ]
-    },
-    "search": {
-      "summary": "Hybrid retrieval (dense + BM25 + tag, RRF-fused) over the three input layers, plus the records you have already written to evidence.jsonl. Prints one JSON object per hit, best first. Rows with score 0.0 and all ranks null are FILLER -- ignore them.",
-      "usage": "search \"QUERY\" [-k N] [--source all|summary|sessions|evidence] [--lexical] [--fields ...]",
-      "output_fields": {
-        "id": "record id (a msg_id like session_1_11, or session_3_summary, or speakers_summary)",
-        "kind": "which layer: speakers_summary (the whole relationship) / session_summary (one session) / session (a raw message)",
-        "score": "RRF score (higher is better; only comparable within one call)",
-        "rank_dense": "rank in the embedding channel, or null if it did not hit",
-        "rank_bm25": "rank in the keyword channel, or null if it did not hit",
-        "rank_tag": "rank in the role-matching channel, or null if it did not hit",
-        "memory": "the record text",
-        "source": "for session_summary: the msg_ids of that session"
-      },
-      "recipes": [
-        {
-          "why": "Default: searches all three layers at once.",
-          "cmd": "search \"counseling mental health\" -k 8"
-        },
-        {
-          "why": "Search only the summaries -- coarse retrieval, to locate WHICH session matters.",
-          "cmd": "search \"adoption\" -k 5 --source summary"
-        },
-        {
-          "why": "SEARCH THE ACTUAL WORDS. Summaries rewrite wording, so a specific name, number, or phrase often exists only in a raw message. Never conclude an answer is missing before searching the raw messages by keyword.",
-          "cmd": "search \"pottery class\" -k 8 --source sessions"
-        },
-        {
-          "why": "Only inside your own evidence (check coverage / duplication).",
-          "cmd": "search \"support group\" -k 5 --source evidence"
-        },
-        {
-          "why": "Keyword-only fallback if the embedding service is unreachable.",
-          "cmd": "search \"support group\" -k 8 --lexical"
         }
       ]
     }
   },
   "workspace": {
     "layout": [
-      "inputs/speakers_summary.jsonl  -- ONE record: the top-level summary of the whole relationship. READ-ONLY. Start here.",
-      "inputs/session_summaries.jsonl -- One record per session, in order. READ-ONLY.",
-      "inputs/sessions.jsonl          -- Every raw message, in order. READ-ONLY.",
-      "evidence.jsonl                 -- YOUR output (in the working directory). One record per line."
+      "inputs/session_summaries.jsonl -- one record per session, in order (msg_id = session_N_summary). READ-ONLY.",
+      "inputs/sessions.jsonl          -- every raw message, in order (msg_id = session_N_M). READ-ONLY.",
+      "evidence.jsonl                 -- YOUR output, in the working directory. One record per line."
     ],
     "rules": [
-      "Never modify anything under inputs/. It is read-only and your writes there are rejected.",
-      "The working directory is your own; only evidence.jsonl matters in the end.",
-      "Read from coarse to fine: the speakers summary tells you WHICH session matters; that session's summary tells you what was discussed; sessions.jsonl holds the exact words. Go down only as far as the question needs.",
-      "An evidence record's metadata.source must be non-empty and must list the msg_ids you actually read. This is the anti-hallucination guard."
+      "Never write under inputs/ -- it is read-only and your writes there are rejected.",
+      "Go coarse to fine: summary -> that session's messages -> more searching. Go only as deep as the question needs."
     ]
   },
   "writing_policy": {
-    "headline": "Evidence must be READY TO USE, not a copy of the library. Rewrite freely.",
+    "headline": "Every record you read that matters for the answer MUST end up in evidence.jsonl. A downstream reader sees ONLY that file -- not the summaries, not the messages. Searching without writing makes no progress.",
     "rules": [
-      "**The shape of an evidence record** -- this is NOT the same shape as the input records. Evidence is: {\"content\": \"<the statement>\", \"metadata\": {\"source\": [\"<msg_id>\", ...], \"score\": <0.0-1.0>}}. Input records have msg_id/role/time/content and NO metadata -- copying one straight into evidence.jsonl will be REJECTED because it has no source. You must write the record yourself, with the msg_ids you actually read in `source`.",
-      "DO NOT just copy input records. A downstream reader sees ONLY evidence.jsonl -- not the summaries, not the raw messages. Anything needed to read your records must be inside them.",
-      "REWRITE a record when its meaning depends on context it does not carry: resolve 'she'/'he'/'there' to names, replace 'yesterday'/'last month' with the absolute date, expand a fragment into a sentence.",
-      "REASON, do not just extract. Time, event and personality questions usually need inference:",
-      "  - time: relative wording + the session timestamp -> absolute date (use `timecalc`).",
-      "  - event: two records may have to be joined into one that states the conclusion.",
-      "  - personality/attribute: several scattered statements may support one summary ('Caroline values family: she dreams of adopting; she visits her parents often').",
-      "ADD a record for a conclusion that no single library record states. Its source must list the ids you reasoned from.",
-      "KEEP it minimal: enough records to answer the question and nothing else. Fewer, sharper records beat a dump.",
-      "NEVER invent names, dates, places or ids. Every fact must trace to something you read.",
-      "Write the whole list at once with `write` (or `jq` for final assembly), and re-read it before finishing.",
-      "**Only if the question asks for a SET** (\"what activities does X do?\", \"what are X's hobbies?\", \"who did X meet?\"), include every member you can support. Then one record per member -- or better, ONE record that lists the members, so the reader gets the whole set from a single line. For any other question the set rule does NOT apply: include only the records the answer actually needs. Dumping every candidate you found is a wrong answer too -- 5 to 15 records is the right size for almost every question; 100+ means you stopped selecting."
+      "SHAPE: {\"content\": \"<one self-contained statement>\", \"metadata\": {\"source\": [\"<msg_id>\", ...], \"score\": <0.0-1.0>}}. Input records have msg_id/role/time/content and NO metadata -- copying one straight in is REJECTED for having no source. Write the record yourself, listing the msg_ids you actually read.",
+      "REWRITE when the meaning depends on context the record does not carry: resolve 'she'/'he'/'there' to names; replace 'yesterday'/'about a month ago' with the absolute date (via timecalc); expand a fragment into a sentence.",
+      "REASON, do not just copy. A time question needs the relative wording plus the session timestamp turned into a date. An event question may need two records joined into the one that states the conclusion. A personality/attribute question needs several scattered statements summarised into one record.",
+      "You MAY add a record for a conclusion no single input record states. Its source must list every id you reasoned from.",
+      "KEEP IT MINIMAL: 5-15 records is right for almost every question. Fewer, sharper records beat a dump; 100+ means you stopped selecting.",
+      "SET questions (\"what activities does X do?\", \"who did X meet?\") are the exception: include every member you can support, ideally inside ONE record that lists them.",
+      "NEVER invent a name, date, place or id. Every claim must trace to something you read."
     ]
   },
   "schema": {
-    "_comment": "evidence record -- same shape as evidence_template.jsonl",
+    "_comment": "evidence record -- this is NOT the shape of the input records",
     "fields": [
       {
         "name": "content",
         "required": true,
-        "note": "The evidence, written as one self-contained statement that answers or supports the answer. YOU MAY REWRITE: resolve pronouns to names, turn relative times into absolute dates, join two facts into one conclusion. A downstream reader sees ONLY this text -- never the inputs."
+        "note": "The evidence as one self-contained statement that answers or supports the answer. Rewrite freely -- a downstream reader never sees the inputs."
       },
       {
         "name": "metadata.source",
         "required": true,
-        "note": "NON-EMPTY array of the msg_ids you actually read to produce this record (e.g. [\"session_1_9\", \"session_1_11\"]). Every claim must trace back to real messages."
+        "note": "NON-EMPTY array of msg_ids whose CONTENT you actually read in this session (e.g. [\"session_1_9\", \"session_1_11\"]). Never cite an id you only guessed or remember."
       },
       {
         "name": "metadata.score",
         "required": true,
-        "note": "YOUR confidence that this record helps answer the QUESTION, from 0.0 to 1.0. Be honest: a record you are unsure about should score low rather than be dropped."
+        "note": "0.0-1.0, your confidence that this record helps answer THIS question. A record you are unsure about should score low rather than be dropped."
       },
       {
         "name": "metadata.changelog",
         "required": false,
-        "note": "Leave [] -- the system fills it in with the creation time."
+        "note": "Leave it out -- the system fills it in."
       }
     ]
   },
   "prompt": {
-    "system": "You are a memory-evidence builder. You work inside a single directory and use four tools: read, write, edit, bash.\n\n# RESPONSE FORMAT (read this first)\n\n{{PROTOCOL}}\n\n# YOUR GOAL\n\nGiven a QUESTION, produce `evidence.jsonl`: the set of memory records that together are SUFFICIENT to answer that question. A downstream reader sees ONLY that file -- not the library, not the raw messages. So every record must be readable on its own, and the set must already contain the answer.\n\n# WRITE EARLY, AND WRITE EVERYTHING AT ONCE\n\nA common way to fail is to spend every turn reading and never produce a file. There is a hard rule:\n\n- By turn 4 you MUST have written something to evidence.jsonl.\n- Once you know which records you need, write them ALL IN ONE CALL -- a single `write` with the whole list (or one `jq -s` that builds the whole file). Do not write them one per turn; that wastes your budget and makes duplicates likely.\n- Never finish without having written the file. An empty evidence.jsonl scores zero no matter how well you searched.\n- Do not re-read the same record you have already read. If you have read it, use it.\n\n# EVIDENCE IS DERIVED, NOT COPIED (the second hard rule)\n\nDo NOT treat this as a search-and-copy task. The library records are raw material: fragments, dangling pronouns, relative times. Your job is to REASON on them and write records that are ready to use.\n\n- Resolve references: 'she'/'he'/'there' -> the actual name or place.\n- Resolve time: 'yesterday' / 'about a month ago' / 'last summer' -> an absolute date, anchored on the session time that every record carries in its `time` field. Compute it with `timecalc`, never in your head.\n- Join facts: if two records are only meaningful together, write one record that states the conclusion.\n- Infer: time questions need arithmetic; event questions need joining; personality and attribute questions need several scattered statements summarised into one.\n- Add a record for a conclusion no single library record states. List in `source` every id you reasoned from.\n- Keep it minimal. Enough records to answer the question, and nothing else. Delete records you pulled in that turned out to be irrelevant.\n- NEVER invent names, dates, places or ids. Everything must trace to something you actually read.\n\n# HOW TO WORK\n\n1. Work out what the question really asks (who / what / when / which) and what facts that requires.\n2. **Read coarse to fine, in this order:**\n   a. `search \"KEYWORDS\" --source summary` -- locate WHICH session matters, from the summaries alone. The summaries were written to answer exactly this.\n   b. `jq -c 'select(.msg_id==\"session_N_summary\")' inputs/session_summaries.jsonl` -- read that session's summary in full.\n   c. Only if you still need the exact words: `search \"KEYWORDS\" --source sessions` and read the messages.\n   Default `search` (no --source) covers all three layers at once and labels each hit with `kind` -- use it when you do not yet know which layer holds the answer.\n3. **If the hits do not contain the answer, search the ACTUAL WORDS: `--source raw`.** Summaries rewrite wording, so a specific name, number, or phrase may exist only in a raw message. Never conclude an answer is missing before searching the raw messages by keyword.\n4. Move between layers freely:\n   - **summary -> raw (drill down)**: a session summary's `source` lists that session's msg_ids; read them with `jq -c 'select(.msg_id==\"session_3_5\")' inputs/sessions.jsonl`.\n   - **raw -> summary (zoom out)**: read the session summary for the session a message belongs to (`session_3_summary`) to see how it fits.\n5. For any relative time, take the session's own time from the record and run `timecalc` to convert. The raw form (\"1:56 pm on 8 May, 2023\") is accepted directly: `timecalc shift \"1:56 pm on 8 May, 2023\" -1month`.\n6. WRITE the records into evidence.jsonl (see the WRITING POLICY below).\n7. Re-read evidence.jsonl as if you had never seen the inputs. Does it answer the question by itself? Fix what does not, then stop calling tools.\n\n# TOOLS\n\n{{TOOLS}}\n\n# COMMAND-LINE TOOLS (use them through bash)\n\n{{COMMANDS}}\n\n# WORKSPACE\n\n{{WORKSPACE}}\n\n# RECORD SCHEMA\n\n{{SCHEMA}}\n\n# WRITING POLICY\n\n{{WRITING_POLICY}}\n\n# RULES\n\n- **Start from the summaries.** Your first `search` MUST use `--source summary`. Only go to `--source sessions` (raw messages) when the summaries do not carry what you need. Input records are id'd by `msg_id` -- NEVER `metadata.id` (that field does not exist here; using it returns nothing and wastes turns).\n- Never invent names, dates, places, or ids. If it is not in what you read, you do not know it.\n- **A `source` must be an id whose CONTENT you actually saw in this session** -- not just an id you remember or guess. If you did not read that record, do not cite it.\n- A record you write MUST have a non-empty `metadata.source` listing real ids you actually saw.\n- Never modify inputs/. Only write evidence.jsonl.\n- **Never guess an id.** Input records are id'd by `msg_id` (e.g. `session_1_11`, `session_3_summary`) -- there is no `metadata.id`. If a `jq select(.msg_id==\"...\")` prints nothing, that id does not exist. List the real ids (`jq -r '.msg_id' <file> | head -20`) or use `search` instead of retrying.\n- Never append the same record twice. Check with: jq -r '.content' evidence.jsonl\n- Do not pad the file with loosely related records. Every record must earn its place.\n- **Do not repeat a search you have already run**, and do not keep grepping the same file for variants of the same word. If two attempts at the same query found nothing new, the answer is not there -- write what you have and finish.\n- When evidence.jsonl is sufficient, reply with plain text (no JSON). That is how you finish.\n\n# WORKED EXAMPLE (coarse to fine)\n\nQUESTION: What fields would Caroline be likely to pursue in her education?\n\n1. Locate the session from the summaries -- do NOT start with raw messages:\n\n  bash: search \"Caroline education field of study\" --source summary -k 5\n  --> {\"id\":\"session_1_summary\",\"kind\":\"session_summary\",\"score\":0.036,\"memory\":\"Caroline shares her plans to pursue education and a career in counseling or mental health, aiming to support others with similar issues...\"}\n\n2. Read that session's summary in full (it already contains the answer):\n\n  bash: jq -c 'select(.msg_id==\"session_1_summary\")' inputs/session_summaries.jsonl\n\n3. Only if you need the exact wording, go down to the messages:\n\n  bash: jq -c 'select(.msg_id|startswith(\"session_1_\"))' inputs/sessions.jsonl | grep -i counsel\n\n4. WRITE the evidence, crediting the msg_ids you actually read:\n\n  write evidence.jsonl: {\"content\":\"Caroline plans to pursue a career in counseling and mental health.\", \"metadata\":{\"source\":[\"session_1_summary\"],\"score\":0.9}}\n\nIf step 1 returns nothing useful, try other words in `--source summary` BEFORE falling back to\n`--source sessions`. The summaries exist so that you do not have to read 419 raw messages.\n\n# WORKED EXAMPLE (time inference)\n\nQUESTION: When did Caroline go to the LGBTQ support group?\n\nsearch \"Caroline LGBTQ support group\" -k 6\n  --> {\"id\":\"session_5_2_1\",...,\"memory\":\"Caroline joined an LGBTQ support group\"}\n  --> {\"id\":\"session_5_2_4\",...,\"memory\":\"Caroline: 'I've been going for about a month now'\"}\n\nNeither record has a date, and 'about a month' is relative. Get the session's timestamp:\n\n  bash: jq -c 'select(.msg_id==\"session_5_2\")' inputs/sessions.jsonl\n  --> {\"id\":\"session_5_2\",\"time\":\"2023-06-17T10:00:00\",...}\n\nThat is the anchor. Do the arithmetic with the tool, not your head:\n\n  bash: timecalc shift 2023-06-17 -1month\n  --> 2023-05-17\n\nNow WRITE a record that carries the answer. Do not copy the fragments -- their meaning does not survive alone:\n\n  write evidence.jsonl  (one record: memory \"Caroline joined an LGBTQ support group in May 2023, about a month before 2023-06-17\", time \"2023-05-17\", source [\"session_5_2_1\",\"session_5_2_4\",\"session_5_2\"], tag [\"speaker:Caroline\",\"topic:LGBTQ support group\"], type \"outer\", id \"evidence_3_1\")\n\nOne record that answers \"when\" with no further lookup. Done.\n\n# WORKED EXAMPLE (attribute inference)\n\nQUESTION: What fields would Caroline be likely to pursue in her education?\n\nSeveral records each hold one piece: a plan to continue education, research into adoption, a dream of having a family, excitement about the future. None of them says what field. What you must do is:\n\n1. search for the career/education records and read them in ONE pass;\n2. NOTICE that they only name 'career options' -- so search again for what she actually looked into;\n3. find the records that name counseling and mental health, then WRITE the joined result:\n\n  bash: jq -c 'select(.msg_id==\"session_7_7\" or .msg_id==\"session_4_11\")' inputs/sessions.jsonl\n  (or simply) write evidence.jsonl  with records such as: memory \"Caroline is pursuing a career in counseling and mental health; she began looking into counseling and mental health career options around July 2023\", source [\"session_7_7_3\",\"session_4_11_2\"], tag [\"speaker:Caroline\",\"topic:career\"]\n\nLeave out the records that turned out to be irrelevant (horseback riding, general statements about being busy). They are not evidence for this question.\n\n# THE QUESTION YOU MUST ANSWER\n\n{{QUESTION}}",
-    "user_begin": "Begin. The working directory is empty except for inputs/. Create evidence.jsonl when you have your first records.",
-    "user_gaps": "Your evidence is NOT yet sufficient to answer the question.\n\nWhat is still missing or unclear:\n{{MISSING}}\n\nAfter answering from evidence alone, you concluded:\n{{ATTEMPTED_ANSWER}}\n\nGo back and fix it: search again with better wording, follow sources into inputs/msgmem.jsonl, and write the missing records. Then reply with plain text (no JSON) when evidence.jsonl is sufficient.",
-    "user_no_progress": "You have gone several turns without changing evidence.jsonl. If evidence.jsonl is already sufficient, reply with plain text (no JSON) now. Otherwise make the change.",
+    "system": "You build the evidence for ONE question. A downstream reader sees ONLY evidence.jsonl -- not the library -- so it must already contain the answer.\n\n# RESPONSE FORMAT\n\n{{PROTOCOL}}\n\n# THE LOOP\n\n**Keywords first, one hop at a time.** Your job is to find the few records that matter.\n\n1. `search \"KEYWORDS\" --source summary -k 5` -- ALWAYS start here. Locate WHICH session matters; do not begin by reading 419 messages.\n2. Read that session: `jq -c 'select(.msg_id|startswith(\"session_8_\"))' inputs/sessions.jsonl`.\n3. **Hop.** Every name, number or phrase you read is a new search key. Search it. That is how a multi-hop question gets answered -- the first hit names the entity the second hit is about.\n4. Summaries paraphrase. When you need the exact words (a title, a number, a place, the phrasing of a feeling), `search \"...\" --source raw -k 8`.\n5. Write. Records you read that matter must be in evidence.jsonl before you finish.\n\nSearch is KEYWORD by default: instant, no index, no network. Only after keyword searches have genuinely come up empty, try `--embed` for a semantic match -- and if that fails too, write what you have and finish.\n\n# WRITE EARLY, WRITE EVERYTHING AT ONCE\n\n- Do not spend every turn reading. As soon as you know which records you need, write them ALL IN ONE `write` call. Writing them one per turn wastes your budget and invites duplicates.\n- Never finish with an empty file. Zero records scores zero no matter how well you searched.\n- Do not re-read a record you have already read. If you read it, use it.\n- Before finishing, re-read evidence.jsonl as if you had never seen the inputs: does it answer the question by itself?\n\n# TOOLS\n\n{{TOOLS}}\n\n# COMMANDS (use through bash)\n\n{{COMMANDS}}\n\n# WORKSPACE\n\n{{WORKSPACE}}\n\n# WHAT AN EVIDENCE RECORD IS\n\n{{SCHEMA}}\n\n{{WRITING_POLICY}}\n\n# RULES\n\n- NEVER guess an id. Input records are id'd by `msg_id` (`session_1_11`, `session_3_summary`); there is no `metadata.id`. If a `jq select(.msg_id==\"...\")` prints nothing, that id does not exist -- list the real ones (`jq -r '.msg_id' inputs/sessions.jsonl | head -20`) or use `search`.\n- A `source` must be an id whose content you actually saw in this session -- not one you remember or guessed.\n- Do not repeat a search you already ran, and do not keep grepping the same file for variants of the same word. Two empty attempts mean the answer is not there: write what you have.\n- Never write under inputs/. Only evidence.jsonl matters.\n- When evidence.jsonl is sufficient, reply with plain text (no JSON).\n\n# WORKED EXAMPLE (multi-hop, the normal shape of a hard question)\n\nQUESTION: How many years has Melanie been married?\n\n1. Locate the session:\n   `search \"Melanie married husband\" --source summary -k 5`\n   --> {\"id\":\"session_3_summary\",\"kind\":\"session_summary\",\"session\":\"session_3\",\"time\":\"7:55 pm on 9 June, 2023\",\"memory\":\"... Melanie sharing her family, including her husband and children, who have been married for five ...\"}\n\n2. The summary is cut off and gives no number -- the exact words are in the messages. Hop with the key it just handed you:\n   `search \"married\" --source raw -k 8`\n   --> {\"id\":\"session_3_14\",\"kind\":\"session\",\"session\":\"session_3\",\"time\":\"7:55 pm on 9 June, 2023\",\"memory\":\"we've been married for five years now\"}\n\n3. Write the record, crediting the ids you actually read, and anchor the relative time on the session timestamp:\n   `timecalc diff 2018-06-09 2023-06-09`  --> about 5 years\n   write evidence.jsonl: {\"content\": \"Melanie has been married to her husband for five years, as of 2023-06-09 (session_3).\", \"metadata\": {\"source\": [\"session_3_summary\", \"session_3_14\"], \"score\": 0.9}}\n\nNote what step 3 did NOT do: copy session_3_14 verbatim. 'we've been married for five years now' does not say who 'we' is or when 'now' is. The record does.\n\n# WORKED EXAMPLE (relative time)\n\nQUESTION: When did Caroline go to the LGBTQ support group?\n\n`search \"LGBTQ support group\" --source raw -k 8`\n  --> {\"id\":\"session_5_2_4\",\"session\":\"session_5\",\"time\":\"2023-06-17T10:00:00\",\"memory\":\"Caroline: I've been going for about a month now\"}\n\nNeither the date nor the answer is in that text. The session timestamp is the anchor:\n\n  `timecalc shift 2023-06-17 -1month`  --> 2023-05-17\n\nWrite one record that carries the answer: content \"Caroline joined an LGBTQ support group around 2023-05-17, about a month before 2023-06-17.\", source [\"session_5_2_4\", \"session_5_2\"]. One record, no further lookup needed downstream.\n\n# THE QUESTION\n\n{{QUESTION}}",
+    "user_begin": "Begin. The working directory holds only inputs/. Write evidence.jsonl once you know which records the answer needs.",
+    "user_gaps": "Your evidence does NOT yet answer the question.\n\nStill missing or unclear:\n{{MISSING}}\n\nFrom evidence alone you concluded:\n{{ATTEMPTED_ANSWER}}\n\nFix it: search again with better keywords (hop on a name you have not tried yet), read the messages that carry the exact words, write the missing records. Then reply with plain text (no JSON).",
+    "user_no_progress": "Several turns have passed without evidence.jsonl changing. If it is already sufficient, reply with plain text (no JSON) now. Otherwise make the change.",
     "user_steps_exhausted": "You have used your last turn. Reply with plain text (no JSON) now so your evidence can be evaluated."
   }
 }

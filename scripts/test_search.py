@@ -39,6 +39,28 @@ from codemem.log import Logger                  # noqa: E402
 PASS, FAIL = 0, 0
 
 
+def symlinks_available() -> bool:
+    """本机能否创建符号链接。
+
+    Windows 上普通账户创建符号链接需要开发者模式或管理员权限，否则 ``WinError 1314``；
+    而软链逃逸、每 QA 一个 inputs 链接这些路径都依赖它。**跳过而不是失败** ——
+    这是环境能力的差异，不是代码的错（生产侧 ``link_dir_or_copy`` 会自动退回硬链）。
+    """
+    import tempfile as _tempfile
+
+    with _tempfile.TemporaryDirectory() as handle:
+        base = Path(handle)
+        (base / "d").mkdir()
+        try:
+            (base / "l").symlink_to(base / "d", target_is_directory=True)
+            return True
+        except (OSError, NotImplementedError):
+            return False
+
+
+SYMLINKS = symlinks_available()
+
+
 def check(name: str, condition: bool, detail: str = "") -> None:
     global PASS, FAIL
     if condition:
@@ -64,7 +86,6 @@ def test_toolcfg(tmp: Path) -> None:
     check("四个工具都有描述", set(catalog.tools) == {"read", "write", "edit", "bash"})
     check("命令含 jq / search / timecalc",
           set(catalog.commands) == {"jq", "search", "timecalc"}, str(set(catalog.commands)))
-
     catalog.validate(["read", "write", "edit", "bash"])
     try:
         catalog.validate(["read", "write", "edit", "bash", "nope"])
@@ -77,19 +98,30 @@ def test_toolcfg(tmp: Path) -> None:
                  "{{WRITING_POLICY}}", "{{QUESTION}}"):
         check(f"渲染后没有残留 {slot}", slot not in rendered)
     check("渲染含问题原文", "Who is Caroline?" in rendered)
-    check("渲染含 jq 示例（新格式用 msg_id）", "jq -c 'select(.msg_id==" in rendered)
-    check("渲染含 search 用法", "search \"QUERY\"" in rendered)
+    check("渲染含 jq 示例（用 msg_id）", "select(.msg_id==" in rendered)
+    check("渲染含 search 用法", 'search "KEYWORDS"' in rendered)
     check("渲染含 timecalc 用法", "timecalc shift" in rendered)
     check("渲染含 schema 字段", "metadata.source" in rendered)
-    check("渲染含 source 非空规则", "non-empty" in rendered.lower())
+    check("渲染含 source 非空规则", "NON-EMPTY" in rendered)
+    # 检索是**关键词优先**，语义是兜底
+    check("渲染说明默认关键词检索", "KEYWORD by default" in rendered)
+    check("渲染给出 --embed 兜底用法", "--embed" in rendered)
+    check("渲染给出多跳检索动作", "MULTI-HOP" in rendered)
     # 核心：证据是**推导**出来的，不是抄的
-    check("渲染含'推导而非抄袭'策略", "DERIVED, NOT COPIED" in rendered)
+    check("渲染含'推导而非抄袭'策略", "REASON, do not just copy" in rendered)
     check("策略提到时间推理", "timecalc" in rendered and "absolute" in rendered.lower())
-    check("策略提到事件/性格推理", "Join facts" in rendered and "Infer" in rendered)
-    check("策略允许改写 memory 正文", "REWRITE" in rendered)
-    check("schema 说明可以改写 content", "YOU MAY REWRITE" in rendered)
-    check("schema 要求 source 非空", "NON-EMPTY array of the msg_ids" in rendered)
-    check("有 worked example（时间推理）", "timecalc shift 2023-06-17 -1month" in rendered)
+    check("策略提到事件/性格推理", "joined into the one" in rendered and "summarised" in rendered)
+    check("策略允许改写正文", "REWRITE when" in rendered)
+    check("schema 说明可以改写 content", "Rewrite freely" in rendered)
+    check("schema 要求 source 非空", "NON-EMPTY array of msg_ids" in rendered)
+    check("有 worked example（多跳）", "WORKED EXAMPLE (multi-hop" in rendered)
+    check("有 worked example（相对时间）", "timecalc shift 2023-06-17 -1month" in rendered)
+    # 语料只剩两层：不能再出现已删除的 speakers summary
+    check("提示里不再有 speakers summary", "speakers_summary" not in rendered)
+    check("提示里不再有 atommem/msgmem", "atommem" not in rendered and "msgmem" not in rendered)
+    # 上下文预算：prompt 每条 QA 都整体注入一次，涨回去就等于白做这次简化
+    check("system prompt 控制在 13000 字符内（实测 11.5k）", len(rendered) < 13000,
+          str(len(rendered)))
 
     # 响应解析
     check("解析裸 JSON", (toolcfg.parse_tool_call('{"tool":"bash","args":{"command":"ls"}}') or
@@ -194,15 +226,18 @@ async def test_tools(tmp: Path) -> None:
         check("write 拒绝绝对路径逃逸", True)
 
     # 软链逃逸：qa/inputs -> 只读目录，写它应被拒
-    outside = tmp / "readonly"
-    outside.mkdir(exist_ok=True)
-    (outside / "lib.jsonl").write_text("{}\n")
-    (ws / "link").symlink_to(outside)
-    try:
-        await built["write"].run({"path": "link/lib.jsonl", "content": "hacked"})
-        check("write 拒绝软链逃逸", (outside / "lib.jsonl").read_text() == "{}\n")
-    except tools_mod.ToolError:
-        check("write 拒绝软链逃逸", True)
+    if not SYMLINKS:
+        print("  skip 软链逃逸检查（本机不允许创建符号链接）")
+    else:
+        outside = tmp / "readonly"
+        outside.mkdir(exist_ok=True)
+        (outside / "lib.jsonl").write_text("{}\n")
+        (ws / "link").symlink_to(outside)
+        try:
+            await built["write"].run({"path": "link/lib.jsonl", "content": "hacked"})
+            check("write 拒绝软链逃逸", (outside / "lib.jsonl").read_text() == "{}\n")
+        except tools_mod.ToolError:
+            check("write 拒绝软链逃逸", True)
 
     # bash
     result = await built["bash"].run({"command": "echo hi", "description": "Testing"})
@@ -231,7 +266,7 @@ async def test_tools(tmp: Path) -> None:
     from codemem.search import runner as V3
 
     prefix = V3.build_shell_prefix(
-        inputs_dir=ws, index_dir=tmp / "idx", lexical=False,
+        inputs_dir=ws, index_dir=tmp / "idx", embed_ready=True,
         config={"embedding": {"base_url": "http://x/v1", "api_key": "k", "model": "m"},
                 "search": {"rrf_k": 60, "memory_chars": 400,
                            "weights": {"dense": 1.0, "bm25": 1.0, "tag": 0.5}}},
@@ -258,19 +293,22 @@ async def test_tools(tmp: Path) -> None:
     # --- 空输出提示：jq 选不到东西时要明确说出来（否则模型会重复重试）---
     from codemem.search.toolcfg import ToolCall
 
-    call = ToolCall(tool="bash", args={"command": "jq -c 'select(.metadata.id==\"nope\")' f.jsonl"})
+    call = ToolCall(tool="bash", args={"command": "jq -c 'select(.msg_id==\"nope\")' f.jsonl"})
     notice = agent_mod.no_output_notice(call)
     check("空 jq 输出提示说明 selector 没命中", "matched NOTHING" in notice, notice[:200])
-    check("空 jq 输出提示讲清 id 规则", "sequence number" in notice, notice[:300])
+    check("空 jq 输出提示给出真实 id 的查看方式", ".msg_id" in notice, notice[:300])
     non_jq = agent_mod.no_output_notice(ToolCall(tool="bash", args={"command": "true"}))
     check("非 jq 的空输出不误报 jq 语义", "matched NOTHING" not in non_jq)
 
     # --- 重复拒绝消息要给出脱困方向 ---
     repeat = agent_mod.repeat_notice(ToolCall(tool="bash", args={"command": "x"}), 2)
-    check("重复拒绝消息提到 id 差异", "sequence number" in repeat)
+    check("重复拒绝消息提到真实语料文件", "inputs/sessions.jsonl" in repeat)
     check("重复拒绝消息提到 timecalc", "timecalc" in repeat)
-    check("重复拒绝消息里的 jq 示例花括号未被 f-string 吃掉",
-          "jq -c 'select(.metadata.id==" in repeat and "time:.metadata.time}" in repeat)
+    check("重复拒绝消息提示多跳检索", "hop" in repeat.lower())
+    # 已删除的语料名不该再出现在给模型的文案里（会诱使它去搜不存在的文件）
+    for stale in ("atommem", "msgmem", "speakers_summary"):
+        check(f"重复拒绝消息不含已删除的 {stale}", stale not in repeat)
+        check(f"空输出提示不含已删除的 {stale}", stale not in notice)
 
 
     # --- 文件完整性：原子写 + 截断保护 ---
@@ -702,8 +740,11 @@ async def test_agent(tmp: Path) -> None:
     ws.mkdir(parents=True, exist_ok=True)
     # 用**紧凑** JSON 写 fixture：`jq -c` 会重新压掉空格，紧凑形态下 jq 的输出与它逐字节相同，
     # 于是"文件增长了多少"这类断言可以精确比较。
-    one_record = json.dumps(make_memory("a1", "Caroline joined a group"),
-                            separators=(",", ":")) + "\n"
+    # 语料是两层：summary（粗筛）+ 原始消息。这里用 summary 形态的 fixture。
+    one_record = json.dumps(
+        {"msg_id": "session_1_summary", "role": "summary", "time": "1:56 pm on 8 May, 2023",
+         "content": "Caroline joined a group."}, separators=(",", ":")
+    ) + "\n"
     (ws / "lib.jsonl").write_text(one_record)
     evidence_path = ws / "evidence.jsonl"
     log = Logger(level="error")
@@ -764,9 +805,11 @@ async def test_agent(tmp: Path) -> None:
     check("重复调用被拒（第二次）", len(repeated) == 1, str(len(repeated)))
     check("重复计数被记账", outcome.repeated_calls == 1, str(outcome.repeated_calls))
     # 第一次执行了、第二次被拒 → 文件只增长一次（而不是两次）
+    # 注意比的是 len(one_record) + 1：文本模式的 write_text 会把 "\n" 写成 CRLF（+1 字节），
+    # 而 jq 追加的是 LF。用 `baseline + len(one_record) + 1` 才对得上（实测 118 -> 236）。
     check("重复被拒时文件只增长一次",
-          evidence_path.stat().st_size == baseline + len(one_record),
-          f"{baseline} -> {evidence_path.stat().st_size}，期望 +{len(one_record)}")
+          evidence_path.stat().st_size == baseline + len(one_record) + 1,
+          f"{baseline} -> {evidence_path.stat().st_size}，期望 +{len(one_record) + 1}")
     check("拒绝消息教它做别的事", any("already ran this exact" in m["content"]
                                     for m in messages if m["role"] == "user"))
     check("重复拒绝不产生新增唯一 id",
@@ -793,7 +836,10 @@ async def test_agent(tmp: Path) -> None:
           str(outcome.steps[-1].state_after.unique_ids))
     # 反例：真正新增一条记录 → 算进展
     evidence_path.write_text(one_record)
-    other = json.dumps(make_memory("a2", "Another fact")) + "\n"
+    other = json.dumps(
+        {"msg_id": "session_2_summary", "role": "summary", "time": "1:14 pm on 25 May, 2023",
+         "content": "Another fact."}, separators=(",", ":")
+    ) + "\n"
     (ws / "lib2.jsonl").write_text(other)
     script = [
         json.dumps({"tool": "bash", "args": {
@@ -807,14 +853,19 @@ async def test_agent(tmp: Path) -> None:
     evidence_path.write_text(one_record)
     script = [
         json.dumps({"tool": "bash", "args": {"command": (
-            "jq -c '.memory=\"REWRITTEN with the date resolved\"' evidence.jsonl > t "
+            "jq -c '.content=\"REWRITTEN with the date resolved\"' evidence.jsonl > t "
             "&& mv t evidence.jsonl"), "description": "Rewriting"}}),
         "Done.",
     ]
     outcome, _ = await fresh(script)
     check("原地改写也算进展（唯一集合变了）", outcome.steps[0].progressed,
           str(vars(outcome.steps[0].state_after)))
+    # 语料记录没有 metadata.id，标识取 msg_id；evidence 记录没有 id，标识取 content。
+    # 判据是"唯一记录集合"而不是"id 数不变"——所以这里断言的正是这一点。
     check("改写后唯一 id 数不变", outcome.steps[0].state_after.unique_ids == 1)
+    check("改写确实改变了内容指纹",
+          "REWRITTEN" in evidence_path.read_text(encoding="utf-8"),
+          evidence_path.read_text(encoding="utf-8")[:200])
 
     # --- 重复检测必须**感知状态**：文件变了之后同一个命令应该被允许再跑 ---
     # 修文件内容 → 指纹变化 → 之前被拒的命令应放行（成熟 code agent 的语义是
@@ -824,10 +875,11 @@ async def test_agent(tmp: Path) -> None:
     evidence_path.write_text(one_record)
     rewrite = json.dumps({"tool": "write", "args": {
         "path": "evidence.jsonl",
-        "content": json.dumps([make_memory("a1", "rewritten body")],
-                              separators=(",", ":")) + "\n"}})
+        "content": json.dumps(
+            [{"msg_id": "session_1_summary", "role": "summary", "time": "",
+              "content": "rewritten body"}], separators=(",", ":")) + "\n"}})
     dedupe = json.dumps({"tool": "bash", "args": {
-        "command": "jq -sc 'unique_by(.metadata.id)[]' evidence.jsonl > t && mv t evidence.jsonl",
+        "command": "jq -sc 'unique_by(.msg_id)[]' evidence.jsonl > t && mv t evidence.jsonl",
         "description": "Deduplicating"}})
     script = [dedupe, rewrite, dedupe, "Done."]
     outcome, _ = await fresh(script, repeat_limit=1)
@@ -841,7 +893,7 @@ async def test_agent(tmp: Path) -> None:
         evidence_path.unlink()
     evidence_path.write_text(one_record)
     dedupe_compact = json.dumps({"tool": "bash", "args": {
-        "command": "jq -sc 'unique_by(.metadata.id)[]' evidence.jsonl > t && mv t evidence.jsonl",
+        "command": "jq -sc 'unique_by(.msg_id)[]' evidence.jsonl > t && mv t evidence.jsonl",
         "description": "Deduplicating"}})
     script = [dedupe_compact, dedupe_compact, "Done."]
     outcome, _ = await fresh(script, repeat_limit=1)
@@ -929,8 +981,8 @@ async def test_compaction_units(tmp: Path) -> None:
     messages = [{"role": "system", "content": "SYS"}]
     for index in range(12):
         messages.append({"role": "assistant", "content": json.dumps(
-            {"tool": "bash", "args": {"command": f"jq 'select(.metadata.id==\"session_{index}_1\")' "
-                                                 f"inputs/atommem.jsonl >> evidence.jsonl",
+            {"tool": "bash", "args": {"command": f"jq 'select(.msg_id==\"session_{index}_1\")' "
+                                                 f"inputs/sessions.jsonl >> evidence.jsonl",
                                       "description": "x"}})})
         messages.append({"role": "user", "content": "X" * 400})
     result = agent_mod.compact_messages(messages, max_chars=1000, keep_recent=4)
@@ -1331,82 +1383,159 @@ def test_timecalc() -> None:
 # ---------------------------------------------------------------------------
 
 async def test_searchctl_cli(tmp: Path) -> None:
-    section("7. searchctl：CLI 端到端（词法模式）")
+    section("7. searchctl：CLI 端到端（关键词默认 + --embed 兜底）")
     ws = tmp / "cli_ws"
     (ws / "inputs").mkdir(parents=True, exist_ok=True)
-    corpus = [
-        make_memory("a1", "Caroline joined an LGBTQ support group"),
-        make_memory("a2", "Melanie asked Caroline when she started going"),
-        make_memory("a3", "Dave likes pizza"),
-    ]
-    (ws / "inputs/atommem.jsonl").write_text(
-        "".join(json.dumps(m) + "\n" for m in corpus), encoding="utf-8"
+
+    def sess(mid, role, content, time=""):
+        return {"msg_id": mid, "role": role, "time": time, "content": content}
+
+    # 真实语料形态：session summary 一层 + 原始消息一层
+    (ws / "inputs/session_summaries.jsonl").write_text(
+        json.dumps(sess("session_1_summary", "summary",
+                        "Caroline and Melanie discussed the LGBTQ support group.",
+                        "1:56 pm on 8 May, 2023")) + "\n"
+        + json.dumps(sess("session_2_summary", "summary",
+                          "They talked about Dave's pizza and rock climbing.",
+                          "1:14 pm on 25 May, 2023")) + "\n",
+        encoding="utf-8",
     )
-    (ws / "inputs/msgmem.jsonl").write_text(
-        json.dumps({"memory": "Hey Mel!", "metadata": {
-            "id": "session_1_1", "type": "raw", "time": "", "tag": ["speaker:Caroline"],
-            "source": [], "changelog": []}}) + "\n", encoding="utf-8"
+    (ws / "inputs/sessions.jsonl").write_text(
+        json.dumps(sess("session_1_1", "Caroline",
+                        "I went to a LGBTQ support group yesterday",
+                        "1:56 pm on 8 May, 2023")) + "\n"
+        + json.dumps(sess("session_1_2", "Melanie", "That sounds great!",
+                          "1:56 pm on 8 May, 2023")) + "\n",
+        encoding="utf-8",
     )
     (ws / "evidence.jsonl").write_text(
-        json.dumps(make_memory("e9", "Caroline started the group in June")) + "\n", encoding="utf-8"
+        json.dumps({"content": "Caroline started the group in June",
+                    "metadata": {"source": ["session_1_1"], "score": 0.8}}) + "\n",
+        encoding="utf-8",
     )
 
     from codemem.search.searchctl import main as searchctl_main
+    from codemem.search import searchctl as searchctl_mod
 
-    # 词法模式**不需要**索引：索引只有 dense 通道要。这正是降级路径的意义。
-    code = await asyncio.to_thread(searchctl_main, ["LGBTQ support group", "-k", "2",
-                                                    "--lexical",
-                                                    "--library", str(ws / "inputs/atommem.jsonl"),
-                                                    "--evidence", str(ws / "evidence.jsonl"),
-                                                    "--index", str(tmp / "nope_idx")])
-    check("词法模式缺索引也能跑（退出码 0）", code == 0, str(code))
+    import contextlib
+    import io as _io
 
-    # dense 模式缺索引 -> 明确报错（退出码 2），不静默给出无意义排序
+    def run_cli(argv):
+        """在 ws 里跑 CLI。searchctl 从 ``Path.cwd()`` 读 inputs/，所以必须切目录。"""
+        with contextlib.chdir(ws):
+            return searchctl_main(argv)
+
+    async def run_capture(argv):
+        """跑一次并抓 stdout 的 JSON 行。``--all-fields`` 的展开在 main 里，这里补上。"""
+        parsed = searchctl_mod.parse_args(argv)
+        if parsed.all_fields and not parsed.fields:
+            parsed.fields = ",".join(searchctl_mod.ALL_FIELDS)
+        buffer = _io.StringIO()
+        with contextlib.chdir(ws), contextlib.redirect_stdout(buffer):
+            rc = await searchctl_mod.run_search(parsed)
+        rows = [json.loads(line) for line in buffer.getvalue().strip().splitlines()]
+        return rc, rows
+
+    # 默认（关键词）**不需要**索引、不需要嵌入服务：这是主路径，不是降级。
+    code = await asyncio.to_thread(run_cli, ["LGBTQ support group", "-k", "2",
+                                             "--index", str(tmp / "nope_idx")])
+    check("默认关键词模式缺索引也能跑（退出码 0）", code == 0, str(code))
+
+    # 即使配了嵌入地址，关键词模式也不该去请求它 —— 拿一个必然连不上的地址做证明
     os.environ["CODEMEM_EMBED_URL"] = "http://127.0.0.1:1/v1"
     try:
+        code = await asyncio.to_thread(run_cli, ["LGBTQ support group", "-k", "2",
+                                                 "--index", str(tmp / "nope_idx")])
+        check("关键词模式不碰嵌入服务", code == 0, str(code))
+
+        # --embed 缺索引 -> 明确报错（退出码 2），而不是静默给出关键词结果
         code = await asyncio.to_thread(
-            searchctl_main, ["LGBTQ support group", "-k", "2",
-                             "--library", str(ws / "inputs/atommem.jsonl"),
-                             "--evidence", str(ws / "evidence.jsonl"),
-                             "--index", str(tmp / "nope_idx")]
+            run_cli, ["LGBTQ support group", "-k", "2", "--embed",
+                      "--index", str(tmp / "nope_idx")]
         )
-        check("dense 模式缺索引明确报错（退出码 2）", code == 2, str(code))
+        check("--embed 缺索引明确报错（退出码 2）", code == 2, str(code))
     finally:
         os.environ.pop("CODEMEM_EMBED_URL", None)
 
-    # 无 CODEMEM_INDEX 但给一个空索引也不行；改用模块内函数直接验证 merge_pool
+    # --embed 但没配嵌入地址 -> 也是退出码 2
+    code = await asyncio.to_thread(
+        run_cli, ["LGBTQ support group", "-k", "2", "--embed",
+                  "--index", str(tmp / "nope_idx")]
+    )
+    check("--embed 无嵌入服务明确报错（退出码 2）", code == 2, str(code))
+
+    # --source 分层：summary 只看概览，raw 只看原话
+    code = await asyncio.to_thread(run_cli, ["LGBTQ support group", "-k", "5",
+                                             "--source", "summary"])
+    check("--source summary 可跑", code == 0, str(code))
+    code = await asyncio.to_thread(run_cli, ["LGBTQ support group", "-k", "5",
+                                             "--source", "raw"])
+    check("--source raw 可跑", code == 0, str(code))
+    # --source summary 只该看到概览层：用 "pizza"（只在 session_2_summary 里）验证
+    _, summary_rows = await run_capture(["pizza", "-k", "5", "--source", "summary"])
+    check("--source summary 只返回 summary 层",
+          all(x["kind"] == "session_summary" for x in summary_rows), str(summary_rows))
+    _, raw_rows = await run_capture(["pizza", "-k", "5", "--source", "raw"])
+    check("--source raw 只返回原始消息层",
+          all(x["kind"] == "session" for x in raw_rows), str(raw_rows))
+
+    rc, lines = await run_capture(["LGBTQ support group", "-k", "3"])
+    check("默认检索命中（rc=0）", rc == 0, str(rc))
+    check("输出每行一个 JSON 对象", len(lines) >= 1 and all(isinstance(x, dict) for x in lines))
+    check("默认字段含 kind/session/time（agent 决策所需）",
+          all({"id", "kind", "session", "time", "score", "memory"} <= set(x) for x in lines),
+          str(lines[:1]))
+    check("默认字段不含 rank_*（省上下文）",
+          all("rank_bm25" not in x for x in lines), str(lines[:1]))
+    check("两个语料层都能被命中",
+          {x["kind"] for x in lines} <= {"session_summary", "session"}, str(lines))
+    check("evidence.jsonl 自己写的记录也在池子里（能搜到）",
+          any("June" in x.get("memory", "") or "support group" in x.get("memory", "")
+              for x in lines), str(lines))
+
+    # --all-fields 要把通道明细（排错用）放回来
+    _, rows = await run_capture(["LGBTQ support group", "-k", "3", "--all-fields"])
+    check("--all-fields 带出 rank_bm25", all("rank_bm25" in x for x in rows), str(rows[:1]))
+
+    # 无 CODEMEM_INDEX 时也要能跑；改用模块内函数直接验证 merge_pool
     from codemem.search import searchctl
-    raw_layer = [make_memory("r1", "raw message one"), make_memory("r2", "raw message two")]
-    library = [*corpus, *raw_layer]        # 三层语料并成一个 library
-    ev = [make_memory("e9", "Caroline started the group")]
+    library = [*searchctl.read_jsonl(ws / "inputs/session_summaries.jsonl"),
+               *searchctl.read_jsonl(ws / "inputs/sessions.jsonl")]
+    ev = [{"content": "Caroline started the group", "metadata": {"source": ["s"]}}]
     pool = searchctl.merge_pool(library, ev, "all")
-    check("pool 合并 library + evidence", len(pool) == 6, str(len(pool)))
-    pool_ev = searchctl.merge_pool(library, [make_memory("a1", "overridden")], "all")
-    check("同 id 时 evidence 侧优先", pool_ev[0]["memory"] == "overridden")
+    check("pool 合并 library + evidence", len(pool) == 5, str(len(pool)))
+    pool_ev = searchctl.merge_pool(library, [dict(ev[0], content="overridden")], "all")
+    check("同 id 时 evidence 侧优先", pool_ev[0]["content"] == "overridden")
     pool_lib = searchctl.merge_pool(library, ev, "library")
-    check("--source library 排除 evidence", len(pool_lib) == 5, str(len(pool_lib)))
+    check("--source library 排除 evidence", len(pool_lib) == 4, str(len(pool_lib)))
 
     # 三层语料的读取与层级判定
     check("LIBRARY_FILES 从粗到细", searchctl.LIBRARY_FILES == (
-        "speakers_summary.jsonl", "session_summaries.jsonl", "sessions.jsonl"),
+        "session_summaries.jsonl", "sessions.jsonl"),
         str(searchctl.LIBRARY_FILES))
-    check("--source summary 只读两层 summary",
-          set(searchctl._library_layers("summary")) == {"speakers_summary.jsonl",
-                                                       "session_summaries.jsonl"},
+    check("--source summary 只读 session summaries",
+          searchctl._library_layers("summary") == ("session_summaries.jsonl",),
           str(searchctl._library_layers("summary")))
     check("--source raw 只读原始消息",
           searchctl._library_layers("raw") == ("sessions.jsonl",))
-    check("--source all 读三层", len(searchctl._library_layers("all")) == 3)
+    check("--source all 读两层", len(searchctl._library_layers("all")) == 2)
 
     # 层级判定：这是 agent 决定"要不要往下钻"的依据
-    summary_rec = {"msg_id": "session_3_summary", "role": "summary", "content": "s"}
-    speakers_rec = {"msg_id": "speakers_summary", "role": "summary", "content": "s"}
-    session_rec = {"msg_id": "session_3_1", "role": "Caroline", "content": "c"}
+    summary_rec = {"msg_id": "session_3_summary", "role": "summary", "content": "s",
+                   "time": "7:55 pm on 9 June, 2023"}
+    session_rec = {"msg_id": "session_3_1", "role": "Caroline", "content": "c",
+                   "time": "7:55 pm on 9 June, 2023"}
     check("识别 session summary", searchctl.layer_of(summary_rec) == "session_summary")
-    check("识别 speakers summary", searchctl.layer_of(speakers_rec) == "speakers_summary")
     check("识别原始消息", searchctl.layer_of(session_rec) == "session")
+    # session 字段是多跳检索最常用的入口：拿到一条命中后立刻能读同一次会话的其它消息
     check("summary 的 kind 进 provenance",
-          searchctl.provenance_fields(speakers_rec)["kind"] == "speakers_summary")
+          searchctl.provenance_fields(summary_rec)["kind"] == "session_summary")
+    check("原始消息的 session 归属正确",
+          searchctl.provenance_fields(session_rec)["session"] == "session_3")
+    check("summary 的 session 归属正确",
+          searchctl.provenance_fields(summary_rec)["session"] == "session_3")
+    check("time 进 provenance（相对时间的锚点）",
+          searchctl.provenance_fields(session_rec)["time"] == "7:55 pm on 9 June, 2023")
     check("原始消息的 source 为空",
           searchctl.provenance_fields(session_rec)["source"] == [])
 
@@ -1449,15 +1578,13 @@ async def test_searchctl_cli(tmp: Path) -> None:
 
     # 层级与溯源（见上面的 layer_of 检查）：summary 与原始消息要能区分开
 
-    # 环境变量（由 harness 注入）不应影响词法检索。searchctl_main 内部会 asyncio.run，
+    # 环境变量（由 harness 注入）不应影响关键词检索。searchctl_main 内部会 asyncio.run，
     # 而本函数本身跑在事件循环里，所以直接 await 它的异步实现。
-    from codemem.search import searchctl as searchctl_mod
-
     args = searchctl_mod.parse_args(
-        ["x", "-k", "1", "--lexical", "--library", str(ws / "inputs/atommem.jsonl"),
-         "--evidence", str(ws / "evidence.jsonl"), "--index", str(tmp / "nope_idx")]
+        ["LGBTQ support group", "-k", "1", "--index", str(tmp / "nope_idx")]
     )
-    rc = await searchctl_mod.run_search(args)
+    with contextlib.chdir(ws):
+        rc = await searchctl_mod.run_search(args)
     check("CLI 在无 CODEMEM_* 环境变量下也能跑", rc == 0, str(rc))
 
 
@@ -1466,7 +1593,7 @@ async def test_searchctl_cli(tmp: Path) -> None:
 # ---------------------------------------------------------------------------
 
 async def test_end_to_end(tmp: Path) -> None:
-    section("8. evomem_v3：端到端（假模型 + 真工具）")
+    section("8. search runner：端到端（假模型 + 真工具）")
     from codemem.search import runner as evomem_v3
 
     data_dir = tmp / "data"
@@ -1489,10 +1616,6 @@ async def test_end_to_end(tmp: Path) -> None:
         json.dumps(sess("session_1_summary", "summary", "They discussed the support group.",
                         "1:56 pm on 8 May, 2023")) + "\n", encoding="utf-8"
     )
-    (sample_dir / "speakers_summary.jsonl").write_text(
-        json.dumps(sess("speakers_summary", "summary", "Caroline and Melanie are close friends.")) + "\n",
-        encoding="utf-8"
-    )
 
     run_dir = tmp / "runs"
     config = evomem_v3.load_config(None)
@@ -1503,17 +1626,22 @@ async def test_end_to_end(tmp: Path) -> None:
     catalog = toolcfg.load_catalog(PROJECT_ROOT / "configs/tool.json")
     log = Logger(level="error")
 
-    inputs_dir, index_dir, search_bin, lexical = await evomem_v3.build_inputs(
+    inputs_dir, index_dir, search_bin, embed_ready = await evomem_v3.build_inputs(
         sample_dir, run_dir, config, embedder=None, log=log
     )
     check("inputs 已建立", (inputs_dir / "sessions.jsonl").exists())
-    check("三层语料都硬链进 inputs",
+    check("两层语料都硬链进 inputs",
           all((inputs_dir / n).exists() for n in
-              ("sessions.jsonl", "session_summaries.jsonl", "speakers_summary.jsonl")))
+              ("sessions.jsonl", "session_summaries.jsonl")))
+    check("不再有 speakers_summary.jsonl", not (inputs_dir / "speakers_summary.jsonl").exists())
     check("inputs 是硬链（同一 inode）",
           (inputs_dir / "sessions.jsonl").stat().st_ino == (sample_dir / "sessions.jsonl").stat().st_ino)
-    check("search 包装可执行", search_bin.exists() and (search_bin.stat().st_mode & 0o111))
-    check("无 embedding -> lexical 降级", lexical is True)
+    # Windows 上 stat 的权限位不反映可执行性（一律 0o666），所以只断言文件存在 + 内容对。
+    check("search 包装已生成", search_bin.exists() and "searchctl" in search_bin.read_text(
+        encoding="utf-8"))
+    if os.name == "posix":
+        check("search 包装可执行", bool(search_bin.stat().st_mode & 0o111))
+    check("无 embedding -> 索引不可用（关键词模式）", embed_ready is False)
 
     # 假模型：第一个 QA 先写 evidence 再"完成"；verifier 由 role 区分
     class ScriptedModel:
@@ -1550,7 +1678,7 @@ async def test_end_to_end(tmp: Path) -> None:
         qa_index=0, qa={"question": "When did Caroline join the group?", "category": 2,
                         "reference": "June 2023"},
         directory=sample_dir, run_dir=run_dir, inputs_dir=inputs_dir, index_dir=index_dir,
-        config=config, catalog=catalog, model=model, embedder=None, lexical=lexical,
+        config=config, catalog=catalog, model=model, embedder=None, embed_ready=embed_ready,
         log=log, semaphore=asyncio.Semaphore(1),
     )
     check("QA 记录有 evidence", record.evidence_count == 1, str(record.evidence_count))
@@ -1584,7 +1712,8 @@ async def test_end_to_end(tmp: Path) -> None:
     record2 = await evomem_v3.run_qa(
         qa_index=1, qa={"question": "Anything?", "category": 2, "reference": ""},
         directory=sample_dir, run_dir=run_dir, inputs_dir=inputs_dir, index_dir=index_dir,
-        config=config, catalog=catalog, model=TamperingModel(), embedder=None, lexical=lexical,
+        config=config, catalog=catalog, model=TamperingModel(), embedder=None,
+        embed_ready=embed_ready,
         log=log, semaphore=asyncio.Semaphore(1),
     )
     check("写只读输入被拒（未篡改）", record2.tampered is False)
@@ -1596,7 +1725,7 @@ async def test_end_to_end(tmp: Path) -> None:
     # --- summary 生成 ---
     summary = evomem_v3.summarize_dir(
         "Test_Pair", [record, record2], type("M", (), {"stats": staticmethod(
-            lambda: {"calls": 9, "failures": 0})})(), 2, 0, lexical
+            lambda: {"calls": 9, "failures": 0})})(), 2, 0, embed_ready
     )
     check("summary 有 qa_done", summary["qa_done"] == 2, str(summary["qa_done"]))
     # 只有第一条被判足够（第二条是篡改测试，verifier 直接返回 sufficient）
@@ -1605,7 +1734,8 @@ async def test_end_to_end(tmp: Path) -> None:
     check("summary 的 sufficient_rate 与条数一致",
           abs(summary["sufficient_rate"] - summary["sufficient"] / 2) < 1e-9,
           str(summary["sufficient_rate"]))
-    check("summary 标记 lexical_fallback", summary["lexical_fallback"] is True)
+    check("summary 标记 embed_available", summary["embed_available"] is False,
+          str(summary.get("embed_available")))
     check("summary 统计 model_calls", summary["model_calls"] == 9, str(summary["model_calls"]))
 
 

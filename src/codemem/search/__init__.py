@@ -1,4 +1,4 @@
-"""search 步骤：question + atommem → evidence.jsonl（能回答该问题的记忆列表）。
+"""search 步骤：question + 两层语料 → evidence.jsonl（能回答该问题的记忆列表）。
 
 入口：``python -m codemem.search``（见 ``__main__.py`` / ``runner.py``）。
 
@@ -10,7 +10,7 @@
     toolcfg.py     configs/tool.json 的加载与 prompt 注入渲染 + 响应解析
     verifier.py    独立判定"这份 evidence 能否回答该问题"（保守默认 + missing[]）
     evidence.py    evidence.jsonl 的解析/校验/规范化 + 进展指纹
-    searchctl.py   `search` 终端命令（混合检索 CLI）+ 建索引入口
+    searchctl.py   `search` 终端命令（关键词检索 CLI，--embed 走语义）+ 建索引入口
     searchmem.py   混合检索：dense + BM25 + tag 三路，RRF 融合（唯一检索实现）
     index.py       检索索引：dense 向量一次性落盘 / 加载 / 打分
     embedder.py    嵌入（分批 + 单批重试）

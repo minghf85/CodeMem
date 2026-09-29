@@ -17,8 +17,8 @@ agent 是用 bash/jq/write 自由写文件的，所以产物可能不合法（�
 3. ``metadata`` 是对象，``metadata.id`` 非空字符串，且**文件内唯一**；
 4. ``metadata.type`` ∈ {inner, outer, raw}；
 5. ``metadata.tag`` 是非空数组且至少一条 ``speaker:``；
-6. ``metadata.source`` 是**非空**数组 —— 反幻觉护栏。从 inputs/atommem.jsonl 拷来的行天然
-   满足；只有 agent 自己合成的记录受约束，而那恰好是最需要约束的地方。
+6. ``metadata.source`` 是**非空**数组 —— 反幻觉护栏。语料是两层（session summary /
+   原始消息），agent 只能引用它真读过的 msg_id。
 """
 
 from __future__ import annotations

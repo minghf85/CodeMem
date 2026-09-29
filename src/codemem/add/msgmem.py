@@ -1,6 +1,11 @@
-"""add · 第一步：把原始对话转成 raw message memory（msgmem）。
+"""add · （遗留）原始对话 → raw message memory（msgmem）。
 
-**这是 add 的输入层**：把 ``data/correct_locomo10.json`` 的每个 session 摊平成一条条
+> ⚠️ **不属于当前的 add 流程**：``python -m codemem.add`` 只跑 ``session`` 与 ``summary``
+> 两步，不生成 ``msgmem.jsonl``（``add.session`` 直接产出同样的原始消息，只是换了文件名与
+> 字段格式）。本模块保留是因为 ``scripts/eval_{baseline,rag,atommem}.py`` 三个历史对照脚本
+> 仍读 ``data/{dir}/msgmem.jsonl``，而盘上那份数据就是它生成的。要重跑那些脚本时再用它。
+
+**这是 atommem 的输入层**：把 ``data/correct_locomo10.json`` 的每个 session 摊平成一条条
 raw memory，写到 ``data/{speaker_a}_{speaker_b}/msgmem.jsonl``。后续 atommem 在这些 raw
 之上抽原子记忆。
 

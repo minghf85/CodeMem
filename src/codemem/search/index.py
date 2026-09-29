@@ -187,7 +187,7 @@ def shared_index_dir(cache_root: Path, memories: list[dict[str, Any]], model: st
 def index_is_usable(directory: Path, memories: list[dict[str, Any]], model: str) -> bool:
     """已有索引是否**正好**对应这份语料与模型。
 
-    只检查文件存在是不够的：``atommem.jsonl`` 一旦重新抽取（``add`` 重跑），语料就变了，
+    只检查文件存在是不够的：语料一旦重新生成（``add`` 重跑），内容就变了，
     旧向量会**静默**给出错误的排序。所以必须比对 ``corpus_sha256``。
     """
     meta_path = directory / "meta.json"
@@ -212,8 +212,9 @@ def load_index(directory: Path) -> MemoryIndex:
     for path in (ids_path, vectors_path, meta_path):
         if not path.exists():
             raise FileNotFoundError(
-                f"索引文件缺失：{path}（先用 `python -m codemem.searchctl --index-only "
-                f"--atoms <atommem.jsonl> --index {directory}` 建一次）"
+                f"索引文件缺失：{path}（先用 `python -m codemem.search.searchctl --index-only "
+                f"--atoms <语料文件.jsonl> --index {directory}` 建一次；正常跑 "
+                f"`python -m codemem.search` 会自动建）"
             )
     ids = json.loads(ids_path.read_text(encoding="utf-8"))
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
