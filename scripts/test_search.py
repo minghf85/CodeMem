@@ -114,13 +114,36 @@ def test_toolcfg(tmp: Path) -> None:
     check("策略要求消解上下文", "RESOLVE THE CONTEXT" in rendered)
     check("schema 说明可以改写 content", "Rewrite freely" in rendered)
     check("schema 要求 source 非空", "NON-EMPTY array of msg_ids" in rendered)
+    # 输出 schema 的字段顺序：自回归模型按顺序生成，reasoning 在前 = 先推理再作答。
+    # 这条不是审美 —— 放在后面就成了"先给答案再补理由"，退化成事后编解释。
+    import re as _re
+    from codemem import prompts as _P
+    for name in ("ANSWER_PROMPT", "BASELINE_ANSWER_PROMPT", "RAG_ANSWER_PROMPT"):
+        text = getattr(_P, name)
+        first = _re.search(r'\{\{"(\w+)"', text)
+        check(f"{name} 首个字段是 reasoning（CoT）",
+              first is not None and first.group(1) == "reasoning",
+              first.group(1) if first else "未找到")
+    _j = _re.search(r'\{\{"(\w+)"', _P.JUDGE_PROMPT)
+    check("JUDGE_PROMPT 首个字段是 reason（先写理由再下结论）",
+          _j is not None and _j.group(1) == "reason", _j.group(1) if _j else "未找到")
+    from codemem.search import verifier as _V
+    check("VERIFIER 首个字段是 reasoning",
+          '{"reasoning"' in _V.VERIFIER_SYSTEM_PROMPT)
+
     # 时间精度：这是这一版的核心规则
-    check("时间策略：不得编造更细的精度", "Never invent precision" in rendered)
+    check("时间策略：不得编造更细的精度", "Never invent a day" in rendered
+          or "not finer" in rendered)
     check("时间策略：按源语料的单位作答", "answer in that unit" in rendered)
     check("时间策略：保留锚点表述", "the week before 9 June 2023" in rendered)
     check("时间策略：区间是合法答案", "A period is a valid answer" in rendered)
-    check("时间策略：记录必须自带锚点", "stands ALONE" in rendered)
-    check("时间策略：原文表述要照录", "verbatim" in rendered)
+    check("时间策略：记录必须自带锚点", "stands ALONE" in rendered or "stand ALONE" in rendered)
+    check("时间策略：原文表述要照录", "restate the source" in rendered.lower()
+          or "verbatim" in rendered.lower())
+    # 这一版最要紧的一条：会话日期 ≠ 事件日期
+    check("时间策略：会话日期不是事件日期", "when it was SAID" in rendered)
+    check("时间策略：给出具体反例（9 June）", "9 June 2023" in rendered and "week before" in rendered)
+    check("时间策略：禁止无锚点的相对词", "unanchored" in rendered.lower())
     check("有 worked example（关键词多跳）", "WORKED EXAMPLE (strategy A: keyword hop)" in rendered)
     check("有 worked example（相对时间）", "date -d \"8 May 2023 -1 day\"" in rendered)
     check("有 worked example（遍历）", "WORKED EXAMPLE (strategy B: sweep)" in rendered)
@@ -128,7 +151,7 @@ def test_toolcfg(tmp: Path) -> None:
     check("提示里不再有 speakers summary", "speakers_summary" not in rendered)
     check("提示里不再有 atommem/msgmem", "atommem" not in rendered and "msgmem" not in rendered)
     # 上下文预算：prompt 每条 QA 都整体注入一次，涨回去就等于白做这次简化
-    check("system prompt 控制在 14000 字符内", len(rendered) < 14000, str(len(rendered)))
+    check("system prompt 控制在 15000 字符内", len(rendered) < 15000, str(len(rendered)))
 
     # 响应解析
     check("解析裸 JSON", (toolcfg.parse_tool_call('{"tool":"bash","args":{"command":"ls"}}') or
@@ -1113,17 +1136,35 @@ def test_judge_temporal() -> None:
     section("14. judge：相对时间确定性折算")
     from codemem.eval import judge as J
 
+    # 每个期望值都手工核对过星期几（写错期望值会让测试替 bug 背书 —— 实测踩过：
+    # 旧代码把 "Friday before 15 July" 算成 07-08，而测试当时就照着它写 07-08）。
     cases = [
-        ("The week before 6 July 2023", "2023-06-29"),
+        ("The week before 6 July 2023", "2023-06-29"),        # 6 Jul 周四 -> -7d
         ("a week before 6 July 2023", "2023-06-29"),
-        ("The Friday before 15 July 2023", "2023-07-08"),
-        ("The weekend before 20 October 2023", "2023-10-14"),
+        ("The Friday before 15 July 2023", "2023-07-14"),     # 15 Jul 周六，之前的周五 = 14
+        ("The friday before 15 July 2023", "2023-07-14"),     # 大小写不敏感
+        ("The Saturday before 25 May 2023", "2023-05-20"),    # 25 May 周四，之前的周六 = 20
+        ("The Tuesday before 20 July 2023", "2023-07-18"),    # 20 Jul 周四，之前的周二 = 18
+        ("The Friday before 14 August 2023", "2023-08-11"),   # 14 Aug 周一，之前的周五 = 11
+        ("The Friday before 22 October 2023", "2023-10-20"),  # 22 Oct 周日，之前的周五 = 20
+        ("The weekend before 20 October 2023", "2023-10-14"), # 20 Oct 周五，之前的周六 = 14
+        ("The weekend before 13 September 2023", "2023-09-09"),
+        ("two weekends before 17 July 2023", "2023-07-08"),   # 17 Jul 周一 -> 15/16，再前一周 = 8
         ("two weeks before 1 June 2023", "2023-05-18"),
+        # 括号里的补充说明不该干扰解析
+        ("The Saturday before 25 May 2023 (approximately May 20, 2023)", "2023-05-20"),
     ]
     for reference, expected in cases:
         got = J.resolve_relative_date(reference)
         check(f"折算 {reference!r}", got is not None and got.isoformat() == expected,
               f"{got} != {expected}")
+
+    # 回归：星期几**不能**被单位正则吃掉。"Friday" 里含 "day"，旧正则把它当成
+    # "N days before"，于是 X-1 天 —— 实测这一条把若干答对的 temporal QA 判成错的。
+    check("Friday 不会被当成 1 day 处理",
+          J.resolve_relative_date("The Friday before 15 July 2023").isoformat() == "2023-07-14")
+    check("weekend 的数量词生效",
+          J.resolve_relative_date("two weekends before 17 July 2023").isoformat() == "2023-07-08")
 
     check("非相对时间参考返回 None",
           J.resolve_relative_date("2 July 2023") is None)

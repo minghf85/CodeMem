@@ -82,40 +82,75 @@ def resolve_relative_date(reference: Any) -> "date | None":
     做过同样的取舍：相对时间交给确定性代码，而不是模型）。
 
     支持的形式（大小写不敏感）：
+        the <weekday> before X      -> X 之前最近的那个星期几（严格早于 X）
+        the weekend before X        -> X 之前最近的周六
+        N weekends before X         -> X 之前第 N 个周六
         the week before X           -> X - 7 天
         N weeks before X            -> X - 7N 天
-        the <weekday> before X      -> X 之前最近的那个星期几
-        the weekend before X        -> X 之前最近的周六
+
+    **两个实测踩过的坑**（后果都是把对的答案判成错的，比不折算更糟）：
+
+    1. 原正则把 ``Friday`` 匹配成了单位 ``day`` —— ``(day|week|weekend)s?`` 命中了
+       "Fri**day**" 的后缀，于是 "The Friday before 15 July 2023" 被算成 X-1 天（7 月 8 日），
+       而正确答案是 7 月 14 日。实测这一条直接把若干答对的 QA 判成 INCORRECT。
+       修法：**星期几先匹配**，并用词首边界锚住。
+    2. ``two weekends before X`` 里的 "two" 被丢掉了，只算了"最近的那个周六"。
+       修法：weekend 分支也要乘数量。
     """
     import re
     from datetime import timedelta
 
     text = str(reference or "")
+
+    # ---- 星期几分支：必须先试，否则 "Friday" 的 "day" 会被下面的单位正则吃掉 ----
     match = re.search(
-        r"(?:the\s+)?(?:(a|one|two|three|four|\d+)\s+)?"
-        r"(?:(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+)?"
-        r"(day|week|weekend)s?\s+before\s+(.+)",
+        r"(?:the\s+)?(?:(a|one|two|three|four|five|six|\d+)\s+)?"
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)s?\b"
+        r"\s+before\s+(.+)",
+        text, re.IGNORECASE,
+    )
+    if match:
+        base = _parse_date(match.group(3))
+        if base is None:
+            return None
+        target = _WEEKDAYS[match.group(2).lower()]
+        delta = (base.weekday() - target) % 7 or 7
+        base = base - timedelta(days=delta)
+        # "two Fridays before X" 这种也支持：再往前推整周
+        count = _quantity(match.group(1))
+        return base - timedelta(days=7 * (count - 1))
+
+    # ---- 单位分支（day / week / weekend）----
+    match = re.search(
+        r"(?:the\s+)?(?:(a|one|two|three|four|five|six|\d+)\s+)?"
+        r"\b(day|week|weekend)s?\b\s+before\s+(.+)",
         text, re.IGNORECASE,
     )
     if not match:
         return None
-    base = _parse_date(match.group(4))
+    base = _parse_date(match.group(3))
     if base is None:
         return None
 
-    weekday, unit, quantity = match.group(2), match.group(3).lower(), (match.group(1) or "a").lower()
-    if weekday:
-        target = _WEEKDAYS[weekday.lower()]
-        delta = (base.weekday() - target) % 7 or 7
-        return base - timedelta(days=delta)
+    unit, count = match.group(2).lower(), _quantity(match.group(1))
     if unit == "weekend":
-        # 最近的那个周六（base 是周六时退到上周六）
-        delta = (base.weekday() - 5) % 7 or 7
-        return base - timedelta(days=delta)
-    count = {"a": 1, "one": 1, "two": 2, "three": 3, "four": 4}.get(quantity)
-    if count is None:
-        count = int(quantity) if quantity.isdigit() else 1
+        # X 之前第 N 个周六。"before" 是**严格早于**：X 本身是周六时先退一周。
+        first = base - timedelta(days=(base.weekday() - 5) % 7 or 7)
+        return first - timedelta(days=7 * (count - 1))
+    if unit == "day":
+        return base - timedelta(days=count)
     return base - timedelta(days=7 * count)
+
+
+_COUNT_WORDS = {"a": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+
+
+def _quantity(word: Any) -> int:
+    """把 "two" / "3" / None 统一成整数（None 与无法识别的一律当 1）。"""
+    text = str(word or "a").strip().lower()
+    if text.isdigit():
+        return int(text)
+    return _COUNT_WORDS.get(text, 1)
 
 
 def temporal_hint(reference: Any, candidate: Any) -> str:

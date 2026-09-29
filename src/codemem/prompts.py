@@ -147,11 +147,12 @@ You have access to memories from two speakers in a conversation. These memories 
 2. Pay special attention to the timestamps to determine the answer
 3. If the question asks about a specific event or fact, look for direct evidence in the memories
 4. If the memories contain contradictory information, prioritize the most recent memory
-5. If there is a question about time references (like "last year", "two months ago", etc.), calculate the actual date based on the memory timestamp. For example, if a memory from 4 May 2022 mentions "went to India last year," then the trip occurred in 2021.
-6. NEVER leave a relative time expression in the final answer. Replace every relative time with the concrete date, month, or year it resolves to, computed from the timestamp of the memory that states it. For example, a memory dated 2023-05-08 saying "last year" resolves to "2022"; a memory dated 2023-05-08 saying "two months ago" resolves to "March 2023".
-7. Focus only on the content of the memories from both speakers. Do not confuse character names mentioned in memories with the actual users who created those memories.
-8. If memories are insufficient and the question is about a general world fact, you may use reliable general world knowledge.
-9. Keep the final answer concise, typically no more than 10-12 words; do not omit essential entities or dates.
+5. **The memory timestamp is WHEN THE CONVERSATION HAPPENED -- it is almost never when the event happened.** A memory dated 2023-06-09 saying "I gave a speech last week" means the speech was in the week before 9 June 2023, NOT on 9 June 2023. Never answer with the memory's own timestamp as if it were the event date.
+6. **A relative expression that carries its anchor is a COMPLETE answer.** "the week before 9 June 2023", "the Friday before 15 July 2023", "the weekend before 20 October 2023" are exact and need no further context -- answer with that form, or with the single date it resolves to, whichever the memory supports. Do NOT flatten an anchored expression into the anchor itself.
+7. **Only answer with a bare relative word if the anchor is resolvable and you state it.** "next month" alone is WRONG; "June 2023" (i.e. the month after the 2023-05-25 conversation) is right. Same for "last year" -> give the year, "recently" -> give the week or month. Never leave the reader to guess what "next" or "recent" is relative to.
+8. Focus only on the content of the memories from both speakers. Do not confuse character names mentioned in memories with the actual users who created those memories.
+9. If memories are insufficient and the question is about a general world fact, you may use reliable general world knowledge.
+10. Keep the final answer concise, typically no more than 10-12 words; do not omit essential entities or dates.
 
 # GROUNDING RULES (CRITICAL):
 - Use ONLY facts stated in the memories, or clear logical consequences of them. Never invent a date, number, name, place, or detail.
@@ -159,8 +160,10 @@ You have access to memories from two speakers in a conversation. These memories 
 - If the memories do not support an answer at all, set "answer" to null and "unsupported": true.
 
 # SPECIFICITY RULES (CRITICAL):
-- Resolve every relative time indicator into an absolute date, month, or year.
-- Resolve every pronoun and deictic reference (he, she, they, it, this, that, here, there, the other day, that time) into the concrete entity, place, or date it refers to.
+- **Resolve a relative time against its own anchor, not against the conversation date.** "last Saturday" in a memory dated 2023-05-25 is "the Saturday before 25 May 2023"; "ten years ago" in a memory dated 2023-06-27 is "10 years ago" (the year, since that is all the speaker gave).
+- An anchored phrase ("the week before <date>", "the Friday before <date>") is already absolute -- keep it as-is, or give the date it resolves to. Both are accepted; the anchor alone is NOT.
+- Do NOT add precision the memory does not have. If the speaker said "last year", a year is the correct granularity; do not invent a specific day.
+- Resolve every pronoun and deictic reference (he, she, they, it, this, that, here, there, that time) into the concrete entity, place, or date it refers to.
 - Name every person, place, organization, and event explicitly instead of referring to them indirectly.
 - Prefer the most specific form the memories actually support, e.g. "2022" over "a couple of years ago", "Melanie" over "she", "Paris" over "there".
 - Make the answer understandable on its own, without the question or the memories.
@@ -170,7 +173,7 @@ You have access to memories from two speakers in a conversation. These memories 
 1. First, examine all memories that contain information related to the question
 2. Examine the timestamps and content of these memories carefully
 3. Look for explicit mentions of dates, times, locations, or events that answer the question
-4. If the answer requires calculation (e.g., converting relative time references), show your work
+4. If the answer requires calculation, DO the calculation and show it in reasoning: name the anchor date and the offset ("memory dated 2023-06-09 + 'last week' -> the week before 9 June 2023"). Never write the anchor date as the answer to a "when did X happen" question
 5. Formulate a precise, concise answer based on the evidence in the memories, using general world knowledge only if memories are insufficient
 6. Double-check that your answer directly addresses the question asked
 7. Ensure your final answer is specific and avoids vague time references
@@ -184,14 +187,17 @@ Question: {question}
 CRITICAL: Your entire response must be ONLY a JSON object. No markdown fences, no explanation, no text before or after the JSON.
 
 Format:
-{{"answer": "<final answer, or null if the memories do not support one>", "unsupported": <true|false>, "reasoning": "<brief: evidence used, and how relative times/pronouns were resolved>"}}
+{{"reasoning": "<first: name the memory you used, its date, and how you resolved the time>", "answer": "<final answer, or null if the memories do not support one>", "unsupported": <true|false>}}
 
+- "reasoning": FIRST. One or two sentences: which memory you used, that memory's date, and how you turned its wording into the answer. Write this before the answer.
 - "answer": concise and specific (normally <= 10-12 words); resolve all relative times and pronouns as described above.
 - "unsupported": true only when the memories do not support any answer; then "answer" must be null.
-- "reasoning": one or two short sentences, used for auditing only.
 
 Example (memory dated 2023-05-08: "Melanie went to India last year"):
-{{"answer": "2022", "unsupported": false, "reasoning": "Memory dated 2023-05-08 says Melanie went to India last year, which resolves to 2022."}}
+{{"reasoning": "Memory dated 2023-05-08 says Melanie went to India last year; one year before 2023 is 2022.", "answer": "2022", "unsupported": false}}
+
+Example (memory dated 2023-06-09: "I gave a speech at a school last week"):
+{{"reasoning": "Memory dated 2023-06-09; the speech was 'last week', i.e. the week before 9 June 2023 -- not on 9 June itself.", "answer": "the week before 9 June 2023", "unsupported": false}}
 
 REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing else.
 """
@@ -204,9 +210,10 @@ Current Date: {current_date}
 Instructions:
 - Analyze all supplied memories and use direct evidence whenever available.
 - Each memory includes a timestamp (YYYY-MM-DD HH:MM:SS) and speaker information - use these carefully.
-- If the question asks "when" (about time), you MUST provide a specific date, year, or time period (e.g., "2022", "May 2022", "2021-03-15"). NEVER answer with relative terms like "yesterday", "last year", "recently", "two months ago".
+- If the question asks "when" (about time), give a date, year, or time period (e.g., "2022", "May 2022", "2021-03-15"). An anchored phrase such as "the week before 9 June 2023" is acceptable and exact -- it needs no outside context.
+- **The memory timestamp is WHEN THE CONVERSATION HAPPENED, not when the event happened.** A memory dated 2023-06-09 saying "last week" refers to the week before 9 June 2023, NOT 9 June 2023. Never return the memory's own timestamp as the event date.
+- Anchor every relative expression before using it: "next month" is meaningless on its own -- resolve it to "June 2023" from the memory's date. Never answer with an unanchored relative word.
 - If the question asks "who" (about people), you MUST provide the specific person's name from the speaker or memory content.
-- Convert any relative time references in the memories to absolute dates using the memory timestamp and current date.
 - Do not invent facts, infer beyond what is stated, or add extra information not present in the memories.
 - Answer concisely, normally in no more than 10-12 words, without omitting essential names, dates, or entities.
 - If the memories do not contain enough information, answer briefly that it is unknown. Use general knowledge only for genuinely general facts.
@@ -217,7 +224,8 @@ Instructions:
 - If the memories do not support an answer at all, set "answer" to null and "unsupported": true.
 
 # SPECIFICITY RULES (CRITICAL):
-- Replace every relative time expression (yesterday, last year, recently, two months ago, the other day) with the absolute date, month, or year it resolves to from the memory timestamp and current date.
+- Resolve a relative time against its own anchor (the memory it appears in), not against the conversation date. Keep an anchored phrase as-is if that is what the memory supports ("the week before 9 June 2023").
+- Do NOT add precision the memory lacks: "last year" -> a year; "last Saturday" -> that weekday.
 - Replace every pronoun and deictic reference (he, she, they, it, this, that, here, there) with the concrete entity, place, or date it refers to.
 - Name every person, place, organization, and event explicitly.
 - Make the answer understandable on its own, without the question or the memories.
@@ -232,11 +240,11 @@ Question: {question}
 CRITICAL: Your entire response must be ONLY a JSON object. No markdown fences, no explanation, no text before or after the JSON.
 
 Format:
-{{"answer": "<final answer, or null if the memories do not support one>", "unsupported": <true|false>, "reasoning": "<brief: evidence used, and how relative times/pronouns were resolved>"}}
+{{"reasoning": "<first: name the memory you used, its date, and how you resolved the time>", "answer": "<final answer, or null if the memories do not support one>", "unsupported": <true|false>}}
 
+- "reasoning": FIRST. One or two sentences: which memory you used, that memory's date, and how you turned its wording into the answer. Write this before the answer.
 - "answer": concise and specific (normally <= 10-12 words); resolve all relative times and pronouns as described above.
 - "unsupported": true only when the memories do not contain enough information; then "answer" must be null.
-- "reasoning": one or two short sentences, used for auditing only.
 
 REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing else.
 """
@@ -249,9 +257,10 @@ Current Date: {current_date}
 Instructions:
 - Treat the retrieved memories below as the only evidence for the answer.
 - Each memory includes a timestamp (YYYY-MM-DD HH:MM:SS) and speaker information - use these carefully.
-- If the question asks "when" (about time), you MUST provide a specific date, year, or time period (e.g., "2022", "May 2022", "2021-03-15"). NEVER answer with relative terms like "yesterday", "last year", "recently", "two months ago".
+- If the question asks "when" (about time), give a date, year, or time period (e.g., "2022", "May 2022", "2021-03-15"). An anchored phrase such as "the week before 9 June 2023" is acceptable and exact -- it needs no outside context.
+- **The memory timestamp is WHEN THE CONVERSATION HAPPENED, not when the event happened.** A memory dated 2023-06-09 saying "last week" refers to the week before 9 June 2023, NOT 9 June 2023. Never return the memory's own timestamp as the event date.
+- Anchor every relative expression before using it: "next month" is meaningless on its own -- resolve it to "June 2023" from the memory's date. Never answer with an unanchored relative word.
 - If the question asks "who" (about people), you MUST provide the specific person's name from the speaker or memory content.
-- Convert any relative time references in the memories to absolute dates using the memory timestamp and current date.
 - Do not invent facts, infer beyond what is stated, or add extra information not present in the memories.
 - Answer concisely, normally in no more than 10-12 words, without omitting essential names, dates, or entities.
 - If the retrieved memories do not support an answer, answer briefly that it is unknown.
@@ -262,7 +271,8 @@ Instructions:
 - If the retrieved memories do not support an answer at all, set "answer" to null and "unsupported": true.
 
 # SPECIFICITY RULES (CRITICAL):
-- Replace every relative time expression (yesterday, last year, recently, two months ago, the other day) with the absolute date, month, or year it resolves to from the memory timestamp and current date.
+- Resolve a relative time against its own anchor (the memory it appears in), not against the conversation date. Keep an anchored phrase as-is if that is what the memory supports ("the week before 9 June 2023").
+- Do NOT add precision the memory lacks: "last year" -> a year; "last Saturday" -> that weekday.
 - Replace every pronoun and deictic reference (he, she, they, it, this, that, here, there) with the concrete entity, place, or date it refers to.
 - Name every person, place, organization, and event explicitly.
 - Make the answer understandable on its own, without the question or the retrieved memories.
@@ -277,11 +287,11 @@ Question: {question}
 CRITICAL: Your entire response must be ONLY a JSON object. No markdown fences, no explanation, no text before or after the JSON.
 
 Format:
-{{"answer": "<final answer, or null if the retrieved memories do not support one>", "unsupported": <true|false>, "reasoning": "<brief: evidence used, and how relative times/pronouns were resolved>"}}
+{{"reasoning": "<first: name the memory you used, its date, and how you resolved the time>", "answer": "<final answer, or null if the retrieved memories do not support one>", "unsupported": <true|false>}}
 
+- "reasoning": FIRST. One or two sentences: which memory you used, that memory's date, and how you turned its wording into the answer. Write this before the answer.
 - "answer": concise and specific (normally <= 10-12 words); resolve all relative times and pronouns as described above.
 - "unsupported": true only when the retrieved memories do not support an answer; then "answer" must be null.
-- "reasoning": one or two short sentences, used for auditing only.
 
 REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing else.
 """
@@ -298,20 +308,22 @@ Evaluation Criteria:
    - If the question asks "when", check whether the prediction and the reference denote the SAME point in time.
    - **A reference phrased relatively and a prediction phrased absolutely are EQUIVALENT when the arithmetic works out.**
      This is the single most common way judges get it wrong -- do the arithmetic before deciding.
-   - "the week before X" / "a week before X"  = X minus 7 days
-   - "the weekend before X"                    = the Saturday/Sunday immediately preceding X.
-     Work out X's weekday first: if X is a Friday, the weekend before starts 6 days earlier;
-     if X is a Monday, it is 2 days earlier. Accept a prediction matching either the Saturday
-     or the Sunday of that weekend (and allow +/- 1 day).
-   - "the <weekday> before X"                  = the nearest that weekday strictly before X
-   - "N days/weeks/months before X"            = X minus N days/weeks/months
+   - A [PRECOMPUTED] line may be appended below. When it says the two are the SAME date, treat
+     the temporal criterion as SATISFIED and do not re-derive the arithmetic yourself.
+   - "the week before X" / "a week before X" / "N weeks before X" = X minus 7 (or 7N) days
+   - "the weekend before X" = the Saturday/Sunday immediately preceding X (strictly before).
+     "N weekends before X" = the Nth such weekend back.
+   - "the <weekday> before X" = the nearest that weekday strictly before X
    - "last week"/"last year" relative to a conversation dated Y = the corresponding period before Y
-   - WORKED EXAMPLES (all ACCEPTABLE):
-       reference "The week before 6 July 2023", prediction "2023-06-29"        (6 Jul - 7d = 29 Jun)
-       reference "The Friday before 15 July 2023", prediction "July 8, 2023"   (15 Jul is a Saturday; prior Friday = 8 Jul)
-       reference "The weekend before 17 July 2023", prediction "2023-07-10"    (17 Jul is a Monday; prior weekend = 10-11 Jul)
-       reference "July 2023", prediction "2023-07"                             (same month)
-       reference "10 years ago" (conversation dated 2023), prediction "2013"
+   - WORKED EXAMPLES -- verify the weekday yourself before trusting these:
+       "The week before 6 July 2023"            -> 2023-06-29      (6 Jul is a Thursday; -7d)
+       "The Friday before 15 July 2023"         -> 2023-07-14      (15 Jul is a SATURDAY; prior Friday = 14 Jul)
+       "The weekend before 17 July 2023"        -> 2023-07-15/16   (17 Jul is a MONDAY; prior weekend = 15-16 Jul)
+       "The Tuesday before 20 July 2023"        -> 2023-07-18      (20 Jul is a THURSDAY; prior Tuesday = 18 Jul)
+       "two weekends before 17 July 2023"       -> 2023-07-08/09   (one weekend back = 15-16 Jul; two = 8-9 Jul)
+   - IMPORTANT: a prediction that equals the CONVERSATION date rather than the event date is
+     INCORRECT. If the memory is dated 9 June 2023 and says "last week", then "9 June 2023" is
+     wrong and "the week before 9 June 2023" (or 2 June 2023) is right.
    - Allow +/- 1 day on a computed weekday/weekend, and accept a month-only answer when the
      reference is month-only (or vice versa) as long as the month matches.
    - Only mark INCORRECT when the two answers denote DIFFERENT points in time after the
@@ -371,11 +383,11 @@ Examples:
 CRITICAL: Your entire response must be ONLY a JSON object. No markdown fences, no explanation, no text before or after the JSON.
 
 Format:
-{{"label": "CORRECT" | "INCORRECT", "reason": "<brief explanation, referencing the specific criteria above>"}}
+{{"reason": "<first: the specific criterion that decides it, and the comparison you made>", "label": "CORRECT" | "INCORRECT"}}
 
-- "label" must be exactly "CORRECT" or "INCORRECT" (uppercase).
+- "reason": FIRST. One or two sentences naming the criterion that decided the verdict and the comparison behind it. Write this before the label.
+- "label": exactly "CORRECT" or "INCORRECT" (uppercase).
 - When the prediction is a JSON object, judge its "answer" field; a null answer with "unsupported": true counts as "unknown" and is INCORRECT when the reference answer is known.
-- "reason": one or two short sentences naming the criteria that decided the verdict.
 
 REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing else."""
 

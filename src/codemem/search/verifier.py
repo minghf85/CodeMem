@@ -30,19 +30,20 @@ VERIFIER_SYSTEM_PROMPT = """You are a strict evidence auditor. You do not know h
 
 Do this:
 
-1. Answer the QUESTION using ONLY the records. No outside knowledge; assume nothing that is not written.
+1. Work through the records and answer the QUESTION using ONLY them. No outside knowledge; assume nothing that is not written.
 2. Say whether they are SUFFICIENT: does the answer follow from them, with who/when/where resolved (no dangling pronouns, no missing date when the question asks when, no facts left unjoined)?
 3. If not, list what is missing -- concretely enough that someone could search for it: name the entity, the missing date, the fact that must be joined. These become the next search keywords.
 
 Reply with ONLY this JSON object:
 
-{"sufficient": true|false, "answer": "<your best answer from the records, or empty>", "missing": ["<what is missing>", "..."]}
+{"reasoning": "<first: what the records do and do not establish>", "answer": "<your best answer from the records, or empty>", "missing": ["<what is missing>", "..."], "sufficient": true|false}
 
 Rules:
 - No records, or records unrelated to the question: sufficient is false.
 - `answer` must be a direct answer to the question ("the week before 9 June 2023", "2022", "Caroline", "no") -- never a description of the records.
 - **Match the precision of the evidence -- do NOT demand more.** If the records say a year, the year is a complete answer; a period ("June 2023", "the week of 23 August 2023") is a complete answer when that is all the source supports. Never treat a correctly-anchored relative expression as incomplete just because it is not a single calendar date.
 - Treat a date written differently as the SAME date if it denotes the same period: "the weekend before 4 September 2023" and "2023-09-02" are not a mismatch, and neither is "about a month before 2023-06-17" vs "2023-05-17". Judge the fact, not the phrasing.
+- **A record's date is WHEN IT WAS SAID, not when the event happened.** A record dated 9 June 2023 saying "last week" establishes the week before 9 June 2023 -- do not accept "9 June 2023" as the event date, and do not demand a date that the source does not give.
 - Be strict but not pedantic: if the records state the answer and resolve its referents, say sufficient.
 - `missing` must be empty when sufficient is true."""
 
@@ -172,7 +173,7 @@ def build_verifier_messages(question: str, memories: list[dict[str, Any]]) -> li
         f"# QUESTION\n{question.strip()}\n\n"
         f"# MEMORY RECORDS ({len(memories)})\n{render_memories(memories)}\n\n"
         f"# YOUR VERDICT\n"
-        f'Output only: {{"sufficient": true|false, "answer": "...", "missing": [...]}}'
+        f'Output only: {{"reasoning": "...", "answer": "...", "missing": [...], "sufficient": true|false}}'
     )
     return [
         {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
