@@ -40,8 +40,9 @@ Reply with ONLY this JSON object:
 
 Rules:
 - No records, or records unrelated to the question: sufficient is false.
-- `answer` must be a direct answer to the question ("about a month before 2023-06-17", "Caroline", "no") -- never a description of the records.
-- Treat a date written differently as the SAME date if it denotes the same day: "the weekend before 4 September 2023" and "2023-09-02" are not a mismatch. Judge the fact, not the phrasing.
+- `answer` must be a direct answer to the question ("the week before 9 June 2023", "2022", "Caroline", "no") -- never a description of the records.
+- **Match the precision of the evidence -- do NOT demand more.** If the records say a year, the year is a complete answer; a period ("June 2023", "the week of 23 August 2023") is a complete answer when that is all the source supports. Never treat a correctly-anchored relative expression as incomplete just because it is not a single calendar date.
+- Treat a date written differently as the SAME date if it denotes the same period: "the weekend before 4 September 2023" and "2023-09-02" are not a mismatch, and neither is "about a month before 2023-06-17" vs "2023-05-17". Judge the fact, not the phrasing.
 - Be strict but not pedantic: if the records state the answer and resolve its referents, say sufficient.
 - `missing` must be empty when sufficient is true."""
 
@@ -205,8 +206,8 @@ async def verify(
             "evidence.jsonl. Reading records without writing them down makes no progress."
         )
         missing.append(
-            "Write with `write` (whole file at once) or `jq ... >> evidence.jsonl` in bash, "
-            "then re-read the file to confirm it is non-empty."
+            "Write with `write` (whole file at once), then re-read the file to confirm it is "
+            "non-empty."
         )
         log.warn(
             f"verifier 跳过：evidence 为空（{'文件不存在/空' if not evidence_present else '全部被拒'}），"

@@ -89,7 +89,7 @@ def read_jsonl_report_text(text: str) -> tuple[list[dict[str, Any]], int, int]:
 def parse_jsonl_text(text: str) -> ParseResult:
     """从**文本**解析记录 —— **整个项目唯一的产物解析路径**。
 
-    ``io.read_jsonl``、``search/evidence.py`` 的校验与进展统计、``searchctl`` 的语料加载
+    ``io.read_jsonl``、``search/evidence.py`` 的校验与进展统计、``search/agent.py`` 的观测渲染
     全都走这里。曾经有三份独立实现，导致同一个文件三处判断不一致（实测后果：一次被截断的
     ``write`` 在一个地方能救回 38 条记录，在另一个地方被判成空文件）。
 
@@ -325,7 +325,7 @@ def msg_time(record: dict[str, Any]) -> str:
 
     为什么不在这一步归一化：原始形式里的信息量比一个被猜出来的 ISO 串更可靠，
     而且猜错会把错误固化进下游。需要绝对日期的地方（相对时间推理）用
-    ``search/timecalc`` 现场折算 —— 那里是确定性的算术，且调用方能看见折算过程。
+    确定性工具（bash 的 ``date -d``）现场折算 —— 那里能看见折算过程。
     """
     value = record.get("time")
     if isinstance(value, str):

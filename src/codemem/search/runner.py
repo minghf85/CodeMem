@@ -13,9 +13,6 @@
 
     data/search_runs/{experiment}_{ts}/{dir}/
         inputs/{sessions,session_summaries}.jsonl   只读输入（硬链）
-        inputs/index/                   预建检索索引（只有 --embed 时用得到）
-        inputs/search                   可执行的 search 包装（PATH 里就能直接调）
-        inputs/timecalc                 确定性日期算术
         qa_{idx}/evidence.jsonl         **唯一产物**
         {dir}.qa_trajectories.jsonl     每 QA 一行（含完整步记录）
         {dir}.steps.jsonl               每次模型调用的原始输出（排错用）
@@ -24,8 +21,13 @@
 **语料只有两层**（原始消息 + session summary）。曾经的顶层 speakers summary 已取消：
 它是一条没有 msg_id 可回溯的合成文本，`source` 指不到原始消息，破掉溯源不变量。
 
+**检索靠 grep**：agent 的工具箱就是 read/write/edit/bash，检索是 `grep` 一条命令。
+没有向量索引、没有 embedding 服务、没有外部检索 CLI —— 语料是 JSONL，一行一条记录，
+所以 grep 直接可用、行号稳定，可以 `grep -n` 定位再 `read offset/limit` 精读。
+这砍掉了整条链路里唯一的外部依赖。
+
 **为什么 QA 级并发是安全的**：旧版必须目录内串行，只因为所有 QA 共享一份可变的记忆库；
-现在 base 库只读、产物 per-QA，QA 之间零共享 —— 唯一的共享是只读索引与 embedding 服务。
+现在 base 库只读、产物 per-QA，QA 之间零共享。
 
 自测：``python scripts/test_search.py``（假模型 + 真工具，纯 CPU，零模型成本）。
 """
@@ -51,7 +53,6 @@ from tqdm import tqdm
 
 from . import agent as agent_mod
 from . import evidence as evidence_mod
-from . import index as index_mod
 from . import toolcfg
 from . import verifier as verifier_mod
 from .. import dataset
@@ -64,19 +65,12 @@ DATA_DIR = PROJECT_ROOT / "data"
 CONFIG_FILE = PROJECT_ROOT / "configs" / "search.yaml"
 TOOL_CONFIG_FILE = PROJECT_ROOT / "configs" / "tool.json"
 
-#: 两层语料文件名（与 searchctl.LIBRARY_FILES 一致）。索引、篡改校验、来源描述都用它。
+#: 两层语料文件名。硬链、篡改校验、来源描述都用它。
 CORPUS_FILES = ("sessions.jsonl", "session_summaries.jsonl")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "generator": {"base_url": "http://127.0.0.1:30000/v1", "api_key": "sglang", "model": "local",
                   "temperature": 0.2, "max_tokens": 4096, "enable_thinking": False},
-    "embedding": {"base_url": "http://127.0.0.1:30001/v1", "api_key": "sglang", "model": "local",
-                  "chunk_size": 32, "allow_lexical_fallback": True},
-    # 是否预建语义索引（search --embed 用它）。关闭则 search 只提供关键词模式，
-    # 省掉一次几十秒的嵌入。默认开着：让 agent 在关键词搜不到时有的可选。
-    "build_index": True,
-    "search": {"rrf_k": 60, "weights": {"dense": 1.0, "bm25": 1.0, "tag": 0.5},
-               "memory_chars": 400},
     "max_steps": 30,
     "no_progress_patience": 6,
     "max_verify_rounds": 2,
@@ -326,73 +320,25 @@ def link_dir_or_copy(source: Path, target: Path) -> str:
 def build_shell_prefix(
     *,
     inputs_dir: Path,
-    index_dir: Path,
     config: dict[str, Any],
-    embed_ready: bool,
 ) -> str:
-    """注入给每条 bash 命令的环境：PATH（让 ``search`` 与 ``timecalc`` 成为命令）
-    + 索引 + 嵌入服务参数。"""
-    search_bin = inputs_dir / "search"
-    if search_bin.exists():
-        search_bin.chmod(
-            search_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
-        )
-    timecalc_bin = inputs_dir / "timecalc"
-    if timecalc_bin.exists():
-        timecalc_bin.chmod(
-            timecalc_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
-        )
-    embed = config.get("embedding") or {}
-    search = config.get("search") or {}
-    # 注意：JSON 必须**单引号包起来**。不引的话 bash 会把 {"a":1,"b":2} 当成花括号展开
-    # （`{x,y}` 语法），把它拆成多个词 —— 实测只有最后一个 `tag:0.5` 传进去，导致
-    # searchctl 解析失败并在**每次** search 的观测里吐一行错。
-    weights_json = json.dumps(search.get("weights") or {}, separators=(",", ":"))
-    lines = [
-        f'export PATH="{inputs_dir}:$PATH"',
+    """注入给每条 bash 命令的环境。
+
+    三条：
+
+    - ``PYTHONPATH`` —— 让 agent 自己的代码在子进程里可导入。
+    - ``CODEMEM_INPUTS`` —— 语料目录的绝对路径（用相对路径也行，但绝对路径写进示例
+      更省一次试错）。
+    - **``LC_ALL=C``** —— 这条不是小事。agent 要用 ``date -d`` 算日期，而 ``date`` 的
+      输出格式（月份名、星期名）**跟随系统 locale**：中文环境下
+      ``date -d "8 May 2023 -1 day" +"%d %b %Y"`` 会输出 ``07 5月 2023``，写进 evidence
+      就是一条下游读不了的记录。固定成 C，输出永远是 ``07 May 2023``。
+    """
+    return "\n".join([
+        'export LC_ALL=C',
         f'export PYTHONPATH="{PROJECT_ROOT / "src"}:$PYTHONPATH"',
-        f'export CODEMEM_INDEX="{index_dir}"',
-        f'export CODEMEM_RRF_K="{int(search.get("rrf_k", 60))}"',
-        f'export CODEMEM_MEMORY_CHARS="{int(search.get("memory_chars", 400))}"',
-        f"export CODEMEM_SEARCH_WEIGHTS='{weights_json}'",
-    ]
-    if not embed_ready:
-        # 索引没建起来：**不导出嵌入服务参数**。这样 `search --embed` 会在 searchctl 里
-        # 拿到一句明确的 "CODEMEM_EMBED_URL 未设置"，而不是一个连不上的地址。
-        return "\n".join(lines)
-    lines += [
-        f'export CODEMEM_EMBED_URL="{embed.get("base_url", "")}"',
-        f'export CODEMEM_EMBED_KEY="{embed.get("api_key", "")}"',
-        f'export CODEMEM_EMBED_MODEL="{embed.get("model", "")}"',
-        f'export CODEMEM_EMBED_CHUNK="{int(embed.get("chunk_size", 32))}"',
-    ]
-    return "\n".join(lines)
-
-
-def write_search_wrapper(inputs_dir: Path) -> Path:
-    """写 ``inputs/search`` 与 ``inputs/timecalc`` —— agent 在 PATH 里直接调的命令包装。"""
-    wrapper = inputs_dir / "search"
-    wrapper.write_text(
-        "#!/usr/bin/env bash\n"
-        "# 检索入口：两层语料（session summaries + 原始消息），每行输出一条 JSON。\n"
-        "# 默认关键词（BM25 + tag）；加 --embed 才走语义。\n"
-        '# 由 codemem.search.runner 生成。用法：search "QUERY" [-k N] [--source summary|raw|evidence|all]\n'
-        f'exec python -m codemem.search.searchctl "$@"\n',
-        encoding="utf-8",
-    )
-    wrapper.chmod(0o755)
-
-    # timecalc：相对时间/区间的确定性算术（模型自己算日期不可靠）
-    timecalc = inputs_dir / "timecalc"
-    timecalc.write_text(
-        "#!/usr/bin/env bash\n"
-        "# 确定性日期算术：相对时间（'about a month ago'）-> 绝对日期。\n"
-        "# 用法：timecalc shift <date> <offset> | diff <a> <b> | range <s> <e> | info <date>\n"
-        f'exec python -m codemem.search.timecalc "$@"\n',
-        encoding="utf-8",
-    )
-    timecalc.chmod(0o755)
-    return wrapper
+        f'export CODEMEM_INPUTS="{inputs_dir}"',
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -475,8 +421,6 @@ async def run_qa(
     config: dict[str, Any],
     catalog: toolcfg.ToolCatalog,
     model: ModelRunner,
-    embedder: Any,
-    embed_ready: bool,
     log: Logger,
     semaphore: asyncio.Semaphore,
     repeat: int = 1,
@@ -526,9 +470,7 @@ async def run_qa(
         qa_inputs = workspace_root / "inputs"
         link_dir_or_copy(inputs_dir, qa_inputs)
 
-        shell_prefix = build_shell_prefix(
-            inputs_dir=inputs_dir, index_dir=index_dir, config=config, embed_ready=embed_ready
-        )
+        shell_prefix = build_shell_prefix(inputs_dir=inputs_dir, config=config)
         workspace = Workspace(root=workspace_root, inputs=qa_inputs,
                               evidence=evidence_path, shell_prefix=shell_prefix)
 
@@ -849,7 +791,6 @@ async def run_dir(
     config: dict[str, Any],
     catalog: toolcfg.ToolCatalog,
     generator: openai.AsyncOpenAI,
-    embedder: Any,
     run_dir: Path,
     log: Logger,
 ) -> dict[str, Any]:
@@ -874,9 +815,7 @@ async def run_dir(
 
     out_dir = run_dir / label
     out_dir.mkdir(parents=True, exist_ok=True)
-    inputs_dir, index_dir, _search_bin, embed_ready = await build_inputs(
-        directory, run_dir, config, embedder, log
-    )
+    inputs_dir = await build_inputs(directory, run_dir, config, log)
 
     max_qa = max(0, int(config.get("max_qa", 0) or 0))
     skip_category5 = bool(config.get("skip_category5", True))
@@ -902,7 +841,7 @@ async def run_dir(
         + (f"（跳过 {skipped} 条）" if skipped else "")
         + f" / 步上限 {config.get('max_steps')} / verifier≤{config.get('max_verify_rounds')} "
         f"/ 并发 {config.get('concurrency')}"
-        + ("" if embed_ready else " / 无索引（--embed 不可用）")
+
         + ("".join(f" / {note}" for note in selection.notes))
     )
 
@@ -935,7 +874,7 @@ async def run_dir(
                 run_qa(
                     qa_index=index, qa=qa, directory=directory, run_dir=run_dir,
                     inputs_dir=inputs_dir, index_dir=index_dir, config=config,
-                    catalog=catalog, model=model, embedder=embedder, embed_ready=embed_ready,
+                    catalog=catalog, model=model,
                     log=log, semaphore=semaphore, repeat=run,
                 )
             )
@@ -959,7 +898,7 @@ async def run_dir(
 
     # 按 (QA 下标, 重复次数) 稳定排序，同一条 QA 的多次运行排在一起便于对比
     records.sort(key=lambda item: (item.qa_index, item.repeat))
-    summary = summarize_dir(label, records, model, len(usable), skipped, embed_ready)
+    summary = summarize_dir(label, records, model, len(usable), skipped)
     log.info(
         f"完成：QA {summary['qa_done']}/{len(usable)}"
         + (f"×{repeats}" if repeats > 1 else "")
@@ -1013,121 +952,27 @@ async def build_inputs(
     directory: Path,
     run_dir: Path,
     config: dict[str, Any],
-    embedder: Any,
     log: Logger,
-) -> tuple[Path, Path, Path, bool]:
-    """建 ``<run>/{dir}/inputs/``：硬链两个 jsonl、写 search 包装、准备检索索引。
+) -> Path:
+    """建 ``<run>/{dir}/inputs/``：把两层语料硬链进去。返回 ``inputs_dir``。
 
-    返回 ``(inputs_dir, index_dir, search_bin, embed_ready)``。``embed_ready=True`` 表示
-    索引已就绪、``search --embed`` 可用；False 时 search 只有关键词模式（**这是默认路径**，
-    不是降级 —— 见 ``searchctl`` 模块开头）。
+    没有别的东西了 —— 没有索引、没有命令包装、没有环境文件。语料是 JSONL，agent 用
+    ``grep`` 检索、用 ``read`` 精读，这两样都在系统里。于是：
 
-    **存储优化（重要）**：索引（float32 向量）是这一步最大的产物 —— 一个目录
-    1688 条 × 2560 维 ≈ **17MB**，而它只取决于 ``(语料, 嵌入模型)``，与哪次运行、哪条 QA
-    完全无关。早期实现把它建在**每次运行的目录里**，所以跑 23 次就是 334MB 的重复数据
-    （实测）。
-
-    现在索引放**共享缓存** ``data/search_runs/.index_cache/{corpus}-{model}/``，
-    运行目录里只放一个**符号链接**指过去。于是：
-
-    - 同一目录反复跑（调试、``--qa``、``--repeat``）**只嵌一次**；
-    - 语料变了（重新跑 ``add``）→ ``corpus_sha256`` 变 → 自动建新缓存，旧的留着不影响，
-      也**绝不会**静默复用过期向量；
-    - 删除某次运行目录只删链接，共享索引不受影响。
-
-    ``sessions.jsonl`` / ``session_summaries.jsonl`` 本来就用硬链，不占额外空间（inode 共享）。
+    - 一次运行的可再生中间产物只剩 evidence.jsonl 与轨迹；
+    - 同一目录反复跑不再需要"只嵌一次"的缓存机制（那套是为向量索引存在的）；
+    - 硬链保证运行目录不占额外空间，也保证收尾的 sha256 篡改校验有意义。
     """
     inputs_dir = run_dir / directory.name / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
-    # 两层语料，粒度递减（agent 由粗到细地检索）：
+    # 两层语料：
     #   session_summaries    每次会话一份（粗筛：定位到哪次会话）
     #   sessions             原始消息（精确措辞、时间锚点）
     for name in CORPUS_FILES:
         source = directory / name
         if source.exists():
             link_or_copy(source, inputs_dir / name)
-    search_bin = write_search_wrapper(inputs_dir)
-
-    embed_cfg = config.get("embedding") or {}
-    allow_fallback = bool(embed_cfg.get("allow_lexical_fallback", True))
-    have_embed = bool(embed_cfg.get("base_url")) and bool(embed_cfg.get("model"))
-    model = str(embed_cfg.get("model", ""))
-    index_dir = inputs_dir / "index"
-
-    # 索引**只为 --embed 服务**。默认检索是关键词（BM25 + tag），不需要向量 ——
-    # 所以没有嵌入服务时不再是"降级"，只是少了一条 agent 主动选择才会用的通道。
-    if not have_embed or embedder is None or not bool(config.get("build_index", True)):
-        if not allow_fallback:
-            raise RuntimeError("没有可用的 embedding 配置，且 allow_lexical_fallback=false")
-        log.info(
-            "不建语义索引：search 走关键词模式（默认）。"
-            + ("" if have_embed else "未配置 embedding。")
-            + ("" if bool(config.get("build_index", True)) else "build_index=false。")
-            + "（--embed 因此不可用）"
-        )
-        _link_index(index_dir, None)
-        return inputs_dir, index_dir, search_bin, False
-
-    # 索引覆盖**两层语料全部**：summary 是概览（粗筛），原始消息是细节（精检索），
-    # 只索引其中一层会让另一层永远搜不到。两层的 id 不重叠（summary 带 _summary 后缀）。
-    session_summaries = read_jsonl(inputs_dir / "session_summaries.jsonl")
-    sessions = read_jsonl(inputs_dir / "sessions.jsonl")
-    memories = [*session_summaries, *sessions]
-
-    cache_root = Path(config.get("index_cache_dir") or (run_dir.parent / ".index_cache"))
-    shared = index_mod.shared_index_dir(cache_root, memories, model)
-
-    if index_mod.index_is_usable(shared, memories, model):
-        log.info(
-            f"复用共享索引缓存：{len(memories)} 条 × {index_mod.load_index(shared).dim} 维 "
-            f"（session summary {len(session_summaries)} + 消息 {len(sessions)}）"
-        )
-    else:
-        log.info(
-            f"建检索索引：{len(memories)} 条"
-            f"（session summary {len(session_summaries)} + 原始消息 {len(sessions)}）"
-            f" -> 共享缓存 {shared}"
-        )
-        try:
-            built = await index_mod.build_index(
-                memories,
-                embed=embedder.embed,
-                directory=shared,
-                model=model,
-                source=" + ".join(sorted(CORPUS_FILES)),
-            )
-        except Exception as exc:  # noqa: BLE001
-            if not allow_fallback:
-                raise
-            log.warn(
-                f"建索引失败（{type(exc).__name__}: {exc}），search 走关键词模式"
-                f"（默认行为；--embed 将不可用）"
-            )
-            _link_index(index_dir, None)
-            return inputs_dir, index_dir, search_bin, False
-        log.info(f"索引完成：{len(built)} 条 × {built.dim} 维 -> {shared}")
-
-    _link_index(index_dir, shared)
-    return inputs_dir, index_dir, search_bin, True
-
-
-def _link_index(index_dir: Path, shared: Path | None) -> None:
-    """把 ``inputs/index`` 指向共享缓存（符号链接）；``shared=None`` 时确保它不存在。
-
-    用符号链接而不是 ``os.link``：目录不能硬链。链接的目标在运行目录之外，所以
-    agent 若试图写 ``inputs/index/...`` 会被工具层的路径约束拦下（resolve 后在外）。
-    """
-    if index_dir.is_symlink() or index_dir.is_file():
-        index_dir.unlink()
-    elif index_dir.exists():
-        shutil.rmtree(index_dir, ignore_errors=True)
-    if shared is None:
-        return
-    try:
-        index_dir.symlink_to(shared, target_is_directory=True)
-    except OSError:
-        # 极少数文件系统不支持符号链接：退化成复制（至少功能正确）
-        shutil.copytree(shared, index_dir)
+    return inputs_dir
 
 
 def summarize_dir(
@@ -1136,7 +981,6 @@ def summarize_dir(
     model: ModelRunner,
     qa_total: int,
     skipped: int,
-    embed_ready: bool,
 ) -> dict[str, Any]:
     done = [r for r in records if not r.error]
     sufficient = [r for r in records if r.sufficient]
@@ -1156,7 +1000,6 @@ def summarize_dir(
         "steps_mean": round(steps / len(records), 2) if records else 0.0,
         "tool_calls_total": sum(r.tool_calls for r in records),
         "tampered": sum(1 for r in records if r.tampered),
-        "embed_available": embed_ready,
         "model_calls": model.stats()["calls"],
         "model_failures": model.stats()["failures"],
         # --repeat：逐条 QA 的多次运行是否一致（单次跑时为 1，没有意义）
@@ -1173,7 +1016,8 @@ def summarize_dir(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="EvoMem v3：code-agent 式证据构建（read/write/edit/bash + jq/search）"
+        description="search：搜索 agent 的证据构建"
+                    "（read/write/edit/bash；检索靠 grep，时间靠 date -d）"
     )
     parser.add_argument("dirs", nargs="*", help="speaker 目录名或路径；缺省处理全部")
     parser.add_argument("--config", default=str(CONFIG_FILE), help="搜索配置（默认 configs/search.yaml）")
@@ -1197,21 +1041,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--experiment", default="search", help="实验名，作为输出子目录前缀")
     parser.add_argument("--output-dir", default=str(DATA_DIR / "search_runs"), help="输出根目录")
     parser.add_argument("--prune-runs", action="store_true",
-                        help="清理历史运行目录（保留最后一次全量运行与共享索引缓存），然后退出。"
+                        help="清理历史运行目录（默认保留含 'full' 的那次），然后退出。"
                              "不传 --yes 时只列出将要删除的内容")
     parser.add_argument("--keep-last", type=int, default=0,
                         help="配合 --prune-runs：保留最近 N 次运行（默认 0 = 只保留含 full 的那次）")
-    parser.add_argument("--clean-index-cache", action="store_true",
-                        help="列出并删除**运行目录里内嵌的旧索引**（存储优化前的产物，"
-                             "与共享缓存重复），然后退出。不传则只列出不删")
-    parser.add_argument("--yes", action="store_true", help="配合 --clean-index-cache 真正执行删除")
+    parser.add_argument("--yes", action="store_true", help="配合 --prune-runs 真正执行删除")
     parser.add_argument("--log-full-messages", action="store_true",
                         help="模型调用落盘时带上完整 messages（默认只记原始输出；"
                              "打开后体积约放大 15 倍，仅在需要复现上下文时用）")
     parser.add_argument("--log-level", default="", help="debug/info/warn/error/silent")
     parser.add_argument("--log-output", default=None, help="日志保存目录（空串=只打终端）")
     parser.add_argument("--dry-run", action="store_true",
-                        help="只建 inputs/ + 索引 + 渲染 prompt 后打印，不调模型")
+                        help="只建 inputs/ + 渲染 prompt 后打印，不调模型")
     return parser.parse_args(argv)
 
 
@@ -1254,16 +1095,6 @@ def resolve_dirs(config: dict[str, Any], args: argparse.Namespace) -> list[Path]
     )
 
 
-def make_embedder(config: dict[str, Any], log: Logger) -> Any:
-    cfg = config.get("embedding") or {}
-    if not cfg.get("base_url") or not cfg.get("model"):
-        return None
-    from .embedder import Embedder
-
-    client = openai.AsyncOpenAI(base_url=cfg["base_url"], api_key=cfg.get("api_key") or "none")
-    return Embedder(client, str(cfg["model"]), chunk_size=int(cfg.get("chunk_size", 32)), log=log)
-
-
 async def async_main(args: argparse.Namespace) -> None:
     config = load_config(Path(args.config))
     for key, override in (
@@ -1287,12 +1118,12 @@ async def async_main(args: argparse.Namespace) -> None:
 
     log = build_logger(config, args)
 
-    # --prune-runs：清理历史运行目录（不动共享索引缓存）
+    # --prune-runs：清理历史运行目录
     if args.prune_runs:
-        from . import index as index_mod
+        from . import prune as prune_mod
 
         runs_root = Path(args.output_dir)
-        plan = index_mod.plan_prune(runs_root, keep_last=args.keep_last)
+        plan = prune_mod.plan_prune(runs_root, keep_last=args.keep_last)
         if not plan:
             print(f"没有可清理的运行目录（{runs_root}）")
             return
@@ -1302,37 +1133,13 @@ async def async_main(args: argparse.Namespace) -> None:
             print(f"  {size / 1024:>8.0f} KB  {path.name}")
         if len(plan) > 10:
             print(f"  … 另外 {len(plan) - 10} 个")
-        print(f"\n保留：{'.index_cache/（共享索引，永不删）'}"
-              + (f" + 最近 {args.keep_last} 次运行" if args.keep_last else " + 含 'full' 的运行"))
+        print("\n保留：" + (f"最近 {args.keep_last} 次运行" if args.keep_last
+                            else "含 'full' 的运行（没有则保留最近一次）"))
         if not args.yes:
             print("\n加 --yes 才会真正删除")
             return
-        removed, freed = index_mod.prune_runs(runs_root, plan)
+        removed, freed = prune_mod.prune_runs(runs_root, plan)
         print(f"已删除 {removed} 个目录，释放 {freed / 1024 / 1024:.1f} MB")
-        return
-
-    # --clean-index-cache：清理旧的内嵌索引（存储优化前的产物）
-    if args.clean_index_cache:
-        from . import index as index_mod
-
-        runs_root = Path(args.output_dir)
-        legacy = index_mod.find_legacy_indexes(runs_root)
-        if not legacy:
-            print(f"没有发现内嵌的旧索引（{runs_root}）")
-            return
-        total = sum(
-            sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) for path in legacy
-        )
-        print(f"发现 {len(legacy)} 个内嵌的旧索引，共 {total / 1024 / 1024:.0f} MB：")
-        for path in legacy[:10]:
-            print(f"  {path}")
-        if len(legacy) > 10:
-            print(f"  … 另外 {len(legacy) - 10} 个")
-        if not args.yes:
-            print("\n加 --yes 才会真正删除（共享缓存 data/search_runs/.index_cache 不受影响）")
-            return
-        freed = index_mod.remove_paths(legacy)
-        print(f"已删除 {len(legacy)} 个，释放 {freed / 1024 / 1024:.0f} MB")
         return
 
     catalog = toolcfg.load_catalog(args.tool_config)
@@ -1387,9 +1194,6 @@ async def async_main(args: argparse.Namespace) -> None:
         print(rendered)
         return
 
-    embedder = make_embedder(config, gen_log)
-    if embedder is None:
-        gen_log.info("未配置可用的 embedding：search 只提供关键词模式（--embed 不可用）")
     generator = openai.AsyncOpenAI(
         base_url=gen_cfg.get("base_url"), api_key=gen_cfg.get("api_key") or "none"
     )
@@ -1400,7 +1204,7 @@ async def async_main(args: argparse.Namespace) -> None:
     async def worker(directory: Path) -> dict[str, Any]:
         async with dir_semaphore:
             try:
-                return await run_dir(directory, config, catalog, generator, embedder, run_root, log)
+                return await run_dir(directory, config, catalog, generator, run_root, log)
             except Exception as exc:  # noqa: BLE001 - 一个目录失败不影响其它目录
                 log.error(f"[{directory.name}] 目录失败：{type(exc).__name__}: {exc}")
                 import traceback

@@ -13,9 +13,10 @@
     load_catalog(path)            读 + 校验 tool.json
     catalog.apply(tools)          把 description/guidelines/input_schema 填进 ToolDefinition
     catalog.render_tools()        渲染 <tools> 段
-    catalog.render_commands()     渲染 jq/search 的用法与示例
+    catalog.render_commands()     渲染 grep/date 的用法与示例
     catalog.render_workspace()    渲染目录布局与只读规则
-    catalog.render_schema()       渲染 base_mem 字段说明
+    catalog.render_schema()       渲染 evidence 记录字段说明
+    catalog.render_time_policy()  渲染"时间精度"规则段
     catalog.render_prompt(question)  渲染完整 system prompt（替换 {{TOOLS}} 等槽位）
     catalog.prompt_text(key)      取 user_begin / user_gaps / ... 文案
     parse_tool_call(text)         解析模型输出为一次工具调用
@@ -36,7 +37,8 @@ DEFAULT_TOOL_CONFIG = PROJECT_ROOT / "configs" / "tool.json"
 
 # system prompt 里的槽位名 -> catalog 属性。渲染时逐一替换。
 # 新增槽位时记得同时加进 ``validate`` 的检查，否则拼错槽位会静默留一个 {{XXX}} 在 prompt 里。
-PROMPT_SLOTS = ("TOOLS", "COMMANDS", "WORKSPACE", "SCHEMA", "PROTOCOL", "WRITING_POLICY")
+PROMPT_SLOTS = ("TOOLS", "COMMANDS", "WORKSPACE", "SCHEMA", "PROTOCOL", "WRITING_POLICY",
+                "TIME_POLICY")
 
 
 class ToolConfigError(ValueError):
@@ -155,6 +157,7 @@ class ToolCatalog:
     schema: dict[str, Any]
     prompt: dict[str, str]
     writing_policy: dict[str, Any] = field(default_factory=dict)
+    time_policy: dict[str, Any] = field(default_factory=dict)
     source_path: Path | None = None
 
     # -- 校验 ---------------------------------------------------------------
@@ -247,6 +250,20 @@ class ToolCatalog:
         lines.extend(f"- {rule}" for rule in self.writing_policy.get("rules", []))
         return "\n".join(lines)
 
+    def render_time_policy(self) -> str:
+        """渲染"时间精度"这一段。
+
+        它约束的是**答案的粒度**：源语料说"去年"，答案就该是年份，不能编一个具体日期；
+        源语料依附于某个锚点（"9 June 之前的那个星期"），那这个锚点表述本身就是正确答案。
+        实测 LoCoMo 的 "when" 问题里，绝大多数参考答就是这种相对/区间形态，而不是单点日期。
+        """
+        lines: list[str] = []
+        headline = str(self.time_policy.get("headline", "")).strip()
+        if headline:
+            lines.append(headline)
+        lines.extend(f"- {rule}" for rule in self.time_policy.get("rules", []))
+        return "\n".join(lines)
+
     def render_protocol(self) -> str:
         lines = [
             str(self.protocol.get("response_format", "")).strip(),
@@ -266,6 +283,7 @@ class ToolCatalog:
             "{{SCHEMA}}": self.render_schema(),
             "{{PROTOCOL}}": self.render_protocol(),
             "{{WRITING_POLICY}}": self.render_writing_policy(),
+            "{{TIME_POLICY}}": self.render_time_policy(),
             "{{QUESTION}}": question.strip(),
         }
         for slot, value in replacements.items():
@@ -308,5 +326,6 @@ def load_catalog(path: str | Path | None = None) -> ToolCatalog:
         schema=raw["schema"],
         prompt=raw["prompt"],
         writing_policy=raw.get("writing_policy") or {},
+        time_policy=raw.get("time_policy") or {},
         source_path=target,
     )

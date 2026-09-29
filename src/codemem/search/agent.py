@@ -1,12 +1,12 @@
 """agent loop：让模型用 read/write/edit/bash 在一个目录里自主探索、写出 evidence.jsonl。
 
-设计见 ``docs/evomem_plan_v3.md`` §5。这个 loop 的目标是**对齐成熟 code agent 的标准做法**，
+设计见 ``docs/search.md``。这个 loop 的目标是**对齐成熟 code agent 的标准做法**，
 同时针对实测暴露的四个失败点做了具体修正（每条都有日志里的证据）：
 
 ======================  =====================================================  ==========
 实测问题                 做法                                                    借鉴来源
 ======================  =====================================================  ==========
-93% 的观测是空（`jq >> `  每次变更型调用后**附加证据摘要**（行数/唯一 id/末尾行）     code agent 的
+93% 的观测是空（`grep >> ` 每次变更型调用后**附加证据摘要**（行数/唯一 id/末尾行）     code agent 的
 重定向 stdout 为空），模                                                       post-write 反馈
 型看不见自己刚写了什么    → ``_evidence_digest``
 60/60 步没有一次完成信号  **重复检测**：同样的工具+参数再来一次就直接拒绝并警告     重复工具调用检测
@@ -25,10 +25,10 @@ prompt 随历史无限涨       **上下文压缩**：超出预算即把中段�
 2. **空回复才终止**：只有模型**明确回复纯文本**才视为"我做完了"。解析失败不再是完成信号 ——
    它和"完成"语义完全不同，混在一起会让 verifier 对着一份半成品去判。
 
-本模块不知道 verifier 的存在：验证由 ``evomem_v3.run_qa`` 编排（它在 agent 停下后调用
+本模块不知道 verifier 的存在：验证由 ``runner.run_qa`` 编排（它在 agent 停下后调用
 verifier，并把 ``missing[]`` 作为 user 消息再喂回来继续跑）。这样 agent loop 可以单独测试。
 
-自测：``python scripts/test_evomem_v3.py``（假模型 + 真工具，纯 CPU）。
+自测：``python scripts/test_search.py``（假模型 + 真工具，纯 CPU）。
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ ModelCall = Callable[[list[dict[str, str]], dict[str, Any]], Awaitable[str]]
 def _evidence_digest(path: Path, state: EvidenceState, limit: int = 3) -> str:
     """变更型调用之后附在观测末尾的证据摘要。
 
-    **这是修 P0 的核心**：``jq ... >> evidence.jsonl`` 的 stdout 是空的（重定向走了），
+    **这是修 P0 的核心**：``grep ... >> evidence.jsonl`` 的 stdout 是空的（重定向走了），
     所以模型收到的观测是 ``(no output)`` —— 它看不见自己刚写了什么，于是盲目重试。
     这里由 harness 主动把"文件现在长什么样"告诉它。
     """
@@ -86,14 +86,14 @@ def repeat_notice(call: ToolCall, count: int) -> str:
         f"ERROR: you already ran this exact {call.tool} call {count} times "
         f"({call.describe()}). Running it again cannot change the result.\n"
         f"Do something DIFFERENT. Common reasons you are stuck:\n"
-        f"- The id is NOT in that file. `jq select(...)` that matches nothing prints NOTHING and "
-        f"still exits 0. Print the real ids to check: "
-        f"jq -r '.msg_id' inputs/sessions.jsonl | head -20\n"
-        f"- To resolve a relative time, read the session timestamp off any message in that "
-        f"session (jq -c 'select(.msg_id==\"session_1_3\")' inputs/sessions.jsonl), then run "
-        f"timecalc on it. Do not guess the date.\n"
-        f"- To see what you already have: jq -r '.content' evidence.jsonl\n"
-        f"- To hop: search a NEW name or word you read, e.g. search \"Melanie husband\" -k 5\n"
+        f"- That word may simply not be in that file. Try the OTHER file "
+        f"(inputs/session_summaries.jsonl vs inputs/sessions.jsonl), or a different word.\n"
+        f"- To hop: grep a NEW name or number you just read, e.g. "
+        f"grep -in \"Melanie husband\" inputs/sessions.jsonl | head\n"
+        f"- To see what you already have: grep -c . evidence.jsonl\n"
+        f"- If the question wants a SET, or answers keep turning up in different sessions, stop "
+        f"grepping one word and sweep: grep -n \"NAME\" inputs/session_summaries.jsonl, then read "
+        f"each session it names.\n"
         f"When the evidence already answers the question, reply with plain text (no JSON) to finish."
     )
 
@@ -136,27 +136,48 @@ def write_nudge_notice(step_count: int, have: int) -> str:
     return (
         f"\n\n[You have gone {step_count} steps and evidence.jsonl is still EMPTY. "
         f"Stop reading and WRITE what you have already found, now. Use `write` with the full "
-        f"list of records, or `jq ... > evidence.jsonl`. You can always improve it afterwards -- "
+        f"list of records. You can always improve it afterwards -- "
         f"an empty file scores zero no matter how well you searched.\n"
         f"If you are unsure whether a candidate belongs, include it with the wording you can "
         f"support and move on. Do not spend more turns re-reading the same record.]"
     )
 
 
-def no_output_notice(call: ToolCall) -> str:
-    """命令**成功但没有任何输出**时的提示（`jq` 选不到任何东西就是这种表现）。
+def grep_no_match_notice() -> str:
+    """``grep`` 退出码 1（= 没有匹配）时的提示。
 
-    这是实测里最隐蔽的一个坑：``jq 'select(...)'`` 匹配不到内容时打印空、退出码 0，
-    于是观测是空的，模型以为自己被截断了（或环境坏了），就**再跑一次同样的命令** ——
-    重复检测又把它拒掉，浪费两步。这里直接把"选不到东西"翻译出来，并提示 id 可能写错。
+    这是 grep 最容易骗过 agent 的一点：**没找到不是错误，退出码 1 是它的正常"无匹配"**。
+    工具层会附一句 ``Command exited with code 1``，所以观测**非空** —— 只看"输出为空"是
+    判不出来的。而模型看到 "exited with code 1" 的第一反应往往是环境坏了、命令写错了，
+    于是重试同一个命令（再被重复检测拒掉，白烧两步）。
+    """
+    return (
+        "\n\n[grep exited 1: that means NO MATCH, not a failure -- grep returns 1 when a pattern "
+        "is not found. The word is either absent from that file or spelled differently there. "
+        "Next: try the other file (inputs/session_summaries.jsonl / inputs/sessions.jsonl), or a "
+        "shorter/other word, or fewer terms at once. See what is actually there with: "
+        "grep -c . inputs/sessions.jsonl]"
+    )
+
+
+def no_output_notice(call: ToolCall) -> str:
+    """命令**成功但没有任何输出**时的提示（grep 没命中就是这种表现）。
+
+    这是实测里最隐蔽的一个坑：``grep`` 匹配不到内容时打印空、**退出码 1**，于是观测是空的，
+    模型以为自己被截断了（或环境坏了），就**再跑一次同样的命令** —— 重复检测又把它拒掉，
+    浪费两步。这里直接把"没搜到"翻译出来。
+
+    退出码 1 是 grep 的"无匹配"而不是崩溃，这一点值得明说 —— 模型常把它当失败。
     """
     command = str(call.args.get("command") or "")
-    if "jq" not in command:
+    if "grep" not in command:
         return "\n\n[(no output). If that is unexpected, re-check the command.]"
     return (
-        "\n\n[(no output). For jq this usually means the selector matched NOTHING -- the file may "
-        "not contain that id. Print the real ids to check: "
-        "jq -r '.msg_id' inputs/sessions.jsonl | head -20 -- or use `search` instead.]"
+        "\n\n[(no output). grep found NO match for that pattern -- that is not a crash "
+        "(grep exits 1 when nothing matches). Either the word is not in that file, or it is "
+        "spelled differently there. Try the other file "
+        "(inputs/session_summaries.jsonl / inputs/sessions.jsonl), or another word. "
+        "Check what is actually there with: grep -c . inputs/sessions.jsonl]"
     )
 
 
@@ -290,12 +311,12 @@ class AgentOutcome:
 class _RepeatTracker:
     """同一个工具+参数重复调用的检测。
 
-    实测：模型会用**完全相同**的 ``jq ... >> evidence.jsonl`` 连做 5~10 次，因为观测是空的
+    实测：模型会用**完全相同**的 ``grep ... >> evidence.jsonl`` 连做 5~10 次，因为观测是空的
     它以为没成功。直接拒绝（而不是照做）能在第一次重复时就打断这个循环 —— 照做只会让文件
     更脏（QA2 的 119 行重复就是这么来的）。
 
     **但重复检测必须感知状态。** 一个成熟 code agent 的语义是"重复一次没推进的调用"，
-    而不是"这个命令一辈子只能跑一次"：``jq -s 'unique_by(...)' evidence.jsonl > t && mv t``
+    而不是"这个命令一辈子只能跑一次"：``sort -u evidence.jsonl -o evidence.jsonl``
     在文件变了之后**应该**被允许再跑。所以计数按 **文件状态指纹** 分桶 —— 指纹变了就重来，
     否则才拒绝。
     """
@@ -575,7 +596,7 @@ async def run_agent_round(
         if call.tool not in tools:
             step.error = (
                 f"unknown tool {call.tool!r}. Available: {sorted(tools)}. "
-                f"Use bash for shell commands (jq, search, timecalc), or read/write/edit for files."
+                f"Use bash for shell commands (grep, sed, read), or read/write/edit for files."
             )
             outcome.tool_errors += 1
             log.warn(f"step {global_step} 未知工具 {call.tool!r}（可用 {sorted(tools)}）")
@@ -614,8 +635,15 @@ async def run_agent_round(
                 f"step {global_step} evidence 有 {state_after.unique_ids} 条"
                 f"（软上限 {evidence_soft_limit}），注入精简提醒"
             )
-        # 命令成功但没有任何输出：`jq` 选不到东西就是这种表现，最容易让模型误判后重复重试。
-        if (step.result is not None and step.result.ok and not step.error
+        # grep 没命中 = **退出码 1**（不是崩溃）。这是它和别的命令最不一样的地方，模型常把它
+        # 当失败然后重试同样的命令。观测里必须显式翻译 —— 只靠"输出为空"判不出来，因为
+        # 工具层会附一句 "Command exited with code 1"，观测非空。
+        if (step.result is not None and not step.error and not step.result.ok
+                and step.result.details.get("exit_code") == 1
+                and "grep" in str(call.args.get("command") or "")):
+            observation += grep_no_match_notice()
+        # 命令成功但没有任何输出（sed/head 之类）—— 单独一条，别和上面的 grep 混起来。
+        elif (step.result is not None and step.result.ok and not step.error
                 and not step.result.text.strip()):
             observation += no_output_notice(call)
         # P0 修复：变更型调用之后**主动告诉模型文件现在长什么样**（重定向让 stdout 为空）
@@ -627,7 +655,7 @@ async def run_agent_round(
                 f"\n\n[WARNING: evidence.jsonl has {state_after.duplicate_lines} duplicate lines "
                 f"({state_after.lines} lines but only {state_after.unique_ids} unique ids). "
                 f"Appending again will not help. Deduplicate first:\n"
-                f"  jq -sc 'unique_by(.metadata.id)[]' evidence.jsonl > t && mv t evidence.jsonl]"
+                f"  sort -u evidence.jsonl -o evidence.jsonl]"
             )
 
         messages.append({"role": "assistant", "content": reply})

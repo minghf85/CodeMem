@@ -5,14 +5,12 @@
 
 1. ``toolcfg``：catalog 加载与校验、prompt 渲染（槽位全部替换）、响应解析的稳健性。
 2. ``tools``：read/write/edit/bash 的正常路径 + 全部失败路径 + 路径约束。
-3. ``index`` + ``searchmem``：纯词法检索（含 RRF 与兜底填满 top_k）。
-4. ``evidence``：逐行校验、补全 changelog、拒绝缺 source / 重复 id / 坏类型。
-5. ``verifier``：解析稳健性 + 解析失败**保守判不足**。
-6. ``agent``：用假模型脚本驱动一轮 agent loop，验证无进展检测与失败不中断。
-7. ``searchctl``：CLI 端到端（词法模式，真子进程）。
-8. ``runner``：dry-run 渲染，以及用假模型跑通一条 QA 的端到端（含篡改检测）。
+3. ``evidence``：逐行校验、补全 changelog、拒绝缺 source / 重复 id / 坏类型。
+4. ``verifier``：解析稳健性 + 解析失败**保守判不足**。
+5. ``agent``：用假模型脚本驱动一轮 agent loop，验证无进展检测与失败不中断。
+6. ``runner``：dry-run 渲染，以及用假模型跑通一条 QA 的端到端（含篡改检测）。
 
-跑：``python scripts/test_evomem_v3.py``
+检索不需要测 —— 它就是 ``grep``，没有我们的代码。
 """
 
 from __future__ import annotations
@@ -29,8 +27,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from codemem.search import agent as agent_mod   # noqa: E402
 from codemem.search import evidence as evidence_mod  # noqa: E402
-from codemem.search import index as index_mod   # noqa: E402
-from codemem.search import searchmem            # noqa: E402
+from codemem.search import prune as prune_mod   # noqa: E402
 from codemem.search import toolcfg              # noqa: E402
 from codemem.search import tools as tools_mod   # noqa: E402
 from codemem.search import verifier as verifier_mod  # noqa: E402
@@ -84,8 +81,8 @@ def test_toolcfg(tmp: Path) -> None:
     catalog = toolcfg.load_catalog(PROJECT_ROOT / "configs/tool.json")
     check("catalog 加载成功", bool(catalog.tools), str(catalog.tools))
     check("四个工具都有描述", set(catalog.tools) == {"read", "write", "edit", "bash"})
-    check("命令含 jq / search / timecalc",
-          set(catalog.commands) == {"jq", "search", "timecalc"}, str(set(catalog.commands)))
+    check("命令含 grep / date（检索与算术都走 bash 原生工具）",
+          set(catalog.commands) == {"grep", "time"}, str(set(catalog.commands)))
     catalog.validate(["read", "write", "edit", "bash"])
     try:
         catalog.validate(["read", "write", "edit", "bash", "nope"])
@@ -95,33 +92,43 @@ def test_toolcfg(tmp: Path) -> None:
 
     rendered = catalog.render_prompt("Who is Caroline?")
     for slot in ("{{TOOLS}}", "{{COMMANDS}}", "{{WORKSPACE}}", "{{SCHEMA}}", "{{PROTOCOL}}",
-                 "{{WRITING_POLICY}}", "{{QUESTION}}"):
+                 "{{WRITING_POLICY}}", "{{TIME_POLICY}}", "{{QUESTION}}"):
         check(f"渲染后没有残留 {slot}", slot not in rendered)
     check("渲染含问题原文", "Who is Caroline?" in rendered)
-    check("渲染含 jq 示例（用 msg_id）", "select(.msg_id==" in rendered)
-    check("渲染含 search 用法", 'search "KEYWORDS"' in rendered)
-    check("渲染含 timecalc 用法", "timecalc shift" in rendered)
+    # 检索就是 grep：语料是 JSONL，行号稳定，可以 grep -n 再 read offset
+    check("渲染含 grep 用法", "grep -in" in rendered)
+    check("渲染给出 grep -n 定位 + read 精读的组合", "offset=" in rendered and "read inputs/sessions.jsonl" in rendered)
+    check("渲染含 date -d 做时间算术", "date -d" in rendered)
+    check("不再有已删除的检索 CLI", "search \"" not in rendered and "timecalc" not in rendered)
+    check("不再有 jq", "jq " not in rendered)
     check("渲染含 schema 字段", "metadata.source" in rendered)
     check("渲染含 source 非空规则", "NON-EMPTY" in rendered)
-    # 检索是**关键词优先**，语义是兜底
-    check("渲染说明默认关键词检索", "KEYWORD by default" in rendered)
-    check("渲染给出 --embed 兜底用法", "--embed" in rendered)
-    check("渲染给出多跳检索动作", "MULTI-HOP" in rendered)
+    # 按问题类型选策略
+    check("渲染给出策略 A（关键词多跳）", "KEYWORD HOP" in rendered)
+    check("渲染给出策略 B（遍历多会话）", "SWEEP" in rendered)
+    check("渲染说明集合型问题走遍历", "the answer is a SET" in rendered)
+    check("渲染给出两种策略的判据", "PICK YOUR STRATEGY" in rendered)
     # 核心：证据是**推导**出来的，不是抄的
     check("渲染含'推导而非抄袭'策略", "REASON, do not just copy" in rendered)
-    check("策略提到时间推理", "timecalc" in rendered and "absolute" in rendered.lower())
     check("策略提到事件/性格推理", "joined into the one" in rendered and "summarised" in rendered)
-    check("策略允许改写正文", "REWRITE when" in rendered)
+    check("策略要求消解上下文", "RESOLVE THE CONTEXT" in rendered)
     check("schema 说明可以改写 content", "Rewrite freely" in rendered)
     check("schema 要求 source 非空", "NON-EMPTY array of msg_ids" in rendered)
-    check("有 worked example（多跳）", "WORKED EXAMPLE (multi-hop" in rendered)
-    check("有 worked example（相对时间）", "timecalc shift 2023-06-17 -1month" in rendered)
+    # 时间精度：这是这一版的核心规则
+    check("时间策略：不得编造更细的精度", "Never invent precision" in rendered)
+    check("时间策略：按源语料的单位作答", "answer in that unit" in rendered)
+    check("时间策略：保留锚点表述", "the week before 9 June 2023" in rendered)
+    check("时间策略：区间是合法答案", "A period is a valid answer" in rendered)
+    check("时间策略：记录必须自带锚点", "stands ALONE" in rendered)
+    check("时间策略：原文表述要照录", "verbatim" in rendered)
+    check("有 worked example（关键词多跳）", "WORKED EXAMPLE (strategy A: keyword hop)" in rendered)
+    check("有 worked example（相对时间）", "date -d \"8 May 2023 -1 day\"" in rendered)
+    check("有 worked example（遍历）", "WORKED EXAMPLE (strategy B: sweep)" in rendered)
     # 语料只剩两层：不能再出现已删除的 speakers summary
     check("提示里不再有 speakers summary", "speakers_summary" not in rendered)
     check("提示里不再有 atommem/msgmem", "atommem" not in rendered and "msgmem" not in rendered)
     # 上下文预算：prompt 每条 QA 都整体注入一次，涨回去就等于白做这次简化
-    check("system prompt 控制在 13000 字符内（实测 11.5k）", len(rendered) < 13000,
-          str(len(rendered)))
+    check("system prompt 控制在 14000 字符内", len(rendered) < 14000, str(len(rendered)))
 
     # 响应解析
     check("解析裸 JSON", (toolcfg.parse_tool_call('{"tool":"bash","args":{"command":"ls"}}') or
@@ -265,50 +272,43 @@ async def test_tools(tmp: Path) -> None:
     # 实测只有最后一段传进去，于是**每次** search 都吐一行解析错误。
     from codemem.search import runner as V3
 
-    prefix = V3.build_shell_prefix(
-        inputs_dir=ws, index_dir=tmp / "idx", embed_ready=True,
-        config={"embedding": {"base_url": "http://x/v1", "api_key": "k", "model": "m"},
-                "search": {"rrf_k": 60, "memory_chars": 400,
-                           "weights": {"dense": 1.0, "bm25": 1.0, "tag": 0.5}}},
-    )
+    prefix = V3.build_shell_prefix(inputs_dir=ws, config={})
     probe = tools_mod.build_tools(cwd=ws, shell_command_prefix=prefix)
     result = await probe["bash"].run(
-        {"command": "echo \"$CODEMEM_SEARCH_WEIGHTS\"", "description": "Checking weights env"}
+        {"command": "echo \"$CODEMEM_INPUTS\"", "description": "Checking inputs env"}
     )
-    echoed = result.text.strip()
-    check("weights JSON 原样传到子进程（未被花括号展开）",
-          echoed == '{"dense":1.0,"bm25":1.0,"tag":0.5}', echoed)
-    import json as _json
-    try:
-        parsed_weights = _json.loads(echoed)
-        check("传进去的 weights 是合法 JSON", isinstance(parsed_weights, dict))
-    except ValueError as exc:
-        check("传进去的 weights 是合法 JSON", False, str(exc))
-    result = await probe["bash"].run(
-        {"command": "python -m codemem.search.searchctl --help >/dev/null 2>&1; echo rc=$?",
-         "description": "Checking searchctl importable"}
-    )
-    check("searchctl 在注入环境下可运行", "rc=0" in result.text, result.text)
+    check("语料目录经环境变量传进子进程", ws.as_posix() in result.text.replace("\\", "/"), result.text)
 
-    # --- 空输出提示：jq 选不到东西时要明确说出来（否则模型会重复重试）---
+    # 回归：date 的输出必须与 locale 无关。中文环境下 `date +%b` 会给「5月」，写进 evidence
+    # 就是一条下游读不了的记录 —— 所以 harness 注入 LC_ALL=C。
+    result = await probe["bash"].run({
+        "command": "date -d \"8 May 2023 -1 day\" +\"%d %b %Y\"; date -d \"15 Jul 2023 -2 day\" +\"%A\"",
+        "description": "Checking date locale",
+    })
+    check("date 输出月份/星期为英文（LC_ALL=C 生效）",
+          "May" in result.text and "Thursday" in result.text, result.text)
+
+    # --- grep 无匹配（退出码 1）是**最容易被误判成失败**的一种观测 ---
     from codemem.search.toolcfg import ToolCall
 
-    call = ToolCall(tool="bash", args={"command": "jq -c 'select(.msg_id==\"nope\")' f.jsonl"})
-    notice = agent_mod.no_output_notice(call)
-    check("空 jq 输出提示说明 selector 没命中", "matched NOTHING" in notice, notice[:200])
-    check("空 jq 输出提示给出真实 id 的查看方式", ".msg_id" in notice, notice[:300])
-    non_jq = agent_mod.no_output_notice(ToolCall(tool="bash", args={"command": "true"}))
-    check("非 jq 的空输出不误报 jq 语义", "matched NOTHING" not in non_jq)
+    notice = agent_mod.grep_no_match_notice()
+    check("grep 提示说明退出码 1 = 无匹配而非崩溃", "not a failure" in notice, notice[:200])
+    check("grep 提示给出下一步（换文件/换词）", "other file" in notice, notice[:250])
+    check("grep 提示给出查看真实内容的命令", "grep -c ." in notice, notice[:300])
+
+    call = ToolCall(tool="bash", args={"command": "sed -n '1p' f.jsonl"})
+    empty = agent_mod.no_output_notice(call)
+    check("非 grep 的空输出不误报 grep 语义", "grep exited 1" not in empty)
 
     # --- 重复拒绝消息要给出脱困方向 ---
     repeat = agent_mod.repeat_notice(ToolCall(tool="bash", args={"command": "x"}), 2)
     check("重复拒绝消息提到真实语料文件", "inputs/sessions.jsonl" in repeat)
-    check("重复拒绝消息提到 timecalc", "timecalc" in repeat)
     check("重复拒绝消息提示多跳检索", "hop" in repeat.lower())
+    check("重复拒绝消息给出集合型问题的出路（遍历）", "SET" in repeat)
     # 已删除的语料名不该再出现在给模型的文案里（会诱使它去搜不存在的文件）
-    for stale in ("atommem", "msgmem", "speakers_summary"):
+    for stale in ("atommem", "msgmem", "speakers_summary", "timecalc", "jq"):
         check(f"重复拒绝消息不含已删除的 {stale}", stale not in repeat)
-        check(f"空输出提示不含已删除的 {stale}", stale not in notice)
+        check(f"grep 提示不含已删除的 {stale}", stale not in notice)
 
 
     # --- 文件完整性：原子写 + 截断保护 ---
@@ -350,152 +350,6 @@ def make_memory(memory_id: str, text: str, *, source: list[str] | None = None,
             "changelog": [],
         },
     }
-
-
-async def test_search(tmp: Path) -> None:
-    section("3. index + searchmem：纯词法检索")
-    corpus = [
-        make_memory("a1", "Caroline joined an LGBTQ support group"),
-        make_memory("a2", "Melanie asked Caroline when she started going"),
-        make_memory("a3", "Caroline has been going for about a month"),
-        make_memory("a4", "Dave likes pizza and rock climbing"),
-    ]
-
-    scored = await searchmem.search_scored(
-        "LGBTQ support group", corpus, top_k=2, embed=None,
-        weights=searchmem.lexical_weights(),
-    )
-    check("词法检索命中", len(scored) == 2, str(len(scored)))
-    check("最相关的排第一", scored[0].id == "a1", scored[0].id)
-    check("带通道明细", "bm25" in scored[0].channels, str(scored[0].channels))
-
-    # 零信号候选要兜底填满 top_k
-    scored_all = await searchmem.search_scored(
-        "LGBTQ support group", corpus, top_k=4, embed=None,
-        weights=searchmem.lexical_weights(),
-    )
-    check("候选不足时兜底填满 top_k", len(scored_all) == 4, str(len(scored_all)))
-    check("兜底项 score=0 无通道", scored_all[3].score == 0.0 and not scored_all[3].channels)
-
-    # extra_channels 注入（searchctl 的用法）
-    injected = await searchmem.search_scored(
-        "anything", corpus, top_k=4, embed=None,
-        weights={"dense": 1.0, "bm25": 0.0, "tag": 0.0},
-        extra_channels={"dense": [0.0, 0.9, 0.1, 0.0]},
-    )
-    check("extra_channels 生效", injected[0].id == "a2", injected[0].id)
-
-    # 索引：建 + 载 + 打分
-    fake_vectors = {
-        "a1": [1.0, 0.0, 0.0], "a2": [0.9, 0.1, 0.0],
-        "a3": [0.0, 1.0, 0.0], "a4": [0.0, 0.0, 1.0],
-    }
-
-    async def fake_embed(texts: list[str]) -> list[list[float]]:
-        out = []
-        for text in texts:
-            for key, vector in fake_vectors.items():
-                if key in text or text in key:
-                    out.append(vector)
-                    break
-            else:
-                out.append(fake_vectors["a1"] if "LGBTQ" in text else [0.0, 0.0, 1.0])
-        return out
-
-    index_dir = tmp / "idx"
-    built = await index_mod.build_index(
-        corpus, embed=fake_embed, directory=index_dir, model="fake", source="test"
-    )
-    check("索引维度正确", built.dim == 3, str(built.dim))
-    loaded = index_mod.load_index(index_dir)
-    check("索引可加载且条数一致", len(loaded) == 4)
-    row_of = loaded.build_row_index()
-    scores = loaded.dense_scores([1.0, 0.0, 0.0], row_of, ["a1", "a3", "unknown"])
-    check("dense 打分：同向最高", abs(scores[0] - 1.0) < 1e-6, str(scores))
-    check("dense 打分：正交为 0", abs(scores[1]) < 1e-6)
-    check("dense 打分：无向量给 0", scores[2] == 0.0)
-
-    # --- 共享索引缓存：同一语料只建一次（存储优化）---
-
-    def mem(i, t):
-        return {"memory": t, "metadata": {"id": i, "type": "raw", "tag": [], "source": []}}
-
-    corpus_a = [mem("x1", "one"), mem("x2", "two")]
-    corpus_b = [mem("x1", "CHANGED"), mem("x2", "two")]     # 正文改了
-    corpus_c = [mem("x1", "one")]                           # 少一条
-
-    key_a = index_mod.cache_key(corpus_a, "modelA")
-    check("同语料同模型 key 稳定", key_a == index_mod.cache_key(corpus_a, "modelA"))
-    check("正文变了 key 就变", key_a != index_mod.cache_key(corpus_b, "modelA"))
-    check("条数变了 key 就变", key_a != index_mod.cache_key(corpus_c, "modelA"))
-    check("换模型 key 就变", key_a != index_mod.cache_key(corpus_a, "modelB"))
-
-    cache_root = tmp / "idx_cache"
-    shared = index_mod.shared_index_dir(cache_root, corpus_a, "modelA")
-    check("共享目录在 cache_root 下", shared.parent == cache_root, str(shared))
-    check("未建时 index_is_usable=False",
-          index_mod.index_is_usable(shared, corpus_a, "modelA") is False)
-
-    async def fake_embed(texts):
-        return [[1.0, 0.0] for _ in texts]
-
-    await index_mod.build_index(corpus_a, embed=fake_embed, directory=shared,
-                                model="modelA", source="test")
-    check("建好后 index_is_usable=True",
-          index_mod.index_is_usable(shared, corpus_a, "modelA") is True)
-    # 关键安全性质：语料变了必须判为**不可用**，否则会静默复用过期向量
-    check("语料变了判为不可用（防静默复用过期向量）",
-          index_mod.index_is_usable(shared, corpus_b, "modelA") is False)
-    check("模型变了判为不可用",
-          index_mod.index_is_usable(shared, corpus_a, "modelB") is False)
-    check("条数变了判为不可用",
-          index_mod.index_is_usable(shared, corpus_c, "modelA") is False)
-    check("目录不存在判为不可用",
-          index_mod.index_is_usable(tmp / "nope", corpus_a, "modelA") is False)
-
-    # --- 运行目录清理：只删运行目录，永不删共享索引缓存 ---
-    runs = tmp / "runs"
-    for name in ("search_a_20260101_000000", "search_b_20260102_000000",
-                 "full_20260103_000000", "search_c_20260104_000000"):
-        d = runs / name
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "summary.json").write_text("{}")
-        (d / "blob.jsonl").write_text("x" * 5000)
-    cache = runs / ".index_cache" / "abc"
-    cache.mkdir(parents=True, exist_ok=True)
-    (cache / "vectors.f32").write_text("v" * 1000)
-
-    plan = index_mod.plan_prune(runs)
-    names = {p.name for p, _ in plan}
-    check("默认保留含 full 的运行", "full_20260103_000000" not in names, str(names))
-    check("默认清理其它运行目录", len(plan) == 3, str(sorted(names)))
-    check("共享索引缓存永不出现在清理列表",
-          not any(".index_cache" in str(p) for p, _ in plan))
-    check("清理列表带大小", all(size > 0 for _, size in plan))
-
-    plan2 = index_mod.plan_prune(runs, keep_last=2)
-    check("--keep-last 2 只清 2 个", len(plan2) == 2, str(len(plan2)))
-    check("--keep-last 保留最新的",
-          "search_c_20260104_000000" not in {p.name for p, _ in plan2})
-
-    check("目录不存在时返回空", index_mod.plan_prune(tmp / "nope") == [])
-    check("run_size 能算出大小", index_mod.run_size(runs / "full_20260103_000000") > 5000)
-
-    # 执行删除：缓存必须还在
-    removed, freed = index_mod.prune_runs(runs, plan)
-    check("删除了计划中的目录", removed == 3, str(removed))
-    check("释放字节数 > 0", freed > 0)
-    check("共享索引缓存仍在", (cache / "vectors.f32").exists())
-    check("保留的运行仍在", (runs / "full_20260103_000000" / "summary.json").exists())
-
-    # 坏索引目录要报错，不要静默
-    empty = tmp / "idx_empty"
-    empty.mkdir(exist_ok=True)
-    try:
-        index_mod.load_index(empty)
-        check("缺文件的索引报错", False)
-    except FileNotFoundError:
-        check("缺文件的索引报错", True)
 
 
 # ---------------------------------------------------------------------------
@@ -951,8 +805,8 @@ async def test_agent(tmp: Path) -> None:
     check("失败步带 ERROR 观测",
           any("ERROR" in m["content"] for m in outcome.messages if m["role"] == "user"))
     check("失败步不中断（步数=5）", len(outcome.steps) == 5, str(len(outcome.steps)))
-    check("未知工具提示里有 timecalc", any("timecalc" in m["content"]
-                                          for m in outcome.messages if m["role"] == "user"))
+    check("未知工具提示里点名可用的 bash 命令", any("grep" in m["content"]
+                                              for m in outcome.messages if m["role"] == "user"))
 
     # --- 步数用尽 ---
     script = [json.dumps({"tool": "read", "args": {"path": "lib.jsonl"}})] * 20
@@ -1344,249 +1198,9 @@ def test_eval_metrics() -> None:
               unsupported=False, category=2, judge_label="WRONG").correct)
 
 
-def test_timecalc() -> None:
-    section("9. timecalc：确定性日期算术")
-    from codemem.search import timecalc
-
-    def run(*args: str) -> tuple[int, str]:
-        return timecalc.run(list(args))
-
-    check("shift -1month", run("shift", "2023-06-17", "-1month") == (0, "2023-05-17"),
-          str(run("shift", "2023-06-17", "-1month")))
-    check("shift +2week", run("shift", "2023-05-08", "+2week") == (0, "2023-05-22"),
-          str(run("shift", "2023-05-08", "+2week")))
-    check("月份越界取月末", run("shift", "2023-01-31", "+1month") == (0, "2023-02-28"),
-          str(run("shift", "2023-01-31", "+1month")))
-    check("多个偏移叠加", run("shift", "2023-06-17", "-1month", "+3day") == (0, "2023-05-20"),
-          str(run("shift", "2023-06-17", "-1month", "+3day")))
-    code, out = run("diff", "2023-05-08", "2023-06-17")
-    check("diff 天数正确", code == 0 and "+40 days" in out, out)
-    code, out = run("diff", "2023-06-17", "2023-05-08")
-    check("diff 带符号", code == 0 and "-40 days" in out, out)
-    check("range 输出 ISO 区间",
-          run("range", "2023-05-01", "2023-05-31") == (0, "2023-05-01/2023-05-31"),
-          str(run("range", "2023-05-01", "2023-05-31")))
-    code, out = run("info", "2023-05-08T13:56:00")
-    check("info 给出星期", code == 0 and "Monday" in out, out)
-    check("只给日期时不造出假时分",
-          run("shift", "2023-06-17", "-1month")[1] == "2023-05-17")
-    check("坏偏移报错", run("shift", "2023-05-08", "x1month")[0] == 1)
-    check("坏日期报错", run("diff", "2023-13-01", "2023-01-01")[0] == 1)
-    check("参数不足给用法", run("shift", "2023-05-08")[0] == 2)
-    check("未知命令报错", run("frobnicate")[0] == 2)
-    check("无参数给用法", run()[0] == 2)
-
-
-
 # ---------------------------------------------------------------------------
 # 7. searchctl CLI 端到端
 # ---------------------------------------------------------------------------
-
-async def test_searchctl_cli(tmp: Path) -> None:
-    section("7. searchctl：CLI 端到端（关键词默认 + --embed 兜底）")
-    ws = tmp / "cli_ws"
-    (ws / "inputs").mkdir(parents=True, exist_ok=True)
-
-    def sess(mid, role, content, time=""):
-        return {"msg_id": mid, "role": role, "time": time, "content": content}
-
-    # 真实语料形态：session summary 一层 + 原始消息一层
-    (ws / "inputs/session_summaries.jsonl").write_text(
-        json.dumps(sess("session_1_summary", "summary",
-                        "Caroline and Melanie discussed the LGBTQ support group.",
-                        "1:56 pm on 8 May, 2023")) + "\n"
-        + json.dumps(sess("session_2_summary", "summary",
-                          "They talked about Dave's pizza and rock climbing.",
-                          "1:14 pm on 25 May, 2023")) + "\n",
-        encoding="utf-8",
-    )
-    (ws / "inputs/sessions.jsonl").write_text(
-        json.dumps(sess("session_1_1", "Caroline",
-                        "I went to a LGBTQ support group yesterday",
-                        "1:56 pm on 8 May, 2023")) + "\n"
-        + json.dumps(sess("session_1_2", "Melanie", "That sounds great!",
-                          "1:56 pm on 8 May, 2023")) + "\n",
-        encoding="utf-8",
-    )
-    (ws / "evidence.jsonl").write_text(
-        json.dumps({"content": "Caroline started the group in June",
-                    "metadata": {"source": ["session_1_1"], "score": 0.8}}) + "\n",
-        encoding="utf-8",
-    )
-
-    from codemem.search.searchctl import main as searchctl_main
-    from codemem.search import searchctl as searchctl_mod
-
-    import contextlib
-    import io as _io
-
-    def run_cli(argv):
-        """在 ws 里跑 CLI。searchctl 从 ``Path.cwd()`` 读 inputs/，所以必须切目录。"""
-        with contextlib.chdir(ws):
-            return searchctl_main(argv)
-
-    async def run_capture(argv):
-        """跑一次并抓 stdout 的 JSON 行。``--all-fields`` 的展开在 main 里，这里补上。"""
-        parsed = searchctl_mod.parse_args(argv)
-        if parsed.all_fields and not parsed.fields:
-            parsed.fields = ",".join(searchctl_mod.ALL_FIELDS)
-        buffer = _io.StringIO()
-        with contextlib.chdir(ws), contextlib.redirect_stdout(buffer):
-            rc = await searchctl_mod.run_search(parsed)
-        rows = [json.loads(line) for line in buffer.getvalue().strip().splitlines()]
-        return rc, rows
-
-    # 默认（关键词）**不需要**索引、不需要嵌入服务：这是主路径，不是降级。
-    code = await asyncio.to_thread(run_cli, ["LGBTQ support group", "-k", "2",
-                                             "--index", str(tmp / "nope_idx")])
-    check("默认关键词模式缺索引也能跑（退出码 0）", code == 0, str(code))
-
-    # 即使配了嵌入地址，关键词模式也不该去请求它 —— 拿一个必然连不上的地址做证明
-    os.environ["CODEMEM_EMBED_URL"] = "http://127.0.0.1:1/v1"
-    try:
-        code = await asyncio.to_thread(run_cli, ["LGBTQ support group", "-k", "2",
-                                                 "--index", str(tmp / "nope_idx")])
-        check("关键词模式不碰嵌入服务", code == 0, str(code))
-
-        # --embed 缺索引 -> 明确报错（退出码 2），而不是静默给出关键词结果
-        code = await asyncio.to_thread(
-            run_cli, ["LGBTQ support group", "-k", "2", "--embed",
-                      "--index", str(tmp / "nope_idx")]
-        )
-        check("--embed 缺索引明确报错（退出码 2）", code == 2, str(code))
-    finally:
-        os.environ.pop("CODEMEM_EMBED_URL", None)
-
-    # --embed 但没配嵌入地址 -> 也是退出码 2
-    code = await asyncio.to_thread(
-        run_cli, ["LGBTQ support group", "-k", "2", "--embed",
-                  "--index", str(tmp / "nope_idx")]
-    )
-    check("--embed 无嵌入服务明确报错（退出码 2）", code == 2, str(code))
-
-    # --source 分层：summary 只看概览，raw 只看原话
-    code = await asyncio.to_thread(run_cli, ["LGBTQ support group", "-k", "5",
-                                             "--source", "summary"])
-    check("--source summary 可跑", code == 0, str(code))
-    code = await asyncio.to_thread(run_cli, ["LGBTQ support group", "-k", "5",
-                                             "--source", "raw"])
-    check("--source raw 可跑", code == 0, str(code))
-    # --source summary 只该看到概览层：用 "pizza"（只在 session_2_summary 里）验证
-    _, summary_rows = await run_capture(["pizza", "-k", "5", "--source", "summary"])
-    check("--source summary 只返回 summary 层",
-          all(x["kind"] == "session_summary" for x in summary_rows), str(summary_rows))
-    _, raw_rows = await run_capture(["pizza", "-k", "5", "--source", "raw"])
-    check("--source raw 只返回原始消息层",
-          all(x["kind"] == "session" for x in raw_rows), str(raw_rows))
-
-    rc, lines = await run_capture(["LGBTQ support group", "-k", "3"])
-    check("默认检索命中（rc=0）", rc == 0, str(rc))
-    check("输出每行一个 JSON 对象", len(lines) >= 1 and all(isinstance(x, dict) for x in lines))
-    check("默认字段含 kind/session/time（agent 决策所需）",
-          all({"id", "kind", "session", "time", "score", "memory"} <= set(x) for x in lines),
-          str(lines[:1]))
-    check("默认字段不含 rank_*（省上下文）",
-          all("rank_bm25" not in x for x in lines), str(lines[:1]))
-    check("两个语料层都能被命中",
-          {x["kind"] for x in lines} <= {"session_summary", "session"}, str(lines))
-    check("evidence.jsonl 自己写的记录也在池子里（能搜到）",
-          any("June" in x.get("memory", "") or "support group" in x.get("memory", "")
-              for x in lines), str(lines))
-
-    # --all-fields 要把通道明细（排错用）放回来
-    _, rows = await run_capture(["LGBTQ support group", "-k", "3", "--all-fields"])
-    check("--all-fields 带出 rank_bm25", all("rank_bm25" in x for x in rows), str(rows[:1]))
-
-    # 无 CODEMEM_INDEX 时也要能跑；改用模块内函数直接验证 merge_pool
-    from codemem.search import searchctl
-    library = [*searchctl.read_jsonl(ws / "inputs/session_summaries.jsonl"),
-               *searchctl.read_jsonl(ws / "inputs/sessions.jsonl")]
-    ev = [{"content": "Caroline started the group", "metadata": {"source": ["s"]}}]
-    pool = searchctl.merge_pool(library, ev, "all")
-    check("pool 合并 library + evidence", len(pool) == 5, str(len(pool)))
-    pool_ev = searchctl.merge_pool(library, [dict(ev[0], content="overridden")], "all")
-    check("同 id 时 evidence 侧优先", pool_ev[0]["content"] == "overridden")
-    pool_lib = searchctl.merge_pool(library, ev, "library")
-    check("--source library 排除 evidence", len(pool_lib) == 4, str(len(pool_lib)))
-
-    # 三层语料的读取与层级判定
-    check("LIBRARY_FILES 从粗到细", searchctl.LIBRARY_FILES == (
-        "session_summaries.jsonl", "sessions.jsonl"),
-        str(searchctl.LIBRARY_FILES))
-    check("--source summary 只读 session summaries",
-          searchctl._library_layers("summary") == ("session_summaries.jsonl",),
-          str(searchctl._library_layers("summary")))
-    check("--source raw 只读原始消息",
-          searchctl._library_layers("raw") == ("sessions.jsonl",))
-    check("--source all 读两层", len(searchctl._library_layers("all")) == 2)
-
-    # 层级判定：这是 agent 决定"要不要往下钻"的依据
-    summary_rec = {"msg_id": "session_3_summary", "role": "summary", "content": "s",
-                   "time": "7:55 pm on 9 June, 2023"}
-    session_rec = {"msg_id": "session_3_1", "role": "Caroline", "content": "c",
-                   "time": "7:55 pm on 9 June, 2023"}
-    check("识别 session summary", searchctl.layer_of(summary_rec) == "session_summary")
-    check("识别原始消息", searchctl.layer_of(session_rec) == "session")
-    # session 字段是多跳检索最常用的入口：拿到一条命中后立刻能读同一次会话的其它消息
-    check("summary 的 kind 进 provenance",
-          searchctl.provenance_fields(summary_rec)["kind"] == "session_summary")
-    check("原始消息的 session 归属正确",
-          searchctl.provenance_fields(session_rec)["session"] == "session_3")
-    check("summary 的 session 归属正确",
-          searchctl.provenance_fields(summary_rec)["session"] == "session_3")
-    check("time 进 provenance（相对时间的锚点）",
-          searchctl.provenance_fields(session_rec)["time"] == "7:55 pm on 9 June, 2023")
-    check("原始消息的 source 为空",
-          searchctl.provenance_fields(session_rec)["source"] == [])
-
-    # --tag 过滤（枚举型问题的关键工具）
-    tagged = [
-        make_memory("a1", "Melanie is a big fan of pottery", source=["s1"]),
-        make_memory("a2", "Melanie asks Caroline a question", source=["s2"]),
-        make_memory("a3", "Melanie went camping", source=["s3"]),
-    ]
-    tagged[0]["metadata"]["tag"] = ["speaker:Melanie", "action:pottery"]
-    tagged[1]["metadata"]["tag"] = ["speaker:Melanie", "action:ask"]
-    tagged[2]["metadata"]["tag"] = ["speaker:Melanie", "event:camping trip"]
-
-    picked = searchctl.filter_by_tag(tagged, ["action"])
-    check("--tag 子串匹配", [m["metadata"]["id"] for m in picked] == ["a1", "a2"],
-          str([m["metadata"]["id"] for m in picked]))
-    picked = searchctl.filter_by_tag(tagged, ["action"], exclude=True)
-    check("--exclude-tag 取反", [m["metadata"]["id"] for m in picked] == ["a3"],
-          str([m["metadata"]["id"] for m in picked]))
-    picked = searchctl.filter_by_tag(tagged, ["action:ask"], exclude=True)
-    check("--exclude-tag action:ask 精确排除", [m["metadata"]["id"] for m in picked] == ["a1", "a3"],
-          str([m["metadata"]["id"] for m in picked]))
-    picked = searchctl.filter_by_tag(tagged, ["Action", "EVENT"])
-    check("--tag 大小写不敏感且可多值", len(picked) == 3, str(len(picked)))
-    check("空 pattern 不过滤", searchctl.filter_by_tag(tagged, []) == tagged)
-    check("无命中返回空", searchctl.filter_by_tag(tagged, ["nope"]) == [])
-    # 无 tag 字段的记录不该让过滤崩溃
-    check("缺 tag 的记录被安全排除",
-          searchctl.filter_by_tag([{"memory": "x", "metadata": {"id": "n"}}], ["action"]) == [])
-
-    # --tag-values：列出标签值分布（枚举型问题的第一步）
-    counted = searchctl.tag_value_counts(tagged)
-    check("tag_value_counts 统计全部", dict(counted).get("speaker:Melanie") == 3, str(counted))
-    filtered = searchctl.tag_value_counts(tagged, ["action"])
-    check("tag_value_counts 按前缀过滤",
-          dict(filtered) == {"action:pottery": 1, "action:ask": 1}, str(filtered))
-    check("tag_value_counts 按次数降序",
-          [t for t, _ in searchctl.tag_value_counts(tagged, ["speaker"])] == ["speaker:Melanie"])
-    check("tag_value_counts 空池返回空", searchctl.tag_value_counts([]) == [])
-
-    # 层级与溯源（见上面的 layer_of 检查）：summary 与原始消息要能区分开
-
-    # 环境变量（由 harness 注入）不应影响关键词检索。searchctl_main 内部会 asyncio.run，
-    # 而本函数本身跑在事件循环里，所以直接 await 它的异步实现。
-    args = searchctl_mod.parse_args(
-        ["LGBTQ support group", "-k", "1", "--index", str(tmp / "nope_idx")]
-    )
-    with contextlib.chdir(ws):
-        rc = await searchctl_mod.run_search(args)
-    check("CLI 在无 CODEMEM_* 环境变量下也能跑", rc == 0, str(rc))
-
 
 # ---------------------------------------------------------------------------
 # 8. evomem_v3 端到端（假模型）
@@ -1626,9 +1240,7 @@ async def test_end_to_end(tmp: Path) -> None:
     catalog = toolcfg.load_catalog(PROJECT_ROOT / "configs/tool.json")
     log = Logger(level="error")
 
-    inputs_dir, index_dir, search_bin, embed_ready = await evomem_v3.build_inputs(
-        sample_dir, run_dir, config, embedder=None, log=log
-    )
+    inputs_dir = await evomem_v3.build_inputs(sample_dir, run_dir, config, log=log)
     check("inputs 已建立", (inputs_dir / "sessions.jsonl").exists())
     check("两层语料都硬链进 inputs",
           all((inputs_dir / n).exists() for n in
@@ -1637,11 +1249,10 @@ async def test_end_to_end(tmp: Path) -> None:
     check("inputs 是硬链（同一 inode）",
           (inputs_dir / "sessions.jsonl").stat().st_ino == (sample_dir / "sessions.jsonl").stat().st_ino)
     # Windows 上 stat 的权限位不反映可执行性（一律 0o666），所以只断言文件存在 + 内容对。
-    check("search 包装已生成", search_bin.exists() and "searchctl" in search_bin.read_text(
-        encoding="utf-8"))
-    if os.name == "posix":
-        check("search 包装可执行", bool(search_bin.stat().st_mode & 0o111))
-    check("无 embedding -> 索引不可用（关键词模式）", embed_ready is False)
+    check("inputs 里没有多余的东西（检索靠系统 grep）",
+          sorted(p.name for p in inputs_dir.iterdir()) == ["session_summaries.jsonl",
+                                                           "sessions.jsonl"],
+          str(sorted(p.name for p in inputs_dir.iterdir())))
 
     # 假模型：第一个 QA 先写 evidence 再"完成"；verifier 由 role 区分
     class ScriptedModel:
@@ -1657,19 +1268,27 @@ async def test_end_to_end(tmp: Path) -> None:
                     return '{"sufficient": false, "answer": "", "missing": ["the year"]}'
                 return '{"sufficient": true, "answer": "about a month before June 2023", "missing": []}'
             self.agent_turns += 1
+            # 按 agent 的真实工作流走一遍：grep 定位 -> read 精读 -> date 算 -> write 落盘。
+            # 这样端到端测的不只是"文件写成了"，还有 grep/read/date 这条新路径本身。
             if self.agent_turns == 1:
+                return json.dumps({"tool": "bash", "args": {
+                    "command": 'grep -in "support group" inputs/session_summaries.jsonl',
+                    "description": "Grepping summaries"}})
+            if self.agent_turns == 2:
+                return json.dumps({"tool": "read", "args": {
+                    "path": "inputs/session_summaries.jsonl", "limit": 2}})
+            if self.agent_turns == 3:
+                return json.dumps({"tool": "bash", "args": {
+                    "command": 'date -d "8 May 2023 -1 day" +"%d %b %Y"',
+                    "description": "Computing the date"}})
+            if self.agent_turns == 4:
                 # 写一条**合法 evidence**（新格式：content + metadata.source/score）。
                 # 注意不能直接抄 inputs 的记录 —— 那没有 source，会被正确地拒绝。
-                rec = {"content": "Caroline joined the group in June 2023.",
+                rec = {"content": "Caroline joined the group on 7 May 2023.",
                        "metadata": {"source": ["session_1_summary"], "score": 0.9}}
-                return json.dumps({"tool": "bash", "args": {
-                    "command": "printf '%s\\n' " + json.dumps(json.dumps(rec)) +
-                               " >> evidence.jsonl && jq -s length evidence.jsonl",
-                    "description": "Assembling evidence"}})
-            if self.agent_turns == 2:
-                return json.dumps({"tool": "bash", "args": {
-                    "command": "jq -c '{id,memory}' evidence.jsonl",
-                    "description": "Verifying evidence"}})
+                return json.dumps({"tool": "write", "args": {
+                    "path": "evidence.jsonl",
+                    "content": json.dumps(rec, ensure_ascii=False) + "\n"}})
             return "I am done."
 
     model = ScriptedModel()
@@ -1677,8 +1296,8 @@ async def test_end_to_end(tmp: Path) -> None:
     record = await evomem_v3.run_qa(
         qa_index=0, qa={"question": "When did Caroline join the group?", "category": 2,
                         "reference": "June 2023"},
-        directory=sample_dir, run_dir=run_dir, inputs_dir=inputs_dir, index_dir=index_dir,
-        config=config, catalog=catalog, model=model, embedder=None, embed_ready=embed_ready,
+        directory=sample_dir, run_dir=run_dir, inputs_dir=inputs_dir,
+        config=config, catalog=catalog, model=model,
         log=log, semaphore=asyncio.Semaphore(1),
     )
     check("QA 记录有 evidence", record.evidence_count == 1, str(record.evidence_count))
@@ -1687,11 +1306,12 @@ async def test_end_to_end(tmp: Path) -> None:
     check("最终判定为足够", record.sufficient is True, record.stop_reason)
     check("带上最终答案", "June 2023" in record.final_answer, record.final_answer)
     check("stop_reason=sufficient", record.stop_reason == "sufficient", record.stop_reason)
-    check("工具调用被记账", record.tool_calls >= 2, str(record.tool_calls))
+    check("工具调用被记账（grep + read + date + write）", record.tool_calls >= 4,
+          str(record.tool_calls))
     check("未篡改只读输入", record.tampered is False)
     # evidence 没有 id 字段，标识取 content（见 evidence._id_of）
     check("evidence 标识取自 content",
-          record.evidence_ids == ["Caroline joined the group in June 2023."],
+          record.evidence_ids == ["Caroline joined the group on 7 May 2023."],
           str(record.evidence_ids))
 
     # --- 篡改检测：手写一个 QA，模型去改 inputs/ ---
@@ -1712,8 +1332,7 @@ async def test_end_to_end(tmp: Path) -> None:
     record2 = await evomem_v3.run_qa(
         qa_index=1, qa={"question": "Anything?", "category": 2, "reference": ""},
         directory=sample_dir, run_dir=run_dir, inputs_dir=inputs_dir, index_dir=index_dir,
-        config=config, catalog=catalog, model=TamperingModel(), embedder=None,
-        embed_ready=embed_ready,
+        config=config, catalog=catalog, model=TamperingModel(),
         log=log, semaphore=asyncio.Semaphore(1),
     )
     check("写只读输入被拒（未篡改）", record2.tampered is False)
@@ -1725,7 +1344,7 @@ async def test_end_to_end(tmp: Path) -> None:
     # --- summary 生成 ---
     summary = evomem_v3.summarize_dir(
         "Test_Pair", [record, record2], type("M", (), {"stats": staticmethod(
-            lambda: {"calls": 9, "failures": 0})})(), 2, 0, embed_ready
+            lambda: {"calls": 9, "failures": 0})})(), 2, 0
     )
     check("summary 有 qa_done", summary["qa_done"] == 2, str(summary["qa_done"]))
     # 只有第一条被判足够（第二条是篡改测试，verifier 直接返回 sufficient）
@@ -1734,8 +1353,7 @@ async def test_end_to_end(tmp: Path) -> None:
     check("summary 的 sufficient_rate 与条数一致",
           abs(summary["sufficient_rate"] - summary["sufficient"] / 2) < 1e-9,
           str(summary["sufficient_rate"]))
-    check("summary 标记 embed_available", summary["embed_available"] is False,
-          str(summary.get("embed_available")))
+    check("summary 不再有 embed_available（无向量层）", "embed_available" not in summary)
     check("summary 统计 model_calls", summary["model_calls"] == 9, str(summary["model_calls"]))
 
 
@@ -1747,7 +1365,6 @@ def main() -> int:
         test_no_undefined_names()
         test_toolcfg(tmp)
         test_evidence(tmp)
-        test_timecalc()
         test_qa_selection()
         test_verifier_rendering()
         test_agent_guards()
@@ -1758,10 +1375,8 @@ def main() -> int:
         try:
             loop.run_until_complete(test_verifier())
             loop.run_until_complete(test_tools(tmp))
-            loop.run_until_complete(test_search(tmp))
             loop.run_until_complete(test_agent(tmp))
             loop.run_until_complete(test_compaction_units(tmp))
-            loop.run_until_complete(test_searchctl_cli(tmp))
             loop.run_until_complete(test_end_to_end(tmp))
         finally:
             loop.close()
