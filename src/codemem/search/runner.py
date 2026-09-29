@@ -417,7 +417,6 @@ async def run_qa(
     directory: Path,
     run_dir: Path,
     inputs_dir: Path,
-    index_dir: Path,
     config: dict[str, Any],
     catalog: toolcfg.ToolCatalog,
     model: ModelRunner,
@@ -873,7 +872,7 @@ async def run_dir(
             asyncio.create_task(
                 run_qa(
                     qa_index=index, qa=qa, directory=directory, run_dir=run_dir,
-                    inputs_dir=inputs_dir, index_dir=index_dir, config=config,
+                    inputs_dir=inputs_dir, config=config,
                     catalog=catalog, model=model,
                     log=log, semaphore=semaphore, repeat=run,
                 )

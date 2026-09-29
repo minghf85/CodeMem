@@ -917,6 +917,73 @@ def test_no_undefined_names() -> None:
     check("无未定义调用", not offenders, "; ".join(offenders[:6]))
 
 
+def test_no_stale_kwargs() -> None:
+    """静态检查：调用处传的关键字参数必须真的存在。
+
+    为什么单独加这一条：上面的"无未定义引用"只看**裸名字调用**，关键字参数一个都不查，
+    而且它把所有函数的参数摊平成一个集合 —— 于是 ``f(index_dir=...)`` 这种调用永远查不出来。
+
+    实测就是这么漏掉一个的：删掉向量索引时把 ``run_qa`` 的 ``index_dir`` 形参去掉了，
+    但**调用处**还留着 ``index_dir=index_dir``。全量 CPU 自测 304 项全绿（测试文件自己也
+    传了这个参数，而测试里那个名字恰好还存在），一上真机就 ``NameError`` —— 因为生产路径
+    里那个局部变量已经没了。**形参与实参是两个地方，删一个不等于删另一个。**
+
+    做法：扫全项目的顶层函数签名建成 ``名字 -> [参数名集合]``（同名函数取并集，避免误报），
+    再逐个核对调用处带关键字的名字。有 ``**kwargs`` 的函数直接跳过（它什么都能收）。
+    """
+    section("0b. 静态检查：没有过时的关键字参数")
+    import ast
+
+    roots = [PROJECT_ROOT / "src" / "codemem", PROJECT_ROOT / "scripts"]
+
+    # 第一遍：收集**全部**顶层函数签名（跨文件按名字合并）
+    signatures: dict[str, list[set[str]]] = {}
+    accepts_anything: set[str] = set()
+    trees: list[tuple[str, ast.AST]] = []
+    for root in roots:
+        for path in sorted(root.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except SyntaxError:
+                continue
+            label = f"{root.name}/{path.relative_to(root)}"
+            trees.append((label, tree))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                args = node.args
+                names = {a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
+                if args.vararg:
+                    names.add(args.vararg.arg)
+                signatures.setdefault(node.name, []).append(names)
+                if args.kwarg:
+                    accepts_anything.add(node.name)
+
+    # 第二遍：核对调用处的关键字
+    offenders: list[str] = []
+    for label, tree in trees:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            name = node.func.id
+            candidates = signatures.get(name)
+            if not candidates or name in accepts_anything:
+                continue
+            known = set().union(*candidates)
+            for keyword in node.keywords:
+                if keyword.arg is None:          # f(**mapping) —— 无法静态判断
+                    continue
+                if keyword.arg not in known:
+                    offenders.append(
+                        f"{label}:{node.lineno} {name}({keyword.arg}=...) "
+                        f"不是它的参数（可用：{sorted(known)[:8]}）"
+                    )
+    check("没有调用处传了不存在的关键字参数", not offenders,
+          "; ".join(offenders[:5]))
+
+
 def test_qa_selection() -> None:
     """--qa / --max-qa / 预算闸门的 QA 选择逻辑（纯 CPU）。"""
     section("12. search：QA 选择（--qa / --max-qa / --list-qa）")
@@ -1331,7 +1398,7 @@ async def test_end_to_end(tmp: Path) -> None:
 
     record2 = await evomem_v3.run_qa(
         qa_index=1, qa={"question": "Anything?", "category": 2, "reference": ""},
-        directory=sample_dir, run_dir=run_dir, inputs_dir=inputs_dir, index_dir=index_dir,
+        directory=sample_dir, run_dir=run_dir, inputs_dir=inputs_dir,
         config=config, catalog=catalog, model=TamperingModel(),
         log=log, semaphore=asyncio.Semaphore(1),
     )
@@ -1363,6 +1430,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="codemem-v3-test-") as handle:
         tmp = Path(handle)
         test_no_undefined_names()
+        test_no_stale_kwargs()
         test_toolcfg(tmp)
         test_evidence(tmp)
         test_qa_selection()

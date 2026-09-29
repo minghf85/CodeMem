@@ -63,6 +63,7 @@ src/codemem/
   answer/ answer.py __main__.py
   eval/   runner.py judge.py metrics.py legacy.py __main__.py
 scripts/
+  run_eval.py                        # 一条命令跑通 search → answer → eval 并打印摘要
   test_search.py                     # 纯 CPU 自测（假模型 + 真工具，零模型成本）
   eval_baseline.py eval_rag.py eval_atommem.py analyze_atommem_results.py  # baseline 对照（见 §5）
   regenerate_rejected.py transfer_data_to_msswift_standard.py locomo_data_loader.py
@@ -439,7 +440,7 @@ python -m codemem.search --sample Caroline_Melanie --max-qa 3 --max-steps 8 --lo
 # 全部目录全部 QA（注意成本：每条 QA ≈ steps + verifier 次调用）
 python -m codemem.search --experiment search
 
-# 纯 CPU 自测（假模型 + 真工具，304 项断言，零模型成本）
+# 纯 CPU 自测（假模型 + 真工具，322 项断言，零模型成本）
 python scripts/test_search.py
 ```
 
@@ -738,16 +739,61 @@ sglang serve \
 
 ---
 
+## 一条命令跑通三步（`scripts/run_eval.py`）
+
+search 是改动最频繁的一步，而完整流程是三步、各有自己的 CLI 与产物路径。这个脚本把它们串起来，
+并把**该看的数字**摆成一张表：
+
+```bash
+python scripts/run_eval.py                        # 默认：1 个目录 × 前 5 条 QA，判分
+python scripts/run_eval.py --tag v5-time-rule     # 打标记，便于和上一版对比
+python scripts/run_eval.py --limit 0              # 0 = 全部 QA（慢）
+python scripts/run_eval.py --no-answer            # 只跑 search，看 evidence 产出
+python scripts/run_eval.py --no-judge             # 跑完三步但只算 CPU 指标（省 judge 调用）
+python scripts/run_eval.py --reuse search_20260929_183148   # 复用 evidence，只重跑 answer+eval
+python scripts/run_eval.py --quick                # 冒烟：--max-steps 8 --limit 3
+```
+
+输出长这样（含按 category 拆开那一栏 —— temporal 是时间规则改动的直接反馈）：
+
+```
+-- search --
+  目录                           QA  evidence      步数      充分
+  Caroline_Melanie       5/5             23      61    80%
+-- eval（整体）--
+  judge_accuracy   0.600     evidence_recall  0.550     unsupported_rate  0.200
+-- eval（按 category）--
+  category           n    judge   recall    unsup
+  temporal           3    0.667    0.700    0.000
+-- 失败归类 --
+  missing_evidence      1   → 修 search：该找的没找到
+```
+
+**默认是"快反馈"配置**（小样本、步数偏紧），不是全量 —— 几十条 QA 就能看出 prompt 改动的
+方向对不对。两处设计上的细节值得一说：
+
+- **它接的是"这一次"的运行目录，不是"最近一次"。** 各步骤原本各自取最近一次，而调试时很容易
+  接错 —— 比如你刚跑过一次无关的 `--dry-run`（它也会建目录）。这里改成"跑前记下已有目录、
+  跑完取差集"。
+- **eval 强制带 `--experiment eval`。** eval 默认把 `summary.json` 写进 `--output-dir`，
+  而 search 已经在那里放了一份 —— 不加前缀就会**覆盖掉**，于是"这次 search 跑了多少步、
+  多少条 evidence"当场丢失，而摘要正要读它。现在写的是 `eval_summary.json`，两份并存。
+
 ## 自测
 
 纯 CPU、零模型成本、零网络（假模型 + 真工具）：
 
 ```bash
-python scripts/test_search.py       # 全链路 304 项断言（含静态"无未定义引用"检查）
+python scripts/test_search.py       # 全链路 322 项断言（含两项静态检查）
 ```
 
-`test_search.py` 里的第 0 项是**静态检查**：用 AST 扫全包，确保没有"调用了但没定义/没导入"
-的名字。重构最容易留下的就是这个（把函数搬到别处、忘了补 import，只在某个错误分支才炸）。
+`test_search.py` 开头是两项**静态检查**（都纯 AST，不用跑起来）：
+
+- **无未定义引用**：确保没有"调用了但没定义/没导入"的名字 —— 重构最容易留下的就是它。
+- **无过时关键字参数**：调用处传的 `kwarg=` 必须真的存在于签名里。
+  这一条是**实测补上的**：删掉向量索引时去掉了 `run_qa` 的 `index_dir` 形参，但调用处还留着
+  `index_dir=index_dir` —— 全量自测 304 项全绿（测试文件自己也传了这个参数，而测试里那个名字
+  恰好还存在），一上真机就 `NameError`。**形参与实参是两个地方，删一个不等于删另一个。**
 
 ## TODO
 
@@ -765,6 +811,8 @@ python scripts/test_search.py       # 全链路 304 项断言（含静态"无未
 - [x] **S6** add 只留 session summary（删掉顶层 speakers summary）；search 简化为
       「检索就是 grep、按问题类型选策略」的搜索 agent；补上时间精度规则
       （见 §2.3 / §2.4）；删掉向量检索与检索 CLI（约 1670 行）
+- [x] **S7** `scripts/run_eval.py` 一条命令跑通三步并打印摘要；补一项静态检查
+      （过时关键字参数 —— 它正是 S6 在真机上炸的那个错因）
 
 待办：
 
