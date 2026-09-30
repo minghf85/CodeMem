@@ -333,8 +333,17 @@ Evaluation Criteria:
 
 2. CORE FACTUAL ACCURACY:
    - The main factual claim of the prediction must match the reference
+   - **An empty prediction is ALWAYS INCORRECT** when the reference states an answer. A prediction of
+     null / "unsupported" / "unable to determine" asserts nothing -- it cannot "match" a reference that
+     does state the fact. This is the single most common way a judge inflates the score, so check it
+     FIRST: if the prediction is empty or says the memories are insufficient, mark INCORRECT.
+   - **Extra content is NOT a defect when the question asks for a SET or a LIST.** For "what activities
+     / books / places / events / people", the reference is usually an incomplete list. A prediction that
+     contains every reference item PLUS additional correct items has a SUPERSET of the answer and is
+     CORRECT -- the extra items are more of the answer, not a contradiction. Only mark INCORRECT if an
+     added item is wrong, or if the question asked for a specific single fact.
    - Minor additions (e.g., "for vacation" added to "went to India") are ACCEPTABLE if they don't change the core fact
-   - Major additions that introduce new claims NOT in reference → INCORRECT
+   - Additions that CONTRADICT the reference, or that misstate the asked-about fact → INCORRECT
    - Omission of key information from reference → INCORRECT
 
 3. ENTITY HANDLING:
@@ -383,9 +392,11 @@ Examples:
 CRITICAL: Your entire response must be ONLY a JSON object. No markdown fences, no explanation, no text before or after the JSON.
 
 Format:
-{{"reason": "<first: the specific criterion that decides it, and the comparison you made>", "label": "CORRECT" | "INCORRECT"}}
+{{"reason": "<the comparison you made, in one or two sentences>", "label": "CORRECT" | "INCORRECT"}}
 
-- "reason": FIRST. One or two sentences naming the criterion that decided the verdict and the comparison behind it. Write this before the label.
+- "reason": FIRST. One or two sentences comparing the two answers. Write this before the label.
+  Do NOT name or recite the criteria headings -- just make the comparison.
+- **Decide by DEFAULT to CORRECT.** The prediction does not have to be worded like the reference. Ask only: does it state the same fact (allowing paraphrase, extra correct detail, and a superset for set questions)? Mark INCORRECT only for a clear defect: a different fact, a wrong entity, an omitted key item, or an empty answer.
 - "label": exactly "CORRECT" or "INCORRECT" (uppercase).
 - When the prediction is a JSON object, judge its "answer" field; a null answer with "unsupported": true counts as "unknown" and is INCORRECT when the reference answer is known.
 

@@ -131,6 +131,26 @@ def test_toolcfg(tmp: Path) -> None:
     check("VERIFIER 首个字段是 reasoning",
           '{"reasoning"' in _V.VERIFIER_SYSTEM_PROMPT)
 
+    # --- judge 判据的两条"防放水/防从严"规则（实测各踩过一次）---
+    jp = _P.JUDGE_PROMPT
+    # 放水：旧 judge 把 11 条空答案判成 CORRECT，虚高了整体分数
+    check("judge：空答案一律 INCORRECT", "empty prediction is ALWAYS INCORRECT" in jp)
+    # 从严：新 judge 把"集合型问题多给成员"判成错，集合型分数 67%->26%
+    check("judge：集合型超集算 CORRECT", "SUPERSET" in jp)
+    check("judge：额外内容不算缺陷（集合型）", "Extra content is NOT a defect" in jp)
+    check("judge：默认倾向 CORRECT", "DEFAULT to CORRECT" in jp)
+    check("judge：不要求与参考措辞一致", "does not have to be worded like the reference" in jp)
+    # reason 前置的副作用：模型改成复述判据标题，实测 42%->82%
+    check("judge：不要复述判据标题", "Do NOT name or recite the criteria headings" in jp)
+
+    # --- answer prompt 的时间规则（temporal 27%->50% 的那几条）---
+    ap = _P.ANSWER_PROMPT
+    check("answer：会话时间不是事件时间", "WHEN THE CONVERSATION HAPPENED" in ap)
+    check("answer：带锚点的相对表述是完整答案", "COMPLETE answer" in ap)
+    check("answer：禁止无锚点的相对词", "next month" in ap and "WRONG" in ap)
+    check("answer：不要编造源没有的精度", "do NOT add precision" in ap.lower()
+          or "Do NOT add precision" in ap)
+
     # 时间精度：这是这一版的核心规则
     check("时间策略：不得编造更细的精度", "Never invent a day" in rendered
           or "not finer" in rendered)
