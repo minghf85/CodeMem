@@ -11,6 +11,8 @@ dependencies = [
     "openai",
     "pyyaml",
     "tqdm",
+    "fastapi",
+    "uvicorn",
 ]
 
 [project.scripts]

@@ -62,9 +62,11 @@ src/codemem/
           prune.py __main__.py
   answer/ answer.py __main__.py
   eval/   runner.py judge.py metrics.py legacy.py __main__.py
+  api/    models.py store.py retriever.py server.py __main__.py   # 封装 API（Add/Search，见 §3.5）
 scripts/
   run_eval.py                        # 一条命令跑通 search → answer → eval 并打印摘要
   test_search.py                     # 纯 CPU 自测（假模型 + 真工具，零模型成本）
+  test_api.py                        # 封装 API 的纯 CPU 自测（幂等 / 隔离 / data 映射）
   eval_baseline.py eval_rag.py eval_atommem.py analyze_atommem_results.py  # baseline 对照（见 §5）
   regenerate_rejected.py transfer_data_to_msswift_standard.py locomo_data_loader.py
 docs/search.md                      # search 步骤的设计文档
@@ -719,6 +721,67 @@ python -m codemem.answer --evidence-dir data/search_runs/search_20260927_113054
 - **`unsupported` 尊重模型的显式判断**，只在字段缺失时才由"答案是否为空"推断。模型说
   "证据够但我答不出"（`unsupported: false` + 空答案）是 **answer 步骤**的问题，不该被归成
   证据不足 —— 否则 eval 的失败归类会指向错误的方向。
+
+---
+
+## 3.5 封装 API（Add / Search）
+
+面向外部评测的 HTTP 封装：把 add/search 两半管线包成一个**多用户、按 `user_id` 隔离、
+按 `request_id` 幂等**的服务。
+
+```bash
+python -m codemem.api                       # 默认 0.0.0.0:8000
+python -m codemem.api --port 9000 --log-level debug
+# 或
+uvicorn codemem.api.server:app --port 8000
+```
+
+| 端点 | 请求 | 响应 |
+|---|---|---|
+| `POST /add` | `{request_id, messages:[{role, content, timestamp?}], user_id, session_id}` | `{success, request_id, user_id, session_id}` |
+| `POST /search` | `{query, options?, user_id, top_k?}` | `{data:[{id, content, score, created_at}]}` |
+| `GET /health` | —— | `{status:"ok"}` |
+
+三条贯穿全局的约定：
+
+- **Add 幂等**。`request_id` 是幂等键 —— 重试时同一个 `request_id` **不会再写一遍**
+  （由 `meta.applied_request_ids` 记录）。响应的三个 id 原样回显。
+- **Add 返回即"立即可检索"**。写入原始消息后，**在返回前**同步刷新受影响的 session summary，
+  所以返回 `success:true` 时消息与它的概览层都已落盘。
+- **Search 的 `data` 永不为缺失**。没有记忆（该 user 从没 Add 过）或没有证据，一律返回
+  `{"data": []}`，绝不给 5xx 空响应。
+
+**Search 复用 search 步骤的 code-agent 管线**：`query` 归一化成 question → 建运行目录（硬链
+两层语料进 `inputs/`）→ agent 用 `grep` 检索、把**推导出的**证据写进 `evidence.jsonl` →
+verifier 判"够不够"→ 映射成协议 `data[]`（按 `metadata.score` 降序、`top_k` 截断）。
+**不是朴素关键词检索** —— 协议要的是"能直接回答问题的记忆列表"，而 agent 会把 `yesterday`
+折算成绝对日期、消解指代、把握散落的事实合并成一条。代价：每条 query 一次（或多次）LLM 调用。
+
+**存储布局**（按 `user_id` 一目录，`data/api_store/{slug(user_id)}/`）：
+
+```
+meta.json                 session_id -> 会话号、每会话消息数、已应用的 request_id
+sessions.jsonl            原始消息（session_template 格式，msg_id=session_1_3）
+session_summaries.jsonl   每个 session 一份（role="summary"）
+runs/{ts}/                每次 Search 的运行目录（inputs/ 硬链 + qa/evidence.jsonl，可审计）
+```
+
+**刻意沿用现有 `session_template` 与 `session_1_3` 约定**，于是 search 的 prompt、evidence 的
+`source` 校验、`date -d` 时间锚点全都照常工作 —— **search / add 现有代码一行都没改**。
+`time` 由协议的 `timestamp`（Unix 毫秒）转成 ISO-8601 UTC（`date -d` 可无歧义解析）。
+
+**多模态**：`content` 允许是 `str` 或有序 `ContentPart[]`；数组按原顺序归一化成**一个字符串**，
+文本 part 原样保留，图片 part 降级成 `[image: <url>]` 文本标记（可 grep、可溯源、可审计）。
+⚠️ **本系统不做图像理解** —— 多模态赛道只把图片当引用保留；文本 / 代码赛道是完整支持路径。
+
+自测（纯 CPU、零模型成本、零网络 —— 假模型 + 真工具 / 真存储）：
+
+```bash
+python scripts/test_api.py     # 37 项断言：幂等 / 多 user 隔离 / msg_id 与时间 / data 映射 / 多模态
+```
+
+配置在 `configs/api.yaml`：`generator`（agent+verifier 模型）、`summary`（Add 侧模型）、
+`store_dir`、`concurrency`、`top_k` 与 agent 预算。
 
 ---
 
