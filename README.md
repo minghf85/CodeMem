@@ -158,30 +158,3 @@ python -m codemem.api --host 0.0.0.0 --port 8000 --config configs/api.yaml
 三条契约保证：**Add 幂等**（同一 `request_id` 重试不重复写入）；**Add 返回即"立即可检索"**
 （返回前已同步刷新 session summary）；**Search 的 `data` 永不为缺失**（无记忆或无证据一律
 返回 `{"data": []}`）。详细设计与存储布局见 [`docs/core.md` §4](docs/core.md)。
-
-### 容量与运行限制
-
-- **运行环境**：单进程 Python 3.12 + FastAPI/uvicorn；语料为本地 JSONL（无外部数据库、
-  无向量索引、无 embedding 服务）。模型调用通过 OpenAI 兼容端点（`configs/api.yaml` 的
-  `generator` / `summary` 段）。
-- **并发**：Search 并发上限 `concurrency`（默认 8）、Add 并发上限 `add_concurrency`（默认 8），
-  由进程内 `asyncio.Semaphore` 限流。**每条 Add 触发一次 summary 模型调用、每条 Search 触发
-  一次（或多次）agent 模型调用** —— 容量瓶颈在模型端点，请据此配置并发。
-- **单条 Search 预算**：`max_steps`（默认 30 步）、`max_verify_rounds`（默认 2 轮），
-  可用 `configs/api.yaml` 调整。单条 query 的墙钟时间取决于模型吞吐。
-- **数据隔离**：按 `user_id` 一目录（`data/api_store/{slug(user_id)}/`），互不可见；
-  `top_k` 默认 100，用于截断返回条数（正式外部评测固定 100）。
-- **多模态限制**：`content` 支持 `str` 或有序 `ContentPart[]`。数组按原顺序归一化为**一个
-  文本串**，文本 part 原样保留、图片 part 降级为 `[image: <url>]` 文本标记。
-  ⚠️ **本系统不做图像理解** —— 多模态赛道只保留图片引用；文本 / 代码赛道是完整支持路径。
-- **已知运行限制**：Search 依赖模型的工具调用一致性；弱模型偶发不守 JSON 协议（回显 prompt
-  文本而非工具调用）。生产评测建议使用稳定的指令模型。
-
-### 披露
-
-- **公开仓库**：<https://github.com/minghf85/CodeMem>
-- **原始方法作者**：**minghf85**（本方法即由作者本人设计并实现）。
-- **技术报告**：[`docs/core.md`](docs/core.md)。该文件即本方法的技术报告，完整记录架构、
-  设计依据、实验过程与评测结论。
-- **方法改动**：**无**。仓库已公开于 <https://github.com/minghf85/CodeMem>，本方法为原创方法，
-  未基于他人方法做改动。
