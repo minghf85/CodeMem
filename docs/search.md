@@ -2,8 +2,8 @@
 
 **目标**：对每条 question，产出一份**真正能回答它的记忆列表**，落盘为 `evidence.jsonl`。
 
-**载体**：一个**搜索 agent**。它工作在**一个目录**里，只会四个通用工具
-`read` / `write` / `edit` / `bash`。检索就是 **`grep`** 一条命令 —— 没有任何检索 CLI、
+**载体**：一个**搜索 agent**。它工作在**一个目录**里，只会三个通用工具
+`read` / `edit` / `bash`。检索就是 **`grep`** 一条命令 —— 没有任何检索 CLI、
 没有向量索引、没有 embedding 服务。时间算术用 bash 的 **`date -d`**。工具描述与 schema
 由**统一的 `tool.json`** 管理，渲染进上下文（§5）。
 
@@ -13,16 +13,18 @@
 索引构建、以及一个**无法解释的排序**（它为什么排 101 名，你查不出来）。多跳问题靠的是
 **词面匹配**（第一跳找到的实体名，正是第二跳的检索词），那正是 grep 的强项。
 
-**两种策略，按问题类型选**（写进 system prompt，见 §6.1）：
+**两种策略集成在一个 loop 里，agent 运行中自己切换**（写进 system prompt，见 §6.1）：
 
 | | 什么时候用 | 怎么做 |
 |---|---|---|
-| **A. 关键词多跳** | 事实型：一个名字、一个数字、一件事 | grep 定位会话 → 读它 → 拿新词再 grep |
-| **B. 遍历** | 集合型/散布型："她参加过哪些活动"、"他读过哪些书" | grep 出所有相关会话，**逐个走完** |
+| **A. 关键词直达** | 事实型：一个名字、一个数字、一件事 | `grep -rin "词" inputs/sessions/` → 读到新词再 grep（多跳） |
+| **B. 通读相关 session** | 集合型/散布型："她参加过哪些活动"、"他读过哪些书" | `grep -rln` 拿到相关会话文件列表，**逐个 read 走完** |
 
 实测 LoCoMo 的标注证据里，**1187/1985 条 QA 的证据只用到一个 session**，但有 **330 条
 跨 2 个以上、最多跨 15 个**；集合型问题（"what activities / books / places..."）有 57 条。
-两类问题的正确打法不同，一个 prompt 说不清 —— 所以显式给判据，让模型先选再动手。
+两类问题的打法不同，**但一条 question 不一定一开始就能判定该用哪种** —— 所以不预设分支，
+而是让 agent 先用 A、发现收不全（集合/散布）就转 B；B 读到的成员名又能拿回 A 去查它在别的
+会话的出现。判据写进 prompt，切换由模型自己决定。
 
 ---
 
@@ -58,9 +60,8 @@
 ```
                        ┌──────────────────── 一次运行的目录 ────────────────────┐
                        │                                                        │
-  data/{dir}/sessions.jsonl            ──硬链──► inputs/sessions.jsonl            │
-  data/{dir}/session_summaries.jsonl   ──硬链──► inputs/session_summaries.jsonl   │
-                       │   （没有索引、没有 CLI —— agent 用 grep 检索）             │
+  data/{dir}/sessions/session_N.jsonl  ──硬链──► inputs/sessions/session_N.jsonl  │
+                       │   （没有向量索引、没有 CLI —— agent 用 grep 检索）         │
                        │                                                        │
                        │   qa_{idx}/                    ← workspace == bash 的 cwd │
                        │       evidence.jsonl           ← 唯一产物               │
@@ -68,7 +69,7 @@
                                           ▲                    │
                                           │ 写文件             │ 读文件 / 跑 shell
                                           │                    ▼
-                                     Agent（read/write/edit/bash）──「我不再调用工具了」──► Verifier
+                                     Agent（read/edit/bash）──「我不再调用工具了」──► Verifier
                                           ▲                                                  │
                                           └────────── 不足以回答：注入 missing[] ◄───────────┘
 ```
@@ -80,20 +81,24 @@
 
 ---
 
-## 2. 语料：为什么只有两层
+## 2. 语料：消解后的会话文件（一次会话一个）
 
-| 文件 | 粒度 | 条数（Caroline_Melanie） | 用途 |
-|---|---|---|---|
-| `session_summaries.jsonl` | 概览（每 session 一份） | 19 | **粗筛**：定位"哪次会话谈过这件事" |
-| `sessions.jsonl` | 原始消息 | 419 | 精确措辞、时间锚点 |
+| 位置 | 粒度 | 用途 |
+|---|---|---|
+| `sessions/session_N.jsonl` | 一次会话一个文件，一条消息一行 | **已消解**：时间绝对、指代消解 |
 
-**删掉了顶层的 speakers summary。** 它是把 19 份 summary 再压成 1 条的合成文本，而检索真正
-需要的是"定位到哪次会话"—— 那是 session summary 就有的粒度。更要命的是它**没有 `msg_id`
-可回溯**，`source` 只能指向别的 summary 而非原始消息，直接破掉了 §8 的溯源不变量。
-每多一层，还多一次模型调用、多一次全量重跑，以及每条 QA 都要背的一份没人用的语料。
+**没有摘要层，也没有额外的索引/图层。** 曾经有过两种"摘要"层，实测都被淘汰：**顶层
+speakers summary**（把全部摘要压成一段整体印象）诱导 agent 看一眼就凑答案 —— 152 条 QA 里
+150 条一次 `grep` 都没做；**逐会话 session summary** 则 119/152 条压根不读。后来又有
+`index.jsonl`（三元组）、`nodes/edges`（图）两层"导航"，有效但都是**额外的指针层**。
+这一版**把导航层整个去掉**：add 阶段（`resolve`）直接把每条消息改写成**上下文无关**的
+形式 —— 时间是绝对时间（`7 May 2023`）或带绝对锚点的相对时间（`the week before 9 June
+2023`），指代已换回真名。于是 **grep 命中的就是能回答问题的原料**，同一实体跨会话都写成
+同一个真名（`grep -rin NAME inputs/sessions/` 即一次命中它的全部会话）。
 
 `session_template.jsonl` 是唯一的记录格式：`{"msg_id", "role", "time", "content"}`，
-summary 只是把 `role` 标成 `"summary"`。**agent 只需理解一种格式。**
+消解后额外带 `time_kind`（point/range/approx）与 `source_content` / `source_time`（原话与
+原始会话时间戳）。**agent 只需理解一种格式。**
 
 ---
 
@@ -102,16 +107,15 @@ summary 只是把 `role` 标成 `"summary"`。**agent 只需理解一种格式�
 ```
 data/search_runs/{experiment}_{ts}/{dir}/
     inputs/
-        session_summaries.jsonl   # 只读，硬链
-        sessions.jsonl            # 只读，硬链
+        sessions/session_N.jsonl  # 只读，硬链（每会话一个文件）
     qa_{idx}/
-        evidence.jsonl            # 产物（agent 用 write/edit/bash 生成）
+        evidence.jsonl            # 产物（agent 用 edit/bash 生成）
     {dir}.qa_trajectories.jsonl   # 每 QA 一行：轨迹、步数、工具调用序列、reject、tampered…
     {dir}.model_calls.jsonl       # 每次模型调用的原始输出（debug 级排错用）
     summary.json
 ```
 
-`inputs/` 用**硬链**而不是拷贝：省空间。再加一道保险 —— **每个 QA 跑完校验两层语料的
+`inputs/` 用**硬链**而不是拷贝：省空间。再加一道保险 —— **每个 QA 跑完校验整个会话语料树的
 sha256**，不一致则记 `tampered=true` 并把该 QA 的结果作废（不计入统计）。这是"检测而非防御"：
 bash 理论上能写任何地方，但"检测 + 作废"足够便宜，不值得为此做沙箱。
 
@@ -129,15 +133,17 @@ bash 理论上能写任何地方，但"检测 + 作废"足够便宜，不值得�
 
 ## 4. 工具契约
 
-四个工具的执行语义**对齐 `reference/tools.py`**（该文件依赖的 `tau_agent` 未安装，故移植其
+三个工具的执行语义**对齐 `reference/tools.py`**（该文件依赖的 `tau_agent` 未安装，故移植其
 实现到 `src/codemem/search/tools.py`，保留其关键行为）：
 
 | 工具 | 参数 | 关键行为（沿用 reference 语义） |
 |---|---|---|
 | `read` | `path, offset?, limit?` | 文本按 UTF-8 读；输出截断到 **2000 行 / 50KB**，附续读提示 |
-| `write` | `path, content` | 覆盖写，自动建父目录；**落在 workspace 之外则拒绝**（§8 新增约束） |
-| `edit` | `path, edits[{oldText,newText}]` | 每个 `oldText` 必须**唯一且不重叠**，全部校验通过才写；返回 diff |
+| `edit` | `path, append? \| edits[{oldText,newText}]` | append 追加（缺 `path` 默认 evidence.jsonl，文件不存在则创建）；replace 时每个 `oldText` 必须**唯一且不重叠**，全部校验通过才写 |
 | `bash` | `command, description, timeout?` | stdout+stderr 合并，**tail** 截断 2000 行 / 50KB，超时杀进程组 |
+
+> `write` 已删除：整份覆盖会冲掉前面已写的证据，而 `edit` 的 append + replace 已足够。
+> 删掉它也移除了"模型用 write 覆盖整份文件"这类事故。
 
 `bash` 的沙箱 = `cwd` 指向 `qa_{idx}/`，并通过 `shell_command_prefix` 注入环境
 （这条正是 reference 实现已有的能力）：
@@ -154,20 +160,19 @@ export CODEMEM_INPUTS=<run>/{dir}/inputs # 语料目录的绝对路径
 
 ### 4.2 `grep` —— 检索就是它
 
-语料是两个 JSONL 文件，一行一条记录，所以 `grep` 直接可用、行号稳定：
+语料是 `inputs/sessions/` 下的多个 JSONL 文件（每会话一个），一行一条记录，所以 `grep` 直接可用、行号稳定：
 
-语料是两个文件，各按 line 切：
-
-| 文件 | 内容 | 怎么用 |
+| 动作 | 命令 | 何时 |
 |---|---|---|
-| `inputs/session_summaries.jsonl` | 每个 session 一行概览 | **第一步总是 grep 它** —— 定位到哪次会话 |
-| `inputs/sessions.jsonl` | 每条消息一行，带 `msg_id` 与 `time` | 精确措辞、时间锚点；`grep -n` 拿到行号后 `read` |
+| 全库关键词检索 | `grep -rin "词" inputs/sessions/` | 关键词直达；命中即相关句（已消解，可回答） |
+| 定位相关会话 | `grep -rln "词" inputs/sessions/` | 通读策略第一步：拿到该读哪几个文件 |
+| 通读一个会话 | `read inputs/sessions/session_5.jsonl` | 集合/散布型：从头读到尾 |
 
 ```bash
-grep -in "husband" inputs/session_summaries.jsonl     # ① 哪次会话相关
-grep -in "husband" inputs/sessions.jsonl | head       # ② 原话在这里
-grep -Ein "pottery|camping|painting" inputs/sessions.jsonl | head   # ③ 几个词一起
-read inputs/sessions.jsonl offset=120 limit=40        # ④ 精读一次会话
+grep -rin "husband" inputs/sessions/                 # ① 全部会话里 husband 出现在哪
+grep -rln "husband" inputs/sessions/                 # ② 哪些会话文件提到它
+grep -Ein "pottery|camping|painting" inputs/sessions/ | head   # ③ 几个词一起
+read inputs/sessions/session_5.jsonl                 # ④ 通读一次会话
 ```
 
 每条记录自带 `time`（会话时间）与 `msg_id`，所以 agent 从任何一行都能拿到时间锚点，
@@ -405,7 +410,7 @@ prompt 会随历史无限涨（实测 12 步从 3.3k 涨到 4.5k token）。超�
 |---|---|---|
 | 1 | `evidence.jsonl` 每行必须是 `{content: 非空, metadata.source: 非空数组}`；`score` / `changelog` 系统可补，其余不合规的行 **reject 并在轨迹里记账** | `source` 非空是**反幻觉护栏**：它必须列出真读过的 msg_id，而不是记得或猜的 |
 | 2 | `write`/`edit` 路径必须落在 `qa_{idx}/` 内 | 只读输入不被误写 |
-| 3 | 每 QA 收尾校验**两层语料**的 sha256；不一致 → `tampered=true`，该 QA 作废 | bash 可以绕开 #2，检测成本极低 |
+| 3 | 每 QA 收尾校验**整个会话语料树**的 sha256（逐文件）；不一致 → `tampered=true`，该 QA 作废 | bash 可以绕开 #2，检测成本极低 |
 | 4 | 只补全**系统自有字段**（缺 `changelog` → 补 `created`；缺 `score` → 补 0.5） | 补全语义问题会掩盖失败模式 |
 | 5 | 工具/解析/模型调用失败 = 一次 failed step，记账后继续 | 所有失败路径都退化为无害一步 |
 | 6 | 连续 `no_progress_patience` 步唯一记录指纹没变 → 提前收尾 | 把空转变成机制而不是 prompt 请求 |
@@ -419,7 +424,7 @@ prompt 会随历史无限涨（实测 12 步从 3.3k 涨到 4.5k token）。超�
 
 | 旧版机制 | 为什么不再需要 |
 |---|---|
-| `ADD/UPDATE/DELETE/NOOP` 动作空间 + 逐动作校验 | 被 `write`/`edit`/`bash` 取代 |
+| `ADD/UPDATE/DELETE/NOOP` 动作空间 + 逐动作校验 | 被 `edit`/`bash` 取代 |
 | 候选集 K 与"每条都必须访问一遍" | 循环不再预设候选，agent 自己决定检索几次、看什么 |
 | `{{CURRENT}}/{{RECALLED}}/{{HISTORY}}` 三段式 prompt | 被工具协议 + 对话历史取代（HISTORY 天然就是 messages） |
 | `NOOP` 动作 | 终止由"不再调用工具 + verifier 判定"决定 |
@@ -445,7 +450,7 @@ prompt 会随历史无限涨（实测 12 步从 3.3k 涨到 4.5k token）。超�
 
 **没有索引，也就没有索引的成本**。旧版这一步是整条链路最重的一块：向量索引（一个目录
 17MB）、共享缓存、按 `corpus_sha256` 判失效、跨运行复用。现在这一切都不存在 ——
-语料就是两个 JSONL 文件，硬链进运行目录（inode 共享，0 额外空间），agent 直接 grep。
+语料就是一个 `sessions/` 目录（每会话一个 JSONL 文件），硬链进运行目录（inode 共享，0 额外空间），agent 直接 grep。
 删掉的代码：`index.py`（344 行）、`embedder.py`（115 行）、`searchmem.py`（434 行）、
 `searchctl.py`（531 行）、`timecalc.py`（247 行），合计约 1670 行，以及它们对应的测试。
 

@@ -404,48 +404,117 @@ REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing el
 
 
 # ---------------------------------------------------------------------------
-# 两层 summary：session summary -> speakers summary
+# 消解：把一条消息改写成**上下文无关**的形式（时间绝对化 + 指代消解）
 # ---------------------------------------------------------------------------
 #
-# 为什么需要 summary（而不是继续抽原子）：实测 152 条 QA 里 multi_hop 只有 43%、
-# 单跳之外的推理普遍吃力。根因是**原子丢失了会话结构** —— 一条条孤立的事实无法回答
-# "他们什么时候认识的""这段关系怎么发展的"这类问题。summary 保留的正是结构：
-# 一次会话谈了什么、什么变了、谁对谁说了什么。层级也给了 agent 一个**由粗到细的检索
-# 入口**（先看 speakers summary 定位到哪次会话，再进那次会话的 summary 和原文）。
+# **这是 add 阶段唯一的 LLM 产物**（取代了 `index.jsonl` 三元组与 `nodes/edges` 图）。
+# 它要解决的是 bad case 里最实的两处问题：**时间推理**与**跨 session 联系**。
+#
+# 做法不是"另建一层导航"，而是**把原始消息本身改写成上下文无关的**：读者不需要任何
+# 前后文（也不需要会话时间）就能看懂 —— 因为时间已经锚定成绝对时间 / 带绝对锚点的相对
+# 时间，指代已经消解成原始含义。这样：
+#   - **关键词检索直达**：grep 一个词命中的就是消解后的文本，本身就是能回答问题的原料；
+#   - **跨会话联系**：同一实体在多次会话里都写成同一个真名，grep 那个名字就命中它的全部
+#     会话（替代了图里"边带 session 号"的作用）；
+#   - **通读**时，每个 session 文件自足，不会"读到后面忘了前面"。
+#
+# 三条刻意的设计：
+#
+#   ① **时间要"自足"**：看到它就对应现实中的一个时间，不需要别的辅助信息。
+#      即 **绝对时间**（"7 May 2023"）或 **带绝对锚点的相对时间**（"the week before
+#      9 June 2023"）。禁止无锚点的相对词（"yesterday"、"last week" 单说）。
+#   ② **精度只能等于、不能超过原文**：源说 "last year" → 只能到年（"2022"），
+#      不许编出月日。源说 "yesterday" → 算术精确（锚点是该消息自己的日期），可到日。
+#   ③ **区分时间点 / 时间段 / 大概时间**：点（"7 May 2023"）用 `time_kind: point`；
+#      段（"the week before 9 June 2023"、"June 2023"）用 `range`；模糊（"recently"、
+#      "a while ago"）用 `approx`。粒度也要与原文一致。
+#
+# 指代消解同理：把 it/she/they/there 换成原始含义（真名 / 真实地点 / 真实物件）。
+#
+# 逐消息处理（需要前文消息才能消解指代）—— 见 `add/resolve.py`。
 
-SESSION_SUMMARY_SYSTEM_PROMPT = """CRITICAL: Your response must be ONLY a JSON object. No explanation, no reasoning, no markdown fences, no text before or after the JSON.
+RESOLVE_SYSTEM_PROMPT = """CRITICAL: Your response must be ONLY a JSON object. No explanation, no reasoning, no markdown fences, no text before or after the JSON.
 
-You summarize ONE conversation session between {speaker_a} and {speaker_b}.
+You rewrite ONE message from a conversation between {speaker_a} and {speaker_b} into a form that is FULLY SELF-CONTAINED: a reader who has never seen this conversation, the other messages, or the session time must understand it exactly.
 
-## What a session summary must capture
-- **Who**: every person, pet, or group mentioned, and how they relate to the speakers.
-- **What happened**: the events, plans, and decisions actually discussed.
-- **What changed**: any change in state, plan, belief, or relationship during this session. This matters most -- a summary that only lists topics has failed.
-- **Time anchors**: keep the session's time exactly as given, and note any relative time the speakers use ("last week", "three years ago") together with what it refers to in this session.
-- **Relationship signal**: what this session reveals about how {speaker_a} and {speaker_b} relate (support, advice, shared activity, conflict, distance).
+Two things must be resolved.
 
-## Rules
-- Write in third person, naming people explicitly. Never use a pronoun whose referent is not in the same sentence.
-- Preserve the session's own wording for emotions and nuance ("she was nervous about it") -- do not flatten everything into neutral statements.
-- Include concrete specifics: names, places, numbers, durations, titles. A summary with no specifics is useless.
-- Do NOT invent anything not stated or clearly implied. If something is unclear, leave it out rather than guessing.
-- Do NOT summarize the conversation turn by turn -- synthesize what a reader needs in order to later retrieve and reason over this session.
-- Keep it dense: 120-300 words. Shorter for a trivial session; do not pad.
+## 1. TIME — make it absolute or anchored to an absolute
+
+The message's own time is given below (the session time). Use it as the anchor for any relative expression. The result must let a reader place the event in reality WITHOUT any other information.
+
+- `time`: the resolved time expression at the SAME precision the source used.
+- `time_kind`: `"point"` (a single moment/date), `"range"` (a period: a week, a month, a year, a span), or `"approx"` (vague: "recently", "a while ago").
+- `time_raw`: the source's OWN words for the time, verbatim. Empty string if the message states no time.
+
+Rules, by example (message dated 8 May 2023 unless noted):
+
+- source "yesterday" -> `time` = "7 May 2023" (exact arithmetic from the anchor -> a point)
+- source "last week" -> `time` = "the week before 8 May 2023" (a range; do NOT flatten it to 8 May)
+- source "last year" -> `time` = "2022" (a YEAR -- do NOT invent a day; range)
+- source "last Saturday" -> `time` = "the Saturday before 8 May 2023" (range/weekday; not a full date unless the weekday makes it exact)
+- source "two weekends ago" -> `time` = "two weekends before 8 May 2023"
+- source "recently" / "a while ago" -> `time` = "recently (as of 8 May 2023)" (approx -- keep it vague, but anchor the message; do NOT invent a date)
+- source is already absolute ("on 7 May 2023") -> `time` = "7 May 2023"
+- source states no time -> `time` = "", `time_kind` = ""
+
+**Never invent precision the source did not give.** "last year" is a year, not a date. "a few days ago" is a range, not a day. When in doubt, stay coarser.
+
+## 2. REFERENCES — replace every pronoun / pointing word with what it really is
+
+- `she` / `he` / `they` / `my husband` -> the person's real name (use `{speaker_a}` / `{speaker_b}` for the two speakers).
+- `it` / `that` / `this` / `the one` -> the actual thing it refers to.
+- `there` / `here` -> the actual place.
+- `then` / `that time` -> the resolved time.
+
+Resolve ONLY from what the message and the given context actually support. If you genuinely cannot tell what a pronoun means, keep the most specific description the message allows (e.g. "Melanie's son") rather than a bare "he".
+
+## Rewriting `content`
+
+Rewrite the message so that BOTH resolutions are baked into one self-contained statement. Keep the speaker's own facts and wording where possible -- do not add facts, do not summarize, do not combine messages. Just make the references concrete and the time anchored.
+
+Example (message: Caroline says "I went to a LGBTQ support group yesterday and it was powerful", dated 8 May 2023):
+`content` = "Caroline went to a LGBTQ support group on 7 May 2023 and found it powerful."
 
 ## Output
-Your entire response must be ONLY this JSON object, starting with {{ and ending with }}:
+Your entire response must be ONLY this JSON object, starting with { and ending with }:
 
-{{"summary": "<the session summary>", "key_facts": ["<fact 1>", "<fact 2>", ...], "time": "<the session time, exactly as given>"}}
-
-- "key_facts": 3-8 short, self-contained facts a retrieval system could match a question against.
-  Each must name its subject. These are the highest-value retrieval hooks, so make them specific.
+{"content": "<rewritten, self-contained message>", "time": "<resolved time or empty>", "time_kind": "point|range|approx|", "time_raw": "<source time words or empty>"}
 """
 
-SESSION_SUMMARY_USER_PROMPT = """## Session {session_index} of the conversation
-Time: {session_time}
+RESOLVE_USER_PROMPT = """## Session {session_index} of the conversation
+Session time: {session_time}
 
-## Messages ({message_count} total, in order)
-{messages}
+## Earlier messages in this session (for resolving pronouns ONLY -- do NOT rewrite or extract from them)
+{window}
 
-Summarize this session.
+## MESSAGE to rewrite (rewrite ONLY this one)
+[{msg_id}] ({msg_time}) {role}: {content}
+
+Rewrite this ONE message into a self-contained form (resolve time + references).
 """
+
+# ---------------------------------------------------------------------------
+# 证据标准（search 的核心：一条证据要写法上合格，找到只是第一步）
+# ---------------------------------------------------------------------------
+#
+# 为什么单独抽成一个变量：**"找到了证据"和"写出来的证据能用"是两件事**。实测里最
+# 常见的失败不是没检索到，而是检索到了却写成了一条下游读不懂的记录 —— 指代没消解
+# （"she went there"）、时间只有个无锚点的相对词（"next month"）、或者把两条只有合看
+# 才有意义的记录原样抄成两条。这一类问题与"检索策略"无关，只与"记录的写法"有关。
+#
+# 所以它被提成一份**可核对的清单**（每条都能用眼睛验），由 tool.json 的
+# {{EVIDENCE_STANDARD}} 槽位注入 agent 的 system prompt，与 writing_policy / time_policy
+# 并列。改了它就等于改了"什么算一条合格的证据"。
+
+EVIDENCE_STANDARD = """A record is ACCEPTABLE only if it passes every check below. Run these checks on each record before you consider it written.
+
+1. SELF-CONTAINED. A reader who has never seen the conversation, the session summaries, or the question must understand it. If it needs anything from outside the record itself to make sense, rewrite it or drop it.
+2. REFERENTS RESOLVED. No bare pronoun or pointing word survives: she / he / they / it / this / that / there / then / the other one. Replace each with the concrete person, place, or thing. (A name used as the subject of the sentence is the target; "Caroline" is resolved, "she" is not.)
+3. TIME ANCHORED. Any time expression either (a) is already an absolute date or period ("7 May 2023", "June 2023", "the week of 23 August 2023"), or (b) is a relative phrase that carries its own anchor in the record ("the week before 9 June 2023"). A relative word with no anchor ("next month", "recently", "the other day") is NOT acceptable -- write the anchor next to it.
+4. NO INVENTED PRECISION. State the time at the granularity the source gave. If the source said "last year", the record says a year, not a day. Do not compute a date the source did not support.
+5. A CLAIM, NOT A QUOTE. The record states a fact, not a transcript turn. Paraphrase into a standalone statement; do not paste the raw message.
+6. SOURCED. metadata.source lists the real msg_ids you read to support this record -- never an id you only remember or guessed. If you cannot point to an id, you cannot write the record.
+7. ONE FACT, JOINED IF NEEDED. If answering needs two records joined, write the joined conclusion as one record (and list both sources). If a question wants a SET, list the members, ideally in one record -- not one record per member.
+
+If a candidate record fails a check, fix it (usually by adding the name or the anchor) rather than dropping the evidence. Drop it only when you genuinely cannot resolve it -- a partially-resolved record is worse than a resolved one, but a dropped one scores nothing."""

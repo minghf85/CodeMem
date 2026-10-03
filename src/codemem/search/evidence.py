@@ -1,6 +1,6 @@
 """``evidence.jsonl`` 的校验与规范化 —— harness 侧的**唯一**产物检查点。
 
-agent 是用 bash/jq/write 自由写文件的，所以产物可能不合法（缺字段、id 重复、没有 source）。
+agent 是用 bash/edit 自由写文件的，所以产物可能不合法（缺字段、id 重复、没有 source）。
 本模块在每条 QA 收尾时把文件读一遍，逐行判定：
 
     valid    通过全部不变量 → 原样交付
@@ -17,7 +17,7 @@ agent 是用 bash/jq/write 自由写文件的，所以产物可能不合法（�
 3. ``metadata`` 是对象，``metadata.id`` 非空字符串，且**文件内唯一**；
 4. ``metadata.type`` ∈ {inner, outer, raw}；
 5. ``metadata.tag`` 是非空数组且至少一条 ``speaker:``；
-6. ``metadata.source`` 是**非空**数组 —— 反幻觉护栏。语料是两层（session summary /
+6. ``metadata.source`` 是**非空**数组 —— 反幻觉护栏。语料是两层（跨会话索引 /
    原始消息），agent 只能引用它真读过的 msg_id（用 grep 找到、用 read 看到的那些）。
 """
 

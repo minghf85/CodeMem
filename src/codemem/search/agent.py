@@ -1,6 +1,6 @@
-"""agent loop：让模型用 read/write/edit/bash 在一个目录里自主探索、写出 evidence.jsonl。
+"""agent loop：让模型用 read/edit/bash 在一个目录里自主探索、写出 evidence.jsonl。
 
-设计见 ``docs/search.md``。这个 loop 的目标是**对齐成熟 code agent 的标准做法**，
+设计见 ``docs/core.md``。这个 loop 的目标是**对齐成熟 code agent 的标准做法**，
 同时针对实测暴露的四个失败点做了具体修正（每条都有日志里的证据）：
 
 ======================  =====================================================  ==========
@@ -58,25 +58,27 @@ def _evidence_digest(path: Path, state: EvidenceState, limit: int = 3) -> str:
 
     **这是修 P0 的核心**：``grep ... >> evidence.jsonl`` 的 stdout 是空的（重定向走了），
     所以模型收到的观测是 ``(no output)`` —— 它看不见自己刚写了什么，于是盲目重试。
-    这里由 harness 主动把"文件现在长什么样"告诉它。
+    这里由 harness 主动把"文件现在长什么样"告诉它（末尾几行 + 条数）。
+
+    现在追加有专门的 ``edit append`` 参数（见 tools.create_edit_tool），所以不再需要把
+    "最后一行当 oldText"的配方塞进来 —— 只如实回报文件现状即可。
     """
     if not path.exists():
-        return f"\n\n[{path.name}: does not exist yet]"
+        return f"\n\n[{path.name}: does not exist yet -- your first record goes in with `edit` append]"
     if state.lines == 0:
         return f"\n\n[{path.name}: still empty]"
-    lines: list[str] = []
     try:
-        content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        content = [line for line in path.read_text(
+            encoding="utf-8", errors="replace").splitlines() if line.strip()]
     except OSError:
         content = []
-    for line in content[-limit:]:
-        line = line.strip()
-        if line:
-            lines.append(f"  {line[:160]}" + ("…" if len(line) > 160 else ""))
-    tail = "\n".join(lines)
+    if not content:
+        return f"\n\n[{path.name}: still empty]"
+    preview = "\n".join(f"  {line[:200]}" + ("…" if len(line) > 200 else "")
+                        for line in content[-limit:])
     return (
         f"\n\n[{path.name} now: {state.summary()}]\n"
-        f"[last {len(lines)} line(s)]\n{tail}"
+        f"[last {min(limit, len(content))} line(s)]\n{preview}"
     )
 
 
@@ -86,14 +88,12 @@ def repeat_notice(call: ToolCall, count: int) -> str:
         f"ERROR: you already ran this exact {call.tool} call {count} times "
         f"({call.describe()}). Running it again cannot change the result.\n"
         f"Do something DIFFERENT. Common reasons you are stuck:\n"
-        f"- That word may simply not be in that file. Try the OTHER file "
-        f"(inputs/session_summaries.jsonl vs inputs/sessions.jsonl), or a different word.\n"
+        f"- That word may simply not be in that file. Try another word, or another session file.\n"
         f"- To hop: grep a NEW name or number you just read, e.g. "
-        f"grep -in \"Melanie husband\" inputs/sessions.jsonl | head\n"
+        f"grep -rin \"Melanie husband\" inputs/sessions/ | head\n"
         f"- To see what you already have: grep -c . evidence.jsonl\n"
-        f"- If the question wants a SET, or answers keep turning up in different sessions, stop "
-        f"grepping one word and sweep: grep -n \"NAME\" inputs/session_summaries.jsonl, then read "
-        f"each session it names.\n"
+        f"- If the question wants a SET, or the same topic keeps turning up in different "
+        f"sessions, grep -rin the name across inputs/sessions/ to see every session it appears in.\n"
         f"When the evidence already answers the question, reply with plain text (no JSON) to finish."
     )
 
@@ -112,7 +112,8 @@ def oversize_notice(records: int, limit: int) -> str:
         f"\n\n[evidence.jsonl has {records} records -- that is far too many (aim for 5-15). "
         f"You are supposed to extract a SMALL set that answers the question, not dump every "
         f"candidate you saw. Keep only the records the answer needs, merge related ones into a "
-        f"single record, then `write` the trimmed list. If the question asks for a SET of things "
+        f"single record, and remove the rest (grep evidence.jsonl, then rewrite it with `edit` "
+        f"replace, or just stop adding). If the question asks for a SET of things "
         f"(activities, hobbies), list them in ONE record rather than one record per member.]"
     )
 
@@ -126,7 +127,7 @@ def write_nudge_notice(step_count: int, have: int) -> str:
     **prompt 的软约束在 8B 上不可靠，管用的是一期一会的机制**。
 
     所以由 harness 主动在观测里插话：把你已经查到的东西**现在**写下来。注意措辞是
-    "把已有的写下来"而不是"赶紧写" —— 空 write 或编造记录都是更坏的结局。
+    "把已有的写下来"而不是"赶紧写" —— 空写或编造记录都是更坏的结局。
     """
     if have:
         return (
@@ -135,8 +136,8 @@ def write_nudge_notice(step_count: int, have: int) -> str:
         )
     return (
         f"\n\n[You have gone {step_count} steps and evidence.jsonl is still EMPTY. "
-        f"Stop reading and WRITE what you have already found, now. Use `write` with the full "
-        f"list of records. You can always improve it afterwards -- "
+        f"Stop reading and WRITE what you have already found, now -- one `edit` append per "
+        f"record. You can always improve it afterwards -- "
         f"an empty file scores zero no matter how well you searched.\n"
         f"If you are unsure whether a candidate belongs, include it with the wording you can "
         f"support and move on. Do not spend more turns re-reading the same record.]"
@@ -154,9 +155,9 @@ def grep_no_match_notice() -> str:
     return (
         "\n\n[grep exited 1: that means NO MATCH, not a failure -- grep returns 1 when a pattern "
         "is not found. The word is either absent from that file or spelled differently there. "
-        "Next: try the other file (inputs/session_summaries.jsonl / inputs/sessions.jsonl), or a "
-        "shorter/other word, or fewer terms at once. See what is actually there with: "
-        "grep -c . inputs/sessions.jsonl]"
+        "Next: try a shorter/other word, fewer terms at once, or another session file "
+        "(inputs/sessions/session_N.jsonl). See what is actually there with: "
+        "grep -rc . inputs/sessions/]"
     )
 
 
@@ -175,9 +176,8 @@ def no_output_notice(call: ToolCall) -> str:
     return (
         "\n\n[(no output). grep found NO match for that pattern -- that is not a crash "
         "(grep exits 1 when nothing matches). Either the word is not in that file, or it is "
-        "spelled differently there. Try the other file "
-        "(inputs/session_summaries.jsonl / inputs/sessions.jsonl), or another word. "
-        "Check what is actually there with: grep -c . inputs/sessions.jsonl]"
+        "spelled differently there. Try another word, or another session file. "
+        "Check what is actually there with: grep -rc . inputs/sessions/]"
     )
 
 
@@ -390,7 +390,7 @@ def compact_messages(
                 continue
             tools_used.append(call.tool)
             command = str(call.args.get("command") or call.args.get("path") or "")
-            for name in ("session_summaries.jsonl", "sessions.jsonl", "evidence.jsonl"):
+            for name in ("sessions/", "evidence.jsonl"):
                 if name in command:
                     notes.append(name)
             # 抓出命令里提到的 id（形如 "session_1_3"），它们是最该记住的东西 ——
@@ -596,7 +596,7 @@ async def run_agent_round(
         if call.tool not in tools:
             step.error = (
                 f"unknown tool {call.tool!r}. Available: {sorted(tools)}. "
-                f"Use bash for shell commands (grep, sed, read), or read/write/edit for files."
+                f"Use bash for shell commands (grep, sed, read), or read/edit for files."
             )
             outcome.tool_errors += 1
             log.warn(f"step {global_step} 未知工具 {call.tool!r}（可用 {sorted(tools)}）")

@@ -1,33 +1,36 @@
 """search：code-agent 式证据构建（编排层）。
 
-设计见 ``docs/search.md``。一句话流程：
+设计见 ``docs/core.md``。一句话流程：
 
     for 每条 QA（QA 级并发）:
-        建私有 workspace（inputs/ 硬链只读 + 空 evidence.jsonl + env）
-        agent loop（read/write/edit/bash，最多 max_steps 步）
-        → 停下 → verifier 判"够不够" → 不够就把 missing[] 喂回去再跑一轮
+        建私有 workspace（inputs/ 硬链只读 + env）
+        一个朴素的 agent loop（read/edit/bash，≤ max_steps 步）
+          —— agent 自己选策略（关键词检索 / 通篇读），自己把结论写进 evidence.jsonl
+        → agent 停下 → verifier 判"够不够" → 不够就把 missing[] 喂回去再跑一轮
         → 校验 evidence.jsonl（evidence.validate_file）+ 校验 inputs/ 未被篡改
         → 落 trajectory
 
 产物：
 
     data/search_runs/{experiment}_{ts}/{dir}/
-        inputs/{sessions,session_summaries}.jsonl   只读输入（硬链）
+        inputs/sessions/session_N.jsonl 只读输入（硬链，每会话一个文件）
         qa_{idx}/evidence.jsonl         **唯一产物**
         {dir}.qa_trajectories.jsonl     每 QA 一行（含完整步记录）
-        {dir}.steps.jsonl               每次模型调用的原始输出（排错用）
+        {dir}.model_calls.jsonl         每次模型调用的原始输出（排错用）
         summary.json
 
-**语料只有两层**（原始消息 + session summary）。曾经的顶层 speakers summary 已取消：
-它是一条没有 msg_id 可回溯的合成文本，`source` 指不到原始消息，破掉溯源不变量。
+**语料是一个 ``sessions/`` 目录**：每个会话一个 ``session_N.jsonl``，内容已**消解**成
+上下文无关的形式（时间是绝对时间或带绝对锚点的相对时间，指代已换回原始含义；原话保留在
+``source_content`` / ``source_time``）。**没有摘要层，也没有额外的索引/图层** —— 两种"浓缩
+成品"都被实测淘汰：顶层 speakers summary 诱导 agent 不检索直接凑答案（152 条 QA 里 150 条
+一次 grep 都没做）；session summary 则 119/152 条 QA 压根不读。消解后的消息本身就是导航：
+grep 一个词命中的就是能回答问题的原料，同一实体跨会话都写成同一个真名（grep 即跨会话）。
 
-**检索靠 grep**：agent 的工具箱就是 read/write/edit/bash，检索是 `grep` 一条命令。
-没有向量索引、没有 embedding 服务、没有外部检索 CLI —— 语料是 JSONL，一行一条记录，
-所以 grep 直接可用、行号稳定，可以 `grep -n` 定位再 `read offset/limit` 精读。
-这砍掉了整条链路里唯一的外部依赖。
+**检索靠 grep**：agent 的检索工具就是 `grep` 一条 bash 命令；写证据用 `edit` 的 append
+模式（**没有 write**，所以不存在"整份覆盖冲掉前面证据"这种事）。
+没有向量索引、没有 embedding 服务、没有外部检索 CLI。
 
-**为什么 QA 级并发是安全的**：旧版必须目录内串行，只因为所有 QA 共享一份可变的记忆库；
-现在 base 库只读、产物 per-QA，QA 之间零共享。
+**为什么 QA 级并发是安全的**：base 库只读、产物 per-QA，QA 之间零共享。
 
 自测：``python scripts/test_search.py``（假模型 + 真工具，纯 CPU，零模型成本）。
 """
@@ -39,6 +42,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -65,8 +69,8 @@ DATA_DIR = PROJECT_ROOT / "data"
 CONFIG_FILE = PROJECT_ROOT / "configs" / "search.yaml"
 TOOL_CONFIG_FILE = PROJECT_ROOT / "configs" / "tool.json"
 
-#: 两层语料文件名。硬链、篡改校验、来源描述都用它。
-CORPUS_FILES = ("sessions.jsonl", "session_summaries.jsonl")
+#: 语料：一个 ``sessions/`` 目录（每个会话一个 ``session_N.jsonl``，消解后上下文无关）。
+CORPUS_DIR = "sessions"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "generator": {"base_url": "http://127.0.0.1:30000/v1", "api_key": "sglang", "model": "local",
@@ -308,12 +312,15 @@ def link_dir_or_copy(source: Path, target: Path) -> str:
         pass
     target.mkdir(parents=True, exist_ok=True)
     for item in sorted(source.iterdir()):
+        destination = target / item.name
         if item.is_file():
-            destination = target / item.name
             try:
                 os.link(item, destination)
             except OSError:
                 shutil.copy2(item, destination)
+        elif item.is_dir():
+            # 递归（语料是一个 sessions/ 子目录）—— 同样优先硬链
+            link_dir_or_copy(item, destination)
     return "hardlink"
 
 
@@ -406,6 +413,23 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sha256_of_tree(root: Path) -> dict[str, str]:
+    """目录（或单文件）下每个文件的 ``{相对路径: sha256}``。
+
+    语料是一个 ``sessions/`` 目录（每个会话一个文件），所以篡改校验要按**树**算 ——
+    ``inputs/sessions/session_3.jsonl`` 这样的相对路径是键。
+    """
+    result: dict[str, str] = {}
+    if root.is_file():
+        return {root.name: sha256_of(root)}
+    if not root.is_dir():
+        return result
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and not path.is_symlink():
+            result[str(path.relative_to(root))] = sha256_of(path)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 单条 QA
 # ---------------------------------------------------------------------------
@@ -447,8 +471,8 @@ async def run_qa(
     dir_name = f"qa_{qa_index}" if repeat <= 1 else f"qa_{qa_index}_r{repeat}"
     workspace_root = run_dir / directory.name / dir_name
     evidence_path = workspace_root / "evidence.jsonl"
-    # 篡改校验覆盖**全部语料**（不只原始消息）—— 只查一个是自欺欺人
-    inputs_sha_before = {name: sha256_of(inputs_dir / name) for name in CORPUS_FILES}
+    # 篡改校验覆盖**全部语料**（sessions/ 下的每个会话文件）—— 只查一个是自欺欺人
+    inputs_sha_before = sha256_of_tree(inputs_dir)
 
     async with semaphore:
         qa_log.info(
@@ -482,108 +506,21 @@ async def run_qa(
         )
         catalog.apply(tools)
         scripted_prompt = catalog.render_prompt(question)
-
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": scripted_prompt},
-            {"role": "user", "content": catalog.prompt_text("user_begin")},
-        ]
         qa_log.debug(block("system prompt", scripted_prompt, limit=20000))
-
-        max_steps = int(config.get("max_steps", 30))
-        patience = int(config.get("no_progress_patience", 6))
-        max_verify_rounds = max(1, int(config.get("max_verify_rounds", 2)))
-        observation_max_chars = int(config.get("observation_max_chars", 8000))
-        write_nudge_after = int(config.get("write_nudge_after", 5))
-        evidence_soft_limit = int(config.get("evidence_soft_limit", 12))
-        # 轨迹里每步观测/模型输出的保留长度（0 = 全文）。见 Step.to_dict 的说明。
-        observation_chars = int(config.get("trajectory_observation_chars", 600))
-        max_parse_retries = max(0, int(config.get("max_parse_retries", 2)))
-        repeat_limit = max(0, int(config.get("repeat_limit", 1)))
-        duplicate_warn_at = max(1, int(config.get("duplicate_warn_at", 10)))
-        context_max_chars = max(0, int(config.get("context_max_chars", 0)))
-        context_keep_recent = max(2, int(config.get("context_keep_recent", 8)))
-        step_offset = 0
+        phase = PhaseOutcome()
 
         try:
-            for round_index in range(1, max_verify_rounds + 1):
-                outcome, messages = await agent_mod.run_agent_round(
-                    messages=messages,
-                    tools=tools,
-                    model_call=model,
-                    evidence_path=evidence_path,
-                    cwd=workspace_root,
-                    max_steps=max_steps,
-                    no_progress_patience=patience,
-                    step_offset=step_offset,
-                    round_index=round_index,
-                    log=qa_log,
-                    observation_max_chars=observation_max_chars,
-                    write_nudge_after=write_nudge_after,
-                    evidence_soft_limit=evidence_soft_limit,
-                    max_parse_retries=max_parse_retries,
-                    repeat_limit=repeat_limit,
-                    duplicate_warn_at=duplicate_warn_at,
-                    context_max_chars=context_max_chars,
-                    context_keep_recent=context_keep_recent,
-                )
-                step_offset += len(outcome.steps)
-                record.rounds.append({
-                    "round": round_index,
-                    "done_reason": outcome.done_reason,
-                    "summary": outcome.summary(),
-                    "tool_calls": outcome.tool_calls,
-                    "counts_by_tool": outcome.counts_by_tool(),
-                    "steps": [step.to_dict(observation_chars) for step in outcome.steps],
-                })
-
-                # ---- 校验产物 → 交给 verifier ----
-                report = evidence_mod.validate_file(evidence_path)
-                qa_log.info(
-                    f"round {round_index} 收尾：{outcome.summary()} | evidence "
-                    f"{report.summary()}"
-                )
-                qa_log.debug(block(
-                    f"qa {qa_index} round {round_index} evidence.jsonl",
-                    evidence_path.read_text(encoding="utf-8", errors="replace") if evidence_path.exists()
-                    else "(不存在)",
-                    limit=12000,
-                ))
-
-                verdict = await verifier_mod.verify(
-                    question=question,
-                    memories=report.valid,
-                    model_call=model,
-                    log=qa_log,
-                    round_index=round_index,
-                    evidence_present=(
-                        evidence_path.exists() and evidence_path.stat().st_size > 0
-                    ),
-                )
-                record.verifications.append(verdict.to_dict())
-                qa_log.info(f"round {round_index} {verdict.describe()}")
-
-                if verdict.sufficient:
-                    record.sufficient = True
-                    record.final_answer = verdict.answer
-                    record.stop_reason = "sufficient"
-                    break
-
-                record.final_answer = verdict.answer or record.final_answer
-                if round_index >= max_verify_rounds:
-                    record.stop_reason = "verify_rounds_exhausted"
-                    break
-
-                # ---- 把缺口喂回去，再跑一轮 ----
-                missing = verdict.missing or ["(the auditor gave no specific gap; re-read the question and your evidence)"]
-                messages.append({
-                    "role": "user",
-                    "content": catalog.prompt_text(
-                        "user_gaps",
-                        missing="\n".join(f"- {item}" for item in missing),
-                        attempted_answer=verdict.answer or "(no answer could be produced)",
-                    ),
-                })
-                qa_log.info(f"round {round_index} 注入 {len(missing)} 项缺口，继续 round {round_index + 1}")
+            # ---- 三阶段驱动（印象 → 逐 session → 验证），见 run_phases ----
+            phase = await run_phases(
+                question=question, inputs_dir=inputs_dir, catalog=catalog, tools=tools,
+                model=model, evidence_path=evidence_path, workspace_root=workspace_root,
+                scripted_prompt=scripted_prompt, config=config, log=qa_log,
+            )
+            record.rounds = phase.rounds
+            record.verifications = phase.verifications
+            record.sufficient = phase.sufficient
+            record.final_answer = phase.final_answer
+            record.stop_reason = phase.stop_reason
 
         except Exception as exc:  # noqa: BLE001 - 单条 QA 失败不该拖垮整个目录
             record.error = f"{type(exc).__name__}: {exc}"
@@ -626,23 +563,19 @@ async def run_qa(
         }
         record.evidence_ids = [_id_of(m) for m in report.valid]
         record.evidence_count = len(report.valid)
+        inputs_sha_after = sha256_of_tree(inputs_dir)
         record.inputs_sha256 = {
-            **{name: {"before": digest} for name, digest in inputs_sha_before.items()},
+            name: {"before": digest, "after": inputs_sha_after.get(name, "")}
+            for name, digest in inputs_sha_before.items()
         }
-        for name in CORPUS_FILES:
-            after = sha256_of(inputs_dir / name)
-            record.inputs_sha256[name]["after"] = after
-            if inputs_sha_before[name] != after:
+        for name in sorted(set(inputs_sha_before) | set(inputs_sha_after)):
+            if inputs_sha_before.get(name) != inputs_sha_after.get(name):
                 record.tampered = True
                 qa_log.error(f"inputs/{name} 被改动了！该 QA 结果作废（tampered=true）")
 
-        record.steps = step_offset
-        record.tool_calls = sum(item["tool_calls"] for item in record.rounds)
-        counts: dict[str, int] = {}
-        for item in record.rounds:
-            for name, value in item["counts_by_tool"].items():
-                counts[name] = counts.get(name, 0) + value
-        record.counts_by_tool = counts
+        record.steps = phase.steps
+        record.tool_calls = phase.tool_calls
+        record.counts_by_tool = dict(phase.counts_by_tool)
         record.duration_seconds = round(time.monotonic() - started, 2)
 
         qa_log.info(
@@ -659,6 +592,243 @@ def _id_of(memory: dict[str, Any]) -> str:
     新格式的 evidence 没有 ``metadata.id``（用 content 当标识），两处各写一份就会不一致
     （实测：这里只读 metadata.id，于是所有新格式记录的标识全是空串）。"""
     return evidence_mod._id_of(memory)
+
+
+# ---------------------------------------------------------------------------
+# 两层语料的装载（阶段驱动的输入）
+# ---------------------------------------------------------------------------
+
+#: ``session_3`` / ``session_3_14`` -> 3。解析不出返回 None。
+#: 结尾用 ``($|_)``：会话号后面可以是文件结束（整次会话块 ``session_3``）或下划线
+#: （summary / 单条消息）。早先写死 ``_`` 会让整次会话块 ``session_3`` 解析失败 ——
+#: 实测模型频繁加载它，却被当成"无法加载的 id"忽略。
+_SESSION_NUM_RE = re.compile(r"^session_(\d+)($|_)")
+
+
+def session_number(record: dict[str, Any]) -> int | None:
+    """从 ``msg_id`` 里取会话号（``session_3`` -> 3）。"""
+    match = _SESSION_NUM_RE.match(str(record.get("msg_id") or ""))
+    return int(match.group(1)) if match else None
+
+
+def iter_session_files(inputs_dir: Path) -> list[tuple[int, Path]]:
+    """``inputs/sessions/`` 下全部 ``session_N.jsonl``，按会话号排序。
+
+    会话清单从**文件**推（每个会话一个文件），不从内容推 —— 文件就是会话的真相。
+    """
+    base = inputs_dir / CORPUS_DIR
+    if not base.is_dir():
+        return []
+    found: list[tuple[int, Path]] = []
+    for path in base.glob("session_*.jsonl"):
+        match = re.match(r"^session_(\d+)$", path.stem)
+        if match:
+            found.append((int(match.group(1)), path))
+    return sorted(found, key=lambda pair: pair[0])
+
+
+def load_session_roster(inputs_dir: Path) -> dict[int, str]:
+    """返回 ``{会话号: 该会话第一条消息的时间}``（按会话号排序）。
+
+    时间取第一条记录的 ``source_time``（原始会话时间戳）优先 —— 那是会话发生的真实时间；
+    其次 ``time``（消解后的表述，也可能是锚点日期）。
+    """
+    result: dict[int, str] = {}
+    for number, path in iter_session_files(inputs_dir):
+        records = read_jsonl(path)
+        if not records:
+            continue
+        first = records[0]
+        result[number] = str(first.get("source_time") or first.get("time") or "")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 检索辅助：会话清单（给 agent 一个"从哪找起"的起点，不是答案）
+# ---------------------------------------------------------------------------
+#
+# **不提供任何分层概览/印象**：实测顶层 speakers summary 是反效果 —— 它是一条浓缩成品，
+# agent 看一眼就凑一条答案、还配个假的 source，152 条 QA 里 150 条**一次 grep 都没做**。
+# 这里只给一份**会话号清单**（`session_N` 及其时间），agent 拿它决定去 grep 什么词、
+# 或整会话读哪几次 —— 定位是它的活，不是我们的。
+
+def render_session_index(roster: dict[int, str]) -> str:
+    """渲染一份轻量的会话清单：每行 ``session_N (时间)``。**不含任何事实内容**。
+
+    它只回答"这段对话被切成了哪几次会话、各在什么时候"，让 agent 知道
+    `session_1..session_N` 都存在、可以 `read` 或 `grep`。故意不写每会话讲了什么 ——
+    那正是旧 speakers summary 干的事，而它诱导了"不检索直接答"。
+    """
+    if not roster:
+        return "(no sessions found -- check inputs/sessions/)"
+    lines = ["The conversation is split into these sessions (each is a file):"]
+    for number in sorted(roster):
+        when = roster[number]
+        lines.append(f"  session_{number}" + (f"  ({when})" if when else ""))
+    return "\n".join(lines)
+
+
+@dataclass
+class PhaseOutcome:
+    """``run_phases`` 的产出：跑完一条 QA 的全部结论。"""
+
+    stop_reason: str = ""
+    sufficient: bool = False
+    final_answer: str = ""
+    verifications: list[dict[str, Any]] = field(default_factory=list)
+    rounds: list[dict[str, Any]] = field(default_factory=list)
+    steps: int = 0
+    tool_calls: int = 0
+    counts_by_tool: dict[str, int] = field(default_factory=dict)
+
+
+async def run_phases(
+    *,
+    question: str,
+    inputs_dir: Path,
+    catalog: toolcfg.ToolCatalog,
+    tools: dict[str, Any],
+    model: ModelRunner,
+    evidence_path: Path,
+    workspace_root: Path,
+    scripted_prompt: str,
+    config: dict[str, Any],
+    log: Logger,
+) -> PhaseOutcome:
+    """一条 QA 的完整检索：**一个朴素的 agent loop**，跑完再由 verifier 判一次。
+
+    这是 search 的核心流程，被 ``run_qa``（离线）与 ``api.retriever``（在线）共用。
+
+    **它就是一个 loop，没有阶段、没有上下文块控制工具。** agent 拿到一份会话清单 +
+    `grep`/`read`/`edit` 三个工具，自己决定"这个问题该关键词检索还是通篇读"（引导写在
+    system prompt 里，策略由它自己选）。它读到的内容进上下文，读多了由 agent loop 自带的
+    压缩机制丢中段；它的"记笔记"就是把结论写进 ``evidence.jsonl`` —— 读过的原文丢了没关系，
+    写下的证据留住了。这最接近人的做法，也最不依赖我们预先设计的流程。
+
+    **verifier 在最后判一次**：独立 auditor 只看 ``(question, evidence)``，判"能否回答"；
+    不足则把 ``missing[]`` 作为新一轮 user 消息喂回去再跑（≤ ``max_verify_rounds``）。
+    """
+    roster = load_session_roster(inputs_dir)
+    session_index = render_session_index(roster)
+
+    max_steps = int(config.get("max_steps", 30))
+    patience = int(config.get("no_progress_patience", 6))
+    max_verify_rounds = max(1, int(config.get("max_verify_rounds", 2)))
+    observation_max_chars = int(config.get("observation_max_chars", 8000))
+    write_nudge_after = int(config.get("write_nudge_after", 5))
+    evidence_soft_limit = int(config.get("evidence_soft_limit", 12))
+    observation_chars = int(config.get("trajectory_observation_chars", 600))
+    max_parse_retries = max(0, int(config.get("max_parse_retries", 2)))
+    repeat_limit = max(0, int(config.get("repeat_limit", 1)))
+    duplicate_warn_at = max(1, int(config.get("duplicate_warn_at", 10)))
+    context_max_chars = int(config.get("context_max_chars", 0))
+    context_keep_recent = max(2, int(config.get("context_keep_recent", 8)))
+
+    outcome = PhaseOutcome()
+    step_offset = 0
+
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": scripted_prompt},
+        {"role": "user", "content": catalog.prompt_text(
+            "user_begin", sessions=session_index,
+        )},
+    ]
+
+    async def run_round(round_index: int) -> "agent_mod.AgentOutcome":
+        """跑一轮 agent loop（从当前 messages 出发）。"""
+        nonlocal step_offset, messages
+        remaining = max_steps - step_offset
+        if remaining <= 0:
+            return agent_mod.AgentOutcome(done_reason="steps_exhausted",
+                                          messages=messages)
+        result, messages = await agent_mod.run_agent_round(
+            messages=messages,
+            tools=tools,
+            model_call=model,
+            evidence_path=evidence_path,
+            cwd=workspace_root,
+            max_steps=remaining,
+            no_progress_patience=patience,
+            step_offset=step_offset,
+            round_index=round_index,
+            log=log,
+            observation_max_chars=observation_max_chars,
+            write_nudge_after=write_nudge_after,
+            evidence_soft_limit=evidence_soft_limit,
+            max_parse_retries=max_parse_retries,
+            repeat_limit=repeat_limit,
+            duplicate_warn_at=duplicate_warn_at,
+            context_max_chars=context_max_chars,
+            context_keep_recent=context_keep_recent,
+        )
+        step_offset += len(result.steps)
+        outcome.steps += len(result.steps)
+        outcome.tool_calls += result.tool_calls
+        for name, value in result.counts_by_tool().items():
+            outcome.counts_by_tool[name] = outcome.counts_by_tool.get(name, 0) + value
+        outcome.rounds.append({
+            "round": round_index,
+            "done_reason": result.done_reason,
+            "summary": result.summary(),
+            "tool_calls": result.tool_calls,
+            "counts_by_tool": result.counts_by_tool(),
+            "steps": [step.to_dict(observation_chars) for step in result.steps],
+        })
+        return result
+
+    for verify_round in range(1, max_verify_rounds + 1):
+        result = await run_round(verify_round)
+        if result.done_reason == "steps_exhausted":
+            outcome.stop_reason = "steps_exhausted"
+            break
+
+        report = evidence_mod.validate_file(evidence_path)
+        log.info(f"round {verify_round}：{result.summary()} | evidence {report.summary()}")
+        log.debug(block(
+            f"round {verify_round} evidence.jsonl",
+            evidence_path.read_text(encoding="utf-8", errors="replace")
+            if evidence_path.exists() else "(不存在)",
+            limit=12000,
+        ))
+        verdict = await verifier_mod.verify(
+            question=question,
+            memories=report.valid,
+            model_call=model,
+            log=log,
+            round_index=verify_round,
+            evidence_present=(evidence_path.exists() and evidence_path.stat().st_size > 0),
+        )
+        outcome.verifications.append(verdict.to_dict())
+        log.info(f"round {verify_round} {verdict.describe()}")
+
+        if verdict.sufficient:
+            outcome.sufficient = True
+            outcome.final_answer = verdict.answer
+            # **无条件**覆盖：前面几轮可能已把 stop_reason 标成 verify_rounds_exhausted，
+            # 用 `or` 会盖不掉这一轮的"够了"（实测就是这个 bug）。
+            outcome.stop_reason = "sufficient"
+            break
+        outcome.final_answer = verdict.answer or outcome.final_answer
+        outcome.stop_reason = outcome.stop_reason or "verify_rounds_exhausted"
+        if verify_round >= max_verify_rounds or step_offset >= max_steps:
+            break
+
+        missing = verdict.missing or [
+            "(the auditor gave no specific gap; re-read the question and your evidence)"
+        ]
+        log.info(f"round {verify_round} 注入 {len(missing)} 项缺口，补一轮")
+        messages = messages + [{
+            "role": "user",
+            "content": catalog.prompt_text(
+                "user_gaps",
+                missing="\n".join(f"- {item}" for item in missing),
+                attempted_answer=verdict.answer or "(no answer could be produced)",
+            ),
+        }]
+
+    return outcome
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -797,20 +967,11 @@ async def run_dir(
 
     label = directory.name
     log = log.bind(label)
-    # 需要的输入：原始消息 + session summary。缺 summary 时**只警告不跳过** ——
-    # 原始消息本身是可检索的，退化成"没有概览"总比整个目录跑不了好。
-    sessions_path = directory / "sessions.jsonl"
-    if not sessions_path.exists():
-        log.warn("跳过：缺少 sessions.jsonl（先跑 `python -m codemem.add --stage session`）")
-        return {"dir": label, "status": "SKIPPED", "reason": "missing sessions.jsonl"}
-    missing_summaries = [
-        name for name in ("session_summaries.jsonl",) if not (directory / name).exists()
-    ]
-    if missing_summaries:
-        log.warn(
-            f"缺少 {missing_summaries}：检索将只有原始消息，没有概览层"
-            f"（建议先跑 `python -m codemem.add --stage summary`）"
-        )
+    # 需要的输入：``sessions/`` 目录（每个会话一个文件，消解后上下文无关的语料）。
+    if not iter_session_files(directory):
+        log.warn(f"跳过：缺少 {CORPUS_DIR}/session_*.jsonl"
+                 f"（先跑 `python -m codemem.add --stage session`）")
+        return {"dir": label, "status": "SKIPPED", "reason": f"missing {CORPUS_DIR}/"}
 
     out_dir = run_dir / label
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -964,13 +1125,13 @@ async def build_inputs(
     """
     inputs_dir = run_dir / directory.name / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
-    # 两层语料：
-    #   session_summaries    每次会话一份（粗筛：定位到哪次会话）
-    #   sessions             原始消息（精确措辞、时间锚点）
-    for name in CORPUS_FILES:
-        source = directory / name
-        if source.exists():
-            link_or_copy(source, inputs_dir / name)
+    # 语料：``sessions/`` 目录（每个会话一个 ``session_N.jsonl``，消解后上下文无关）。
+    # 硬链**每个文件**（而不是整目录软链）：语料本身就是一个目录，agent 要 `grep -rin
+    # inputs/sessions/` 递归检索、也要 `read inputs/sessions/session_5.jsonl` 精读。
+    target_dir = inputs_dir / CORPUS_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for _, path in iter_session_files(directory):
+        link_or_copy(path, target_dir / path.name)
     return inputs_dir
 
 
@@ -1090,7 +1251,7 @@ def resolve_dirs(config: dict[str, Any], args: argparse.Namespace) -> list[Path]
         return [DATA_DIR / args.sample]
     return sorted(
         path for path in DATA_DIR.iterdir()
-        if path.is_dir() and (path / "sessions.jsonl").exists()
+        if path.is_dir() and (path / CORPUS_DIR).is_dir()
     )
 
 
@@ -1142,11 +1303,11 @@ async def async_main(args: argparse.Namespace) -> None:
         return
 
     catalog = toolcfg.load_catalog(args.tool_config)
-    catalog.validate(["read", "write", "edit", "bash"])
+    catalog.validate(["read", "edit", "bash"])
 
     directories = resolve_dirs(config, args)
     if not directories:
-        log.error("没有找到任何含 sessions.jsonl 的目录"
+        log.error(f"没有找到任何含 {CORPUS_DIR}/ 的目录"
                   "（先跑 `python -m codemem.add --stage session`）")
         return
 

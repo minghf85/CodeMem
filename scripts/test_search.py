@@ -80,38 +80,53 @@ def test_toolcfg(tmp: Path) -> None:
     section("1. toolcfg：加载 / 校验 / 渲染 / 解析")
     catalog = toolcfg.load_catalog(PROJECT_ROOT / "configs/tool.json")
     check("catalog 加载成功", bool(catalog.tools), str(catalog.tools))
-    check("四个工具都有描述", set(catalog.tools) == {"read", "write", "edit", "bash"})
-    check("命令含 grep / date（检索与算术都走 bash 原生工具）",
+    check("执行层的三个工具都有描述（无控制工具）",
+          set(catalog.tools) == {"read", "edit", "bash"},
+          str(set(catalog.tools)))
+    check("命令含 grep / time（检索与算术都走 bash 原生工具）",
           set(catalog.commands) == {"grep", "time"}, str(set(catalog.commands)))
-    catalog.validate(["read", "write", "edit", "bash"])
+    catalog.validate(["read", "edit", "bash"])
     try:
-        catalog.validate(["read", "write", "edit", "bash", "nope"])
+        catalog.validate(["read", "edit", "bash", "nope"])
         check("校验能发现缺描述的工具", False, "没有报错")
     except toolcfg.ToolConfigError:
         check("校验能发现缺描述的工具", True)
 
     rendered = catalog.render_prompt("Who is Caroline?")
     for slot in ("{{TOOLS}}", "{{COMMANDS}}", "{{WORKSPACE}}", "{{SCHEMA}}", "{{PROTOCOL}}",
-                 "{{WRITING_POLICY}}", "{{TIME_POLICY}}", "{{QUESTION}}"):
+                 "{{WRITING_POLICY}}", "{{TIME_POLICY}}", "{{EVIDENCE_STANDARD}}",
+                 "{{STRATEGY}}", "{{QUESTION}}"):
         check(f"渲染后没有残留 {slot}", slot not in rendered)
     check("渲染含问题原文", "Who is Caroline?" in rendered)
     # 检索就是 grep：语料是 JSONL，行号稳定，可以 grep -n 再 read offset
-    check("渲染含 grep 用法", "grep -in" in rendered)
-    check("渲染给出 grep -n 定位 + read 精读的组合", "offset=" in rendered and "read inputs/sessions.jsonl" in rendered)
+    check("渲染含 grep 用法", "grep -rin" in rendered)
+    check("渲染给出递归 grep + read 精读的组合", "inputs/sessions/" in rendered and "read inputs/sessions/session_" in rendered)
     check("渲染含 date -d 做时间算术", "date -d" in rendered)
     check("不再有已删除的检索 CLI", "search \"" not in rendered and "timecalc" not in rendered)
     check("不再有 jq", "jq " not in rendered)
     check("渲染含 schema 字段", "metadata.source" in rendered)
     check("渲染含 source 非空规则", "NON-EMPTY" in rendered)
-    # 按问题类型选策略
-    check("渲染给出策略 A（关键词多跳）", "KEYWORD HOP" in rendered)
-    check("渲染给出策略 B（遍历多会话）", "SWEEP" in rendered)
-    check("渲染说明集合型问题走遍历", "the answer is a SET" in rendered)
-    check("渲染给出两种策略的判据", "PICK YOUR STRATEGY" in rendered)
+    # 核心引导：两种检索策略（keyword 直达 / 通读相关 session），agent 运行中自助切换
+    check("渲染给出 keyword 检索策略", "Strategy 1" in rendered or "keyword lookup" in rendered)
+    check("渲染给出通读相关 session 的策略", "Strategy 2" in rendered or "read through related sessions" in rendered)
+    check("渲染说明两种策略可自由混用、不必一开始选定",
+          "mix them freely" in rendered or "switch" in rendered)
+    check("渲染给出 keyword 检索的判据（可直接 grep 出词）", "names something concrete" in rendered)
+    check("渲染给出通读的判据（集合/散布型）", "SET" in rendered and "spread" in rendered.lower())
+    check("渲染提醒不要猜、要真读到", "never from what you assume" in rendered
+          or "do not write the record" in rendered)
+    # write 工具已删：不该再出现"用 write 覆盖"
+    check("不再有 write 工具的用法", '"tool":"write"' not in rendered and "Use `write`" not in rendered)
+    check("edit 的 append 模式被说明", "append" in rendered.lower())
     # 核心：证据是**推导**出来的，不是抄的
     check("渲染含'推导而非抄袭'策略", "REASON, do not just copy" in rendered)
     check("策略提到事件/性格推理", "joined into the one" in rendered and "summarised" in rendered)
-    check("策略要求消解上下文", "RESOLVE THE CONTEXT" in rendered)
+    check("策略要求消解上下文（指代）", "REFERENTS RESOLVED" in rendered)
+    # 证据标准：一份可核对的清单（时间锚点 / 自足 / 不编造精度）
+    check("证据标准：自足", "SELF-CONTAINED" in rendered)
+    check("证据标准：时间必须带锚点", "TIME ANCHORED" in rendered)
+    check("证据标准：不编造精度", "NO INVENTED PRECISION" in rendered)
+    check("证据标准：source 必须真实", "SOURCED" in rendered)
     check("schema 说明可以改写 content", "Rewrite freely" in rendered)
     check("schema 要求 source 非空", "NON-EMPTY array of msg_ids" in rendered)
     # 输出 schema 的字段顺序：自回归模型按顺序生成，reasoning 在前 = 先推理再作答。
@@ -157,21 +172,28 @@ def test_toolcfg(tmp: Path) -> None:
     check("时间策略：按源语料的单位作答", "answer in that unit" in rendered)
     check("时间策略：保留锚点表述", "the week before 9 June 2023" in rendered)
     check("时间策略：区间是合法答案", "A period is a valid answer" in rendered)
-    check("时间策略：记录必须自带锚点", "stands ALONE" in rendered or "stand ALONE" in rendered)
+    check("时间策略：记录必须自带锚点", "stands ALONE" in rendered or "stand ALONE" in rendered
+          or "TIME ANCHORED" in rendered)
     check("时间策略：原文表述要照录", "restate the source" in rendered.lower()
           or "verbatim" in rendered.lower())
     # 这一版最要紧的一条：会话日期 ≠ 事件日期
-    check("时间策略：会话日期不是事件日期", "when it was SAID" in rendered)
+    check("时间策略：会话日期不是事件日期", "WHEN IT WAS SAID" in rendered)
     check("时间策略：给出具体反例（9 June）", "9 June 2023" in rendered and "week before" in rendered)
     check("时间策略：禁止无锚点的相对词", "unanchored" in rendered.lower())
-    check("有 worked example（关键词多跳）", "WORKED EXAMPLE (strategy A: keyword hop)" in rendered)
+    check("有 worked example（关键词检索）", "WORKED EXAMPLE (keyword search" in rendered)
     check("有 worked example（相对时间）", "date -d \"8 May 2023 -1 day\"" in rendered)
-    check("有 worked example（遍历）", "WORKED EXAMPLE (strategy B: sweep)" in rendered)
-    # 语料只剩两层：不能再出现已删除的 speakers summary
-    check("提示里不再有 speakers summary", "speakers_summary" not in rendered)
+    check("有 worked example（keyword 检索）", "WORKED EXAMPLE (keyword search" in rendered)
+    check("有 worked example（通读相关 session，集合型）", "WORKED EXAMPLE (Strategy 2" in rendered)
+    # 语料是消解后的会话目录：没有顶层印象/概览层（实测它诱导不检索直接答）
+    check("提示里没有顶层印象 speakers summary", "speakers_summary" not in rendered)
     check("提示里不再有 atommem/msgmem", "atommem" not in rendered and "msgmem" not in rendered)
-    # 上下文预算：prompt 每条 QA 都整体注入一次，涨回去就等于白做这次简化
-    check("system prompt 控制在 15000 字符内", len(rendered) < 15000, str(len(rendered)))
+    check("提示里没有 session summary 层", "session_summaries" not in rendered
+          and "session_N_summary" not in rendered)
+    check("提示暴露消解后的会话目录", "inputs/sessions/" in rendered)
+    check("提示不再提 index/nodes/edges/graph", "index.jsonl" not in rendered
+          and "nodes.jsonl" not in rendered and "edges.jsonl" not in rendered)
+    # 上下文预算：system prompt 每个 round 都整体注入一次，涨回去就等于白做这次简化
+    check("system prompt 控制在 18000 字符内", len(rendered) < 18000, str(len(rendered)))
 
     # 响应解析
     check("解析裸 JSON", (toolcfg.parse_tool_call('{"tool":"bash","args":{"command":"ls"}}') or
@@ -209,19 +231,43 @@ async def test_tools(tmp: Path) -> None:
     ws = tmp / "ws"
     ws.mkdir(parents=True, exist_ok=True)
     built = tools_mod.build_tools(cwd=ws, bash_timeout=20)
-    check("工具名齐全", set(built) == {"read", "write", "edit", "bash"})
+    check("工具名齐全（write 已删）", set(built) == {"read", "edit", "bash"})
 
-    # write / read
-    result = await built["write"].run({"path": "a.txt", "content": "hello\nworld\n"})
-    check("write 成功", result.ok and (ws / "a.txt").read_text() == "hello\nworld\n",
-          result.text)
-    result = await built["write"].run({"path": "nested/deep/b.txt", "content": "x"})
-    check("write 自动建父目录", (ws / "nested/deep/b.txt").exists())
+    # edit append 模式：建文件 + 追加
+    result = await built["edit"].run({"path": "n.txt", "append": "first\n"})
+    check("append 在文件不存在时创建它", (ws / "n.txt").read_text() == "first\n", result.text)
+    # 缺 path 时默认 evidence.jsonl（8B 实测常忘填 path，旧行为是把整条调用重复十几次）
+    result = await built["edit"].run({"append": "no path record\n"})
+    check("append 缺 path 时默认 evidence.jsonl",
+          result.ok and (ws / "evidence.jsonl").read_text() == "no path record\n", result.text)
+    result = await built["edit"].run({"path": "n.txt", "append": "second\n"})
+    check("append 追加到末尾", (ws / "n.txt").read_text() == "first\nsecond\n", result.text)
+    check("append 观测说明了行数变化", "->" in result.text or "Appended" in result.text, result.text)
+    try:
+        await built["edit"].run({"path": "n.txt", "append": ""})
+        check("空 append 被拒", False)
+    except tools_mod.ToolError:
+        check("空 append 被拒", True)
+    try:
+        await built["edit"].run({"path": "n.txt", "append": "second"})
+        check("重复 append 最后一行被拒", False)
+    except tools_mod.ToolError:
+        check("重复 append 最后一行被拒", True)
+    result = await built["edit"].run({"path": "nested/deep/c.txt", "append": "x"})
+    check("append 自动建父目录", (ws / "nested/deep/c.txt").exists())
+    # replace 模式在文件不存在时给出"用 append 建"的提示
+    try:
+        await built["edit"].run(
+            {"path": "nope.txt", "edits": [{"oldText": "a", "newText": "b"}]}
+        )
+        check("replace 对不存在的文件报错并提示 append", False)
+    except tools_mod.ToolError as exc:
+        check("replace 对不存在的文件报错并提示 append", "append" in str(exc), str(exc))
 
-    result = await built["read"].run({"path": "a.txt"})
-    check("read 全文", result.ok and "hello" in result.text and "world" in result.text)
-    result = await built["read"].run({"path": "a.txt", "offset": 2, "limit": 1})
-    check("read offset/limit", result.ok and result.text.startswith("world"), repr(result.text))
+    result = await built["read"].run({"path": "n.txt"})
+    check("read 全文", result.ok and "first" in result.text and "second" in result.text)
+    result = await built["read"].run({"path": "n.txt", "offset": 2, "limit": 1})
+    check("read offset/limit", result.ok and result.text.startswith("second"), repr(result.text))
     try:
         await built["read"].run({"path": "missing.txt"})
         check("read 缺文件报错", False)
@@ -233,18 +279,18 @@ async def test_tools(tmp: Path) -> None:
     except tools_mod.ToolError:
         check("read 目录报错", True)
     try:
-        await built["read"].run({"path": "a.txt", "offset": 99})
+        await built["read"].run({"path": "n.txt", "offset": 99})
         check("read offset 越界报错", False)
     except tools_mod.ToolError:
         check("read offset 越界报错", True)
 
-    # edit
+    # edit replace
     result = await built["edit"].run(
-        {"path": "a.txt", "edits": [{"oldText": "world", "newText": "there"}]}
+        {"path": "n.txt", "edits": [{"oldText": "second", "newText": "there"}]}
     )
-    check("edit 成功", result.ok and "there" in (ws / "a.txt").read_text())
+    check("edit 成功", result.ok and "there" in (ws / "n.txt").read_text())
     try:
-        await built["edit"].run({"path": "a.txt", "edits": [{"oldText": "zzz", "newText": "y"}]})
+        await built["edit"].run({"path": "n.txt", "edits": [{"oldText": "zzz", "newText": "y"}]})
         check("edit oldText 找不到报错", False)
     except tools_mod.ToolError:
         check("edit oldText 找不到报错", True)
@@ -256,24 +302,25 @@ async def test_tools(tmp: Path) -> None:
         check("edit oldText 不唯一报错", True)
     check("edit 失败后文件未变", (ws / "dup.txt").read_text() == "same same\n")
     try:
-        await built["edit"].run({"path": "a.txt", "edits": [{"oldText": "there", "newText": "there"}]})
+        await built["edit"].run({"path": "n.txt", "edits": [{"oldText": "there", "newText": "there"}]})
         check("edit 无变化报错", False)
     except tools_mod.ToolError:
         check("edit 无变化报错", True)
 
     # 路径约束：写到工作目录之外必须被拒
-    for name in ("write", "edit"):
+    for args in ({"path": "../escape.txt", "append": "x"},
+                 {"path": "../escape.txt", "edits": [{"oldText": "a", "newText": "b"}]}):
         try:
-            await built[name].run({"path": "../escape.txt", "content": "x"})
-            check(f"{name} 拒绝工作目录外的路径", False)
+            await built["edit"].run(args)
+            check(f"edit 拒绝工作目录外的路径（{list(args)[1]}）", False)
         except tools_mod.ToolError:
-            check(f"{name} 拒绝工作目录外的路径", True)
+            check(f"edit 拒绝工作目录外的路径（{list(args)[1]}）", True)
     check("没有写出 escape.txt", not (tmp / "escape.txt").exists())
     try:
-        await built["write"].run({"path": "/tmp/codemem-should-not-exist.txt", "content": "x"})
-        check("write 拒绝绝对路径逃逸", not Path("/tmp/codemem-should-not-exist.txt").exists())
+        await built["edit"].run({"path": "/tmp/codemem-should-not-exist.txt", "append": "x"})
+        check("edit 拒绝绝对路径逃逸", not Path("/tmp/codemem-should-not-exist.txt").exists())
     except tools_mod.ToolError:
-        check("write 拒绝绝对路径逃逸", True)
+        check("edit 拒绝绝对路径逃逸", True)
 
     # 软链逃逸：qa/inputs -> 只读目录，写它应被拒
     if not SYMLINKS:
@@ -284,10 +331,10 @@ async def test_tools(tmp: Path) -> None:
         (outside / "lib.jsonl").write_text("{}\n")
         (ws / "link").symlink_to(outside)
         try:
-            await built["write"].run({"path": "link/lib.jsonl", "content": "hacked"})
-            check("write 拒绝软链逃逸", (outside / "lib.jsonl").read_text() == "{}\n")
+            await built["edit"].run({"path": "link/lib.jsonl", "append": "hacked"})
+            check("edit 拒绝软链逃逸", (outside / "lib.jsonl").read_text() == "{}\n")
         except tools_mod.ToolError:
-            check("write 拒绝软链逃逸", True)
+            check("edit 拒绝软链逃逸", True)
 
     # bash
     result = await built["bash"].run({"command": "echo hi", "description": "Testing"})
@@ -322,6 +369,22 @@ async def test_tools(tmp: Path) -> None:
     )
     check("语料目录经环境变量传进子进程", ws.as_posix() in result.text.replace("\\", "/"), result.text)
 
+    # 回归：grep 用了 `|` 却没加 -E —— 基本正则里 `|` 是字面竖线，永远匹配不到东西。
+    # 实测 95 次带 | 的 grep 有 63 次没 -E，直接造成若干零证据 QA。harness 必须替它补上。
+    (ws / "alt.jsonl").write_text(
+        '{}\n{"msg_id":"session_1_1","content":"I want to study counseling"}\n')
+    from codemem.search.tools import _fix_grep_alternation as _fixg
+    check("harness 给缺 -E 的 alternation 补上",
+          _fixg('grep -in "study|learn" f') == 'grep -inE "study|learn" f',
+          _fixg('grep -in "study|learn" f'))
+    check("harness 不动没有 | 的 grep", _fixg('grep -in "husband" f') == 'grep -in "husband" f')
+    check("harness 不动已有 -E 的 grep", _fixg('grep -Ein "a|b" f') == 'grep -Ein "a|b" f')
+    result = await probe["bash"].run(
+        {"command": 'grep -in "study|nope" alt.jsonl', "description": "alternation without -E"})
+    check("缺 -E 的 alternation 被兜住后真的能搜到",
+          "study counseling" in result.text, result.text[:200])
+    check("并在观测里说明了修正", "lacked `-E`" in result.text, result.text[:300])
+
     # 回归：date 的输出必须与 locale 无关。中文环境下 `date +%b` 会给「5月」，写进 evidence
     # 就是一条下游读不了的记录 —— 所以 harness 注入 LC_ALL=C。
     result = await probe["bash"].run({
@@ -336,8 +399,8 @@ async def test_tools(tmp: Path) -> None:
 
     notice = agent_mod.grep_no_match_notice()
     check("grep 提示说明退出码 1 = 无匹配而非崩溃", "not a failure" in notice, notice[:200])
-    check("grep 提示给出下一步（换文件/换词）", "other file" in notice, notice[:250])
-    check("grep 提示给出查看真实内容的命令", "grep -c ." in notice, notice[:300])
+    check("grep 提示给出下一步（换词/换 session）", "other word" in notice or "session file" in notice, notice[:250])
+    check("grep 提示给出查看真实内容的命令", "grep -rc ." in notice, notice[:300])
 
     call = ToolCall(tool="bash", args={"command": "sed -n '1p' f.jsonl"})
     empty = agent_mod.no_output_notice(call)
@@ -345,38 +408,30 @@ async def test_tools(tmp: Path) -> None:
 
     # --- 重复拒绝消息要给出脱困方向 ---
     repeat = agent_mod.repeat_notice(ToolCall(tool="bash", args={"command": "x"}), 2)
-    check("重复拒绝消息提到真实语料文件", "inputs/sessions.jsonl" in repeat)
-    check("重复拒绝消息提示多跳检索", "hop" in repeat.lower())
-    check("重复拒绝消息给出集合型问题的出路（遍历）", "SET" in repeat)
+    check("重复拒绝消息提到真实语料文件", "inputs/sessions/" in repeat)
+    check("重复拒绝消息给出继续检索的方向", "grep" in repeat.lower())
+    check("重复拒绝消息给出集合型问题的出路", "SET" in repeat)
     # 已删除的语料名不该再出现在给模型的文案里（会诱使它去搜不存在的文件）
-    for stale in ("atommem", "msgmem", "speakers_summary", "timecalc", "jq"):
+    for stale in ("atommem", "msgmem", "timecalc", "jq"):
         check(f"重复拒绝消息不含已删除的 {stale}", stale not in repeat)
         check(f"grep 提示不含已删除的 {stale}", stale not in notice)
 
 
-    # --- 文件完整性：原子写 + 截断保护 ---
-    protected = tools_mod.build_tools(cwd=ws, protect_filenames=("evidence.jsonl",))
-    await protected["write"].run({"path": "evidence.jsonl", "content": "X" * 500 + "\n"})
-    check("write 到受保护文件成功", (ws / "evidence.jsonl").stat().st_size > 500)
-    # 空内容重写受保护文件必须被拒（截断的典型表现），否则会静默销毁已有证据
-    try:
-        await protected["write"].run({"path": "evidence.jsonl", "content": ""})
-        check("拒绝用空内容覆盖 evidence.jsonl", False)
-    except tools_mod.ToolError as exc:
-        check("拒绝用空内容覆盖 evidence.jsonl", "refusing" in str(exc), str(exc))
-    check("被拒后文件内容完好",
-          "X" * 500 in (ws / "evidence.jsonl").read_text())
-    # 大幅缩短时给警告（不拒绝）
-    result = await protected["write"].run({"path": "evidence.jsonl", "content": "small\n"})
-    check("大幅缩短时给出截断警告", "shrank" in result.text, result.text)
-    check("缩短被记为 shrank", result.details.get("shrank") is True)
-    check("写操作标记为原子", result.details.get("atomic") is True)
+    # 原子写不留下临时文件（用一个干净目录，免受前面测试的干扰）
+    fresh = tmp / "atomic_ws"
+    fresh.mkdir(exist_ok=True)
+    protected = tools_mod.build_tools(cwd=fresh)
+    (fresh / "evidence.jsonl").unlink(missing_ok=True)
+    await protected["edit"].run({"path": "evidence.jsonl", "append": "X" * 500 + "\n"})
+    check("edit append 到 evidence.jsonl 成功", (fresh / "evidence.jsonl").stat().st_size > 500)
+    await protected["edit"].run({"path": "evidence.jsonl", "append": "second record\n"})
+    check("追加后两条都在",
+          (fresh / "evidence.jsonl").read_text().count("\n") == 2)
     # 原子写不留下临时文件
-    leftovers = [p.name for p in ws.iterdir() if ".evidence.jsonl." in p.name]
+    leftovers = [p.name for p in fresh.iterdir() if ".evidence.jsonl." in p.name]
     check("原子写不留临时文件", not leftovers, str(leftovers))
-    # 不受保护的文件可以用空内容（比如清空草稿）
-    result = await protected["write"].run({"path": "scratch.txt", "content": ""})
-    check("非受保护文件可用空内容", result.ok)
+    # 事件保护：evidence.jsonl 只能追加/替换，**没有**整份覆盖入口（write 已删）
+    check("没有 write 工具（无法整份覆盖）", "write" not in protected)
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +692,7 @@ async def test_agent(tmp: Path) -> None:
     ws.mkdir(parents=True, exist_ok=True)
     # 用**紧凑** JSON 写 fixture：`jq -c` 会重新压掉空格，紧凑形态下 jq 的输出与它逐字节相同，
     # 于是"文件增长了多少"这类断言可以精确比较。
-    # 语料是两层：summary（粗筛）+ 原始消息。这里用 summary 形态的 fixture。
+    # 语料是两层：索引 + 原始消息。这里的 fixture 只是任意一条输入记录（用来测进展追踪）。
     one_record = json.dumps(
         {"msg_id": "session_1_summary", "role": "summary", "time": "1:56 pm on 8 May, 2023",
          "content": "Caroline joined a group."}, separators=(",", ":")
@@ -701,12 +756,13 @@ async def test_agent(tmp: Path) -> None:
     repeated = [s for s in outcome.steps if s.repeat_rejected]
     check("重复调用被拒（第二次）", len(repeated) == 1, str(len(repeated)))
     check("重复计数被记账", outcome.repeated_calls == 1, str(outcome.repeated_calls))
-    # 第一次执行了、第二次被拒 → 文件只增长一次（而不是两次）
-    # 注意比的是 len(one_record) + 1：文本模式的 write_text 会把 "\n" 写成 CRLF（+1 字节），
-    # 而 jq 追加的是 LF。用 `baseline + len(one_record) + 1` 才对得上（实测 118 -> 236）。
+    # 第一次执行了、第二次被拒 → 文件只增长一次（而不是两次）。
+    # 增长量 = 恰好一条记录（jq 追加的是它自己的 LF 输出）。**不要 +1** —— 那是在 Windows
+    # 上按 write_text 的 CRLF 换行猜的，在 Linux 上会让这条断言恒假（本测试曾在 Linux 上
+    # 长期"失败"却没人发现，因为它被当成环境差异）。
     check("重复被拒时文件只增长一次",
-          evidence_path.stat().st_size == baseline + len(one_record) + 1,
-          f"{baseline} -> {evidence_path.stat().st_size}，期望 +{len(one_record) + 1}")
+          evidence_path.stat().st_size - baseline == len(one_record.encode()),
+          f"{baseline} -> {evidence_path.stat().st_size}，期望 +{len(one_record.encode())}")
     check("拒绝消息教它做别的事", any("already ran this exact" in m["content"]
                                     for m in messages if m["role"] == "user"))
     check("重复拒绝不产生新增唯一 id",
@@ -770,11 +826,9 @@ async def test_agent(tmp: Path) -> None:
     if evidence_path.exists():
         evidence_path.unlink()
     evidence_path.write_text(one_record)
-    rewrite = json.dumps({"tool": "write", "args": {
+    rewrite = json.dumps({"tool": "edit", "args": {
         "path": "evidence.jsonl",
-        "content": json.dumps(
-            [{"msg_id": "session_1_summary", "role": "summary", "time": "",
-              "content": "rewritten body"}], separators=(",", ":")) + "\n"}})
+        "edits": [{"oldText": "Caroline joined a group.", "newText": "rewritten body"}]}})
     dedupe = json.dumps({"tool": "bash", "args": {
         "command": "jq -sc 'unique_by(.msg_id)[]' evidence.jsonl > t && mv t evidence.jsonl",
         "description": "Deduplicating"}})
@@ -879,7 +933,7 @@ async def test_compaction_units(tmp: Path) -> None:
     for index in range(12):
         messages.append({"role": "assistant", "content": json.dumps(
             {"tool": "bash", "args": {"command": f"jq 'select(.msg_id==\"session_{index}_1\")' "
-                                                 f"inputs/sessions.jsonl >> evidence.jsonl",
+                                                 f"inputs/sessions/session_1.jsonl >> evidence.jsonl",
                                       "description": "x"}})})
         messages.append({"role": "user", "content": "X" * 400})
     result = agent_mod.compact_messages(messages, max_chars=1000, keep_recent=4)
@@ -1147,7 +1201,7 @@ def test_agent_guards() -> None:
 
     over = A.oversize_notice(658, 40)
     check("过大提醒报出实际条数与目标区间", "658" in over and "5-15" in over, over[:150])
-    check("过大提醒要求精简而非截断", "trimmed" in over)
+    check("过大提醒要求精简而非截断", "Keep only the records" in over or "trimmed" in over)
     check("过大提醒给出集合型问题的替代写法", "ONE record" in over)
 
 
@@ -1331,6 +1385,123 @@ def test_eval_metrics() -> None:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# 7b. add.resolve：消解（时间锚定 + 指代消解 + 原话保留）
+# ---------------------------------------------------------------------------
+
+def test_resolve_module(tmp: Path) -> None:
+    section("7b. add.resolve：解析 / 原话视图 / 记录生成")
+    from codemem.add import resolve as resolve_mod
+
+    # --- parse_resolution：围栏、别名字段、坏 kind ---
+    parsed = resolve_mod.parse_resolution(
+        '```json\n{"content":"Caroline went to a LGBTQ support group on 7 May 2023.",'
+        '"time":"7 May 2023","time_kind":"point","time_raw":"yesterday"}\n```'
+    )
+    check("parse：围栏包裹能解析", parsed.get("time") == "7 May 2023", str(parsed))
+    check("parse：time_kind 保留", parsed["time_kind"] == "point")
+    check("parse：time_raw 保留原话", parsed["time_raw"] == "yesterday")
+    check("parse：content 保留", "LGBTQ support group" in parsed["content"])
+    check("parse：非法 time_kind 归空",
+          resolve_mod.parse_resolution('{"content":"x","time":"2022","time_kind":"weird"}')["time_kind"] == "")
+    check("parse：空输入返回空", resolve_mod.parse_resolution("") == {})
+    check("parse：坏 JSON 返回空（调用方据此保留原话）",
+          resolve_mod.parse_resolution("not json") == {})
+
+    # --- 原话视图：source_* 优先（就地覆盖是幂等的）---
+    resolved = {"msg_id": "session_1_3", "role": "Caroline", "content": "Caroline went ... 7 May 2023",
+                "time": "7 May 2023", "time_kind": "point",
+                "source_content": "I went to a LGBTQ support group yesterday",
+                "source_time": "1:56 pm on 8 May, 2023"}
+    check("原话视图：content 取 source_content",
+          resolve_mod.raw_content(resolved) == "I went to a LGBTQ support group yesterday")
+    check("原话视图：time 取 source_time",
+          resolve_mod.raw_time(resolved) == "1:56 pm on 8 May, 2023")
+    # 未消解过的记录：content/time 本身就是原话
+    raw = {"msg_id": "session_2_1", "role": "Melanie", "content": "hi", "time": "9 May 2023"}
+    check("原话视图：未消解记录回落到 content", resolve_mod.raw_content(raw) == "hi")
+    check("原话视图：未消解记录回落到 time", resolve_mod.raw_time(raw) == "9 May 2023")
+
+    # --- to_resolved_record：消解结果 + 原话落进 source_* ---
+    target = {"msg_id": "session_1_3", "role": "Caroline",
+              "content": "she said hi yesterday", "time": "8 May 2023"}
+    out = resolve_mod.to_resolved_record(
+        target, {"content": "Caroline said hi on 7 May 2023.",
+                 "time": "7 May 2023", "time_kind": "point", "time_raw": "yesterday"},
+        session_time="8 May 2023")
+    check("record：content 是消解结果", out["content"] == "Caroline said hi on 7 May 2023.")
+    check("record：time 是锚定后的", out["time"] == "7 May 2023")
+    check("record：time_kind 落盘", out["time_kind"] == "point")
+    check("record：source_content 保留原话", out["source_content"] == "she said hi yesterday")
+    check("record：source_time 保留原始时间戳", out["source_time"] == "8 May 2023")
+    check("record：msg_id / role 不变", out["msg_id"] == "session_1_3" and out["role"] == "Caroline")
+
+    # --- 消解失败：保留原话、time 留空（绝不写坏记录）---
+    failed = resolve_mod.to_resolved_record(target, {}, session_time="8 May 2023")
+    check("记录：消解失败时 content 保留原话", failed["content"] == "she said hi yesterday")
+    check("记录：消解失败时 time 留空", failed["time"] == "" and failed["time_kind"] == "")
+    check("记录：消解失败时 source_content 仍有原话",
+          failed["source_content"] == "she said hi yesterday")
+
+
+async def test_resolve_pipeline(tmp: Path) -> None:
+    section("7c. add.resolve：run_dir 端到端（就地覆盖、幂等、原话保留）")
+    import re
+
+    from codemem.add import resolve as resolve_mod
+    from codemem import llm as llm_mod
+
+    calls = []
+
+    async def fake_chat_completion(client, config, messages):  # noqa: ANN001
+        user = messages[1]["content"]
+        mid = re.search(r"\[(session_\d+_\d+)\]", user).group(1)
+        calls.append(mid)
+        return json.dumps({
+            "content": f"RESOLVED {mid}",
+            "time": "7 May 2023", "time_kind": "point", "time_raw": "yesterday",
+        })
+
+    saved = llm_mod.chat_completion
+    llm_mod.chat_completion = fake_chat_completion  # type: ignore[assignment]
+    try:
+        sample = tmp / "ResolvePair"
+        sessions = sample / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        for s in (1, 2):
+            records = [
+                {"msg_id": f"session_{s}_{i}", "role": "user", "time": "8 May 2023",
+                 "content": f"raw message {s}-{i}"}
+                for i in (1, 2)
+            ]
+            (sessions / f"session_{s}.jsonl").write_text(
+                "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+
+        result = await resolve_mod.run_dir(sample, {}, None)
+        check("run_dir：状态 OK", result["status"] == "OK", str(result))
+        check("run_dir：2 个 session / 4 条消息", result["sessions"] == 2 and result["messages"] == 4,
+              str(result))
+        content = (sessions / "session_1.jsonl").read_text(encoding="utf-8")
+        check("run_dir：就地覆盖为消解结果", "RESOLVED session_1_1" in content, content[:200])
+        check("run_dir：原话保留在 source_content", "raw message 1-1" in content)
+        check("run_dir：会话时间锚点保留在 source_time", "8 May 2023" in content)
+
+        # --- 幂等：再跑一遍，输入仍是原话（source_content），不会把消解结果当原话 ---
+        calls.clear()
+        await resolve_mod.run_dir(sample, {}, None)
+        second = (sessions / "session_1.jsonl").read_text(encoding="utf-8")
+        check("幂等：再跑一遍结果不变", "RESOLVED session_1_1" in second)
+        check("幂等：原话没有被消解结果污染", "raw message 1-1" in second)
+
+        # --- limit_sessions：只跑第 1 个会话 ---
+        before_2 = (sessions / "session_2.jsonl").read_text(encoding="utf-8")
+        await resolve_mod.run_dir(sample, {}, None, limit_sessions=1)
+        check("limit_sessions：只跑前 1 个会话（session_2 未被再处理）",
+              (sessions / "session_2.jsonl").read_text(encoding="utf-8") == before_2)
+    finally:
+        llm_mod.chat_completion = saved
+
+
+# ---------------------------------------------------------------------------
 # 8. evomem_v3 端到端（假模型）
 # ---------------------------------------------------------------------------
 
@@ -1345,23 +1516,22 @@ async def test_end_to_end(tmp: Path) -> None:
         make_memory("a1", "Caroline joined an LGBTQ support group"),
         make_memory("a2", "Caroline has been going for about a month"),
     ]
-    # 新语料：三层（speakers summary / session summaries / 原始消息）
+    # 新语料：sessions/ 目录，每个会话一个文件（消解后的、上下文无关的记录）
     def sess(mid, role, content, time=""):
-        return {"msg_id": mid, "role": role, "time": time, "content": content}
+        return {"msg_id": mid, "role": role, "time": time, "content": content,
+                "time_kind": "point", "source_content": content, "source_time": time}
 
-    (sample_dir / "sessions.jsonl").write_text(
+    sessions_dir = sample_dir / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    (sessions_dir / "session_1.jsonl").write_text(
         "".join(json.dumps(sess(f"session_1_{i}", "Caroline" if i % 2 else "Melanie",
                                 f"raw message {i}", "1:56 pm on 8 May, 2023")) + "\n"
                 for i in range(1, 4)), encoding="utf-8"
     )
-    (sample_dir / "session_summaries.jsonl").write_text(
-        json.dumps(sess("session_1_summary", "summary", "They discussed the support group.",
-                        "1:56 pm on 8 May, 2023")) + "\n", encoding="utf-8"
-    )
 
     run_dir = tmp / "runs"
     config = evomem_v3.load_config(None)
-    config["max_steps"] = 6
+    config["max_steps"] = 12
     config["max_verify_rounds"] = 2
     config["concurrency"] = 1
     config["log"] = {"level": "error", "output": ""}
@@ -1369,20 +1539,22 @@ async def test_end_to_end(tmp: Path) -> None:
     log = Logger(level="error")
 
     inputs_dir = await evomem_v3.build_inputs(sample_dir, run_dir, config, log=log)
-    check("inputs 已建立", (inputs_dir / "sessions.jsonl").exists())
-    check("两层语料都硬链进 inputs",
-          all((inputs_dir / n).exists() for n in
-              ("sessions.jsonl", "session_summaries.jsonl")))
-    check("不再有 speakers_summary.jsonl", not (inputs_dir / "speakers_summary.jsonl").exists())
+    check("inputs 已建立", (inputs_dir / "sessions").is_dir())
+    check("会话语料硬链进 inputs/sessions/",
+          (inputs_dir / "sessions" / "session_1.jsonl").exists())
     check("inputs 是硬链（同一 inode）",
-          (inputs_dir / "sessions.jsonl").stat().st_ino == (sample_dir / "sessions.jsonl").stat().st_ino)
+          (inputs_dir / "sessions" / "session_1.jsonl").stat().st_ino
+          == (sessions_dir / "session_1.jsonl").stat().st_ino)
     # Windows 上 stat 的权限位不反映可执行性（一律 0o666），所以只断言文件存在 + 内容对。
-    check("inputs 里没有多余的东西（检索靠系统 grep）",
-          sorted(p.name for p in inputs_dir.iterdir()) == ["session_summaries.jsonl",
-                                                           "sessions.jsonl"],
+    check("inputs 里只有 sessions/（检索靠系统 grep）",
+          sorted(p.name for p in inputs_dir.iterdir()) == ["sessions"],
           str(sorted(p.name for p in inputs_dir.iterdir())))
+    # 会话清单：只列会话号与时间，不含任何事实内容（从会话文件推）
+    _roster = evomem_v3.load_session_roster(inputs_dir)
+    idx = evomem_v3.render_session_index(_roster)
+    check("会话清单列出 session 号", "session_1" in idx)
+    check("会话清单不含事实内容", "support group" not in idx)
 
-    # 假模型：第一个 QA 先写 evidence 再"完成"；verifier 由 role 区分
     class ScriptedModel:
         def __init__(self) -> None:
             self.agent_turns = 0
@@ -1391,32 +1563,27 @@ async def test_end_to_end(tmp: Path) -> None:
         async def __call__(self, messages: list[dict], meta: dict) -> str:
             if meta.get("role") == "verifier":
                 self.verify_turns += 1
-                # 第一次判不足，第二次判足够 -> 覆盖"缺口回灌 + 再跑一轮"
+                # 第一次判不足，第二次判足够 -> 覆盖"缺口回灌 + 再补一轮"
                 if self.verify_turns == 1:
                     return '{"sufficient": false, "answer": "", "missing": ["the year"]}'
                 return '{"sufficient": true, "answer": "about a month before June 2023", "missing": []}'
             self.agent_turns += 1
-            # 按 agent 的真实工作流走一遍：grep 定位 -> read 精读 -> date 算 -> write 落盘。
-            # 这样端到端测的不只是"文件写成了"，还有 grep/read/date 这条新路径本身。
+            # 朴素 loop：grep 原文 → date 算 → edit append 写证据
             if self.agent_turns == 1:
                 return json.dumps({"tool": "bash", "args": {
-                    "command": 'grep -in "support group" inputs/session_summaries.jsonl',
-                    "description": "Grepping summaries"}})
+                    "command": 'grep -rin "support group" inputs/sessions/',
+                    "description": "Grepping messages"}})
             if self.agent_turns == 2:
-                return json.dumps({"tool": "read", "args": {
-                    "path": "inputs/session_summaries.jsonl", "limit": 2}})
-            if self.agent_turns == 3:
                 return json.dumps({"tool": "bash", "args": {
                     "command": 'date -d "8 May 2023 -1 day" +"%d %b %Y"',
                     "description": "Computing the date"}})
-            if self.agent_turns == 4:
+            if self.agent_turns == 3:
                 # 写一条**合法 evidence**（新格式：content + metadata.source/score）。
-                # 注意不能直接抄 inputs 的记录 —— 那没有 source，会被正确地拒绝。
                 rec = {"content": "Caroline joined the group on 7 May 2023.",
-                       "metadata": {"source": ["session_1_summary"], "score": 0.9}}
-                return json.dumps({"tool": "write", "args": {
+                       "metadata": {"source": ["session_1_3"], "score": 0.9}}
+                return json.dumps({"tool": "edit", "args": {
                     "path": "evidence.jsonl",
-                    "content": json.dumps(rec, ensure_ascii=False) + "\n"}})
+                    "append": json.dumps(rec, ensure_ascii=False) + "\n"}})
             return "I am done."
 
     model = ScriptedModel()
@@ -1429,12 +1596,13 @@ async def test_end_to_end(tmp: Path) -> None:
         log=log, semaphore=asyncio.Semaphore(1),
     )
     check("QA 记录有 evidence", record.evidence_count == 1, str(record.evidence_count))
+    # 2 轮：第 1 轮跑完 agent loop（verifier 判不足），第 2 轮回灌后足够
     check("QA 记录了 2 轮", len(record.rounds) == 2, str(len(record.rounds)))
     check("第 1 轮注入缺口后续跑", len(record.verifications) == 2)
     check("最终判定为足够", record.sufficient is True, record.stop_reason)
     check("带上最终答案", "June 2023" in record.final_answer, record.final_answer)
     check("stop_reason=sufficient", record.stop_reason == "sufficient", record.stop_reason)
-    check("工具调用被记账（grep + read + date + write）", record.tool_calls >= 4,
+    check("工具调用被记账（grep + date + edit）", record.tool_calls >= 3,
           str(record.tool_calls))
     check("未篡改只读输入", record.tampered is False)
     # evidence 没有 id 字段，标识取 content（见 evidence._id_of）
@@ -1452,9 +1620,9 @@ async def test_end_to_end(tmp: Path) -> None:
                 return '{"sufficient": true, "answer": "x", "missing": []}'
             self.turn += 1
             if self.turn == 1:
-                # 软链逃逸：写 inputs/sessions.jsonl（resolve 后在外，应被拒）
-                return json.dumps({"tool": "write", "args": {
-                    "path": "inputs/sessions.jsonl", "content": "{}"}})
+                # 软链逃逸：写 inputs/sessions/session_1.jsonl（resolve 后在外，应被拒）
+                return json.dumps({"tool": "edit", "args": {
+                    "path": "inputs/sessions/session_1.jsonl", "append": "{}"}})
             return "done"
 
     record2 = await evomem_v3.run_qa(
@@ -1464,8 +1632,8 @@ async def test_end_to_end(tmp: Path) -> None:
         log=log, semaphore=asyncio.Semaphore(1),
     )
     check("写只读输入被拒（未篡改）", record2.tampered is False)
-    check("原 sessions.jsonl 未被改动",
-          "raw message" in (inputs_dir / "sessions.jsonl").read_text())
+    check("原会话语料未被改动",
+          "raw message" in (inputs_dir / "sessions" / "session_1.jsonl").read_text())
     check("工具错误被记账", record2.rounds[0]["steps"][0]["ok"] is False
           or not record2.rounds[0]["steps"][0]["result_text"] == "")
 
@@ -1495,6 +1663,7 @@ def main() -> int:
         test_toolcfg(tmp)
         test_evidence(tmp)
         test_qa_selection()
+        test_resolve_module(tmp)
         test_verifier_rendering()
         test_agent_guards()
         test_judge_temporal()
@@ -1506,6 +1675,7 @@ def main() -> int:
             loop.run_until_complete(test_tools(tmp))
             loop.run_until_complete(test_agent(tmp))
             loop.run_until_complete(test_compaction_units(tmp))
+            loop.run_until_complete(test_resolve_pipeline(tmp))
             loop.run_until_complete(test_end_to_end(tmp))
         finally:
             loop.close()

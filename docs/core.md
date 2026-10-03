@@ -12,7 +12,7 @@
 整个架构围绕**四个步骤**组织，依赖方向严格单向，步骤之间**只通过数据文件耦合**（不互相 import）：
 
 ```
-add ──► sessions.jsonl ──► session_summaries.jsonl
+add ──► sessions/session_N.jsonl   （原始措辞 → 消解后上下文无关）
                              │
                              ▼
 search ──────────────► evidence.jsonl          （question + 记忆库 → 能回答该问题的记忆列表）
@@ -26,8 +26,8 @@ eval ────────────────► eval.jsonl / summary.js
 
 | 步骤 | 做什么 | 入口 |
 |---|---|---|
-| **add** | 一段对话记忆 → 原始消息 + 每个 session 一份 summary | `python -m codemem.add` |
-| **search** | question + 两层语料 → `evidence.jsonl`（搜索 agent：关键词多跳检索，语义兜底） | `python -m codemem.search` |
+| **add** | 一段对话记忆 → 消解后的会话文件（时间锚定 + 指代消解，上下文无关） | `python -m codemem.add` |
+| **search** | question + `sessions/` 语料 → `evidence.jsonl`（朴素 agent loop：检索 → 取证 → 验证） | `python -m codemem.search` |
 | **answer** | question + `evidence.jsonl` → 答案（只用证据，不检索） | `python -m codemem.answer` |
 | **eval** | 答案正确性 + 指标（judge / token F1 / evidence recall / 失败归类） | `python -m codemem.eval` |
 
@@ -38,19 +38,18 @@ eval ────────────────► eval.jsonl / summary.js
 
 ```
 configs/
-  add.yaml      # add 的模型与 summary 参数
+  add.yaml      # add 的模型参数（session 阶段纯 CPU；resolve 阶段逐消息消解时间/指代）
   search.yaml   # search 的 agent/检索/预算参数
   answer.yaml   # answer 的模型参数
   eval.yaml     # eval 的 judge 参数
-  tool.json     # search 的工具描述/schema/prompt/示例（agent 上下文的单一事实源）
+  tool.json     # search 的工具描述/schema/prompt/示例/检索策略引导（agent 上下文的单一事实源）
   api.yaml      # 封装 API 的模型/存储/预算参数
 data/
   correct_locomo10.json        # 原始对话数据（含 QA 与 evidence 标注）
   {speaker_a}_{speaker_b}/
-    sessions.jsonl             # add 产物：原始消息（search 的输入，只读）
-    session_summaries.jsonl    # 每个 session 一份 summary（粗筛层）
+    sessions/session_N.jsonl   # add 产物：一次会话一个文件，已消解（时间锚定 + 指代消解）
   search_runs/{experiment}_{ts}/   # search/answer/eval 的运行目录
-    {dir}/inputs/                   只读输入（硬链的两层语料）
+    {dir}/inputs/sessions/          只读输入（硬链的会话语料，每会话一个文件）
     {dir}/qa_{idx}/evidence.jsonl   search 的产物
     answers.jsonl                   answer 的产物（该次运行的全部回答）
     eval.jsonl / summary.json       eval 的产物
@@ -58,7 +57,8 @@ data/
   api_store/{slug(user_id)}/   # 封装 API 的多用户语料（见 §4）
 src/codemem/
   io.py llm.py log.py dataset.py    # 共享层：四个步骤都依赖，自身不依赖任何步骤
-  add/    session.py summary.py __main__.py
+  prompts.py                        # 所有 prompt 常量（含 search 的证据标准 EVIDENCE_STANDARD）
+  add/    session.py resolve.py __main__.py
   search/ runner.py agent.py tools.py toolcfg.py verifier.py evidence.py
           prune.py __main__.py
   answer/ answer.py __main__.py
@@ -80,6 +80,7 @@ scripts/
 | `llm.py` | chat completion：退避/重试/截断检测/qwen3 关思考 |
 | `log.py` | 分级日志（终端 + 落盘，支持 `bind` 加前缀） |
 | `dataset.py` | LoCoMo 数据模型：sample/QA/evidence 映射（`D1:3` → `session_1_3` 的唯一实现） |
+| `prompts.py` | 各步骤的 prompt 常量。search 的**证据标准**（`EVIDENCE_STANDARD`）也在这里 |
 
 ### 环境
 
@@ -87,51 +88,109 @@ scripts/
 pip install openai pyyaml tqdm fastapi uvicorn
 ```
 
-Python 3.12+。`jq` 需要可执行（search 的 agent 用它处理 JSON）。
+Python 3.12+。`grep` / `date` 是系统自带命令，agent 直接通过 `bash` 用它们。
 
 ---
 
-## 1. add — 把对话记忆添加进来（session summary）
+## 1. add — 把对话记忆添加进来（消解成上下文无关的形式）
 
 ```bash
-python -m codemem.add                      # session + summary，全部目录
+python -m codemem.add                      # session + resolve，全部目录
 python -m codemem.add Caroline_Melanie     # 只处理指定目录
 python -m codemem.add --stage session      # 只跑第一步（纯 CPU，不调模型）
-python -m codemem.add --stage summary --limit-sessions 3   # 只跑前 3 个 session（调试）
+python -m codemem.add --stage resolve --limit-sessions 3   # 只跑前 3 个 session（调试）
 ```
 
-**两步，产出两层语料**（都在 `data/{speaker_a}_{speaker_b}/` 下）：
+**两步，产出一份消解后的会话语料**（在 `data/{speaker_a}_{speaker_b}/sessions/` 下）：
 
-| 文件 | 内容 | 条数（Caroline_Melanie） |
-|---|---|---|
-| `sessions.jsonl` | 原始消息，一条一行 | 419 |
-| `session_summaries.jsonl` | 每个 session 一份 summary | 19 |
+| 文件 | 内容 |
+|---|---|
+| `sessions/session_N.jsonl` | 一次会话一个文件：一条消息一行，**已消解**（时间锚定 + 指代消解） |
 
-记录格式统一为 `session_template.jsonl`：`{"msg_id", "role", "time", "content"}` ——
-summary 记录只是把 `role` 标成 `"summary"`。**agent 只需理解一种格式**。
+记录格式沿用 `session_template.jsonl`：`{"msg_id", "role", "time", "content"}` ——
+消解后额外带 `time_kind`（`point`/`range`/`approx`）与 `source_content` / `source_time`
+（保留原话与原始会话时间戳，供溯源与 re-resolve）。**agent 只需理解一种格式。**
 
-三个刻意的取舍：
+三个刻意的取舍（不变）：
 
 - **`msg_id` 用 1-indexed**（`session_1_1`），与 LoCoMo 的 `dia_id`（`D1:1`）对齐 ——
   这样 evidence 映射是恒等变换，不需要每处 ±1（那是 bug 的温床）。
 - **`role` 用真实人名**（`Caroline`/`Melanie`）而不是 `speaker1`/`speaker2` ——
   指代消解（"she"是谁）依赖它，丢掉就等于让 agent 从对话里猜。
-- **`time` 保留原始形式**（`"1:56 pm on 8 May, 2023"`），不转 ISO ——
-  原始形式是数据里唯一无歧义的时间来源；转换错误会被固化进下游。
-  agent 用 `date -d "8 May 2023 -1 month" +"%d %b %Y"` 现场折算它。
+- **`source_time` 保留原始会话时间戳**（`"1:56 pm on 8 May, 2023"`）—— 它是消解相对时间的
+  **锚点**；`time` 是消解后的结果，原话留在 `source_content`。
 
-**为什么是 session summary 而不是原子记忆**：原子把会话结构打碎了 —— 一条条孤立事实无法回答
-"他们什么时候认识的""这段关系怎么发展的"。session summary 保留"这次谈了什么、什么变了"，
-并给检索一个**由粗到细**的入口：先读 session summary 定位到哪次会话，再进原始消息拿精确措辞。
+### 1.1 消解（`resolve`）——为什么是"改写消息本身"而不是"另建一层导航"
 
-**为什么取消了顶层 speakers summary**：它是把 19 份 summary 再压成 1 条的合成文本，
-而检索需要的是"定位到哪次会话"——那是 session summary 就有的粒度。更要命的是它
-**没有 `msg_id` 可回溯**，`source` 只能指向别的 summary 而非原始消息，直接破掉了
-"证据必须能溯源到原话"这条不变量，每条 QA 还要多背一层没人用的语料。
-`python -m codemem.add` 重跑时会自动删掉目录里历史遗留的 `speakers_summary.jsonl`。
+**两条"浓缩成品"路线都已实测淘汰**（见 §2.16）：
+
+| 层 | 给检索什么 | 实测结果 |
+|---|---|---|
+| 顶层 speakers summary（19 份压成一段印象） | 一段"整体印象" | 152 条 QA 里 **150 条一次 grep 都没做** —— 印象太像答案，agent 直接凭它编 |
+| session summary（每会话一份摘要） | "哪次会话谈过这件事" | 119/152 条 QA **压根不读它** —— agent 只 grep 原文 |
+| `index.jsonl`（扁平 `(s,r,o)` 三元组）/ `nodes+edges`（图） | "这件事在哪些 session 出现过" | 有效，但都是**额外一层**结构，要单独维护、agent 要先读指针再读原文 |
+| **消解后的消息本身**（当前方案） | "看到这句就懂，不需要任何前后文" | ← 当前方案 |
+
+**为什么直接改消息，而不是再加一层。** 三元组/图做的是"**导航**"：agent 先 grep 指针，再去
+读原文核对。这多了一层：指针本身会漏、会压缩、措辞与原文不一致。而**如果消息本身就是自足的**
+（时间绝对、指代消解），那么 grep 命中的**就是能回答问题的原料**——不需要指针，也不需要回头
+读原文。这一版把 add 的目标从"造一层导航"换成"**把每条消息改写成上下文无关的形式**"。
+
+**它同时解决 bad case 里最实的两处缺口：**
+
+1. **时间推理**（temporal 类曾只有 27%）。消解后 `time` 是**绝对时间**（`7 May 2023`）或
+   **带绝对锚点的相对时间**（`the week before 9 June 2023`）—— **看到它就对应现实中的一个
+   时间，不需要任何辅助信息**。这正是不再让 agent 在检索时现算的收益。
+2. **跨会话联系**（multi_hop 平均跨 2.41 个 session，最多 7 个）。同一实体在**每次会话里都
+   写成同一个真名**，于是 `grep -rin "Caroline" inputs/sessions/` 一次命中她出现的全部会话
+   —— 这正是图里"边带 session 号"想干的事，但**不需要单独一层**：消解后的文本本身就是索引。
+
+#### 消解的两件事
+
+**① 时间：自足 + 精度只减不增 + 区分点/段/大概。**
+
+`time` 必须让读者**不依赖任何其它信息**就能定位现实时间。三条硬约束：
+
+- **自足**：绝对时间（`7 May 2023`）或带绝对锚点的相对时间（`the week before 9 June 2023`）。
+  **禁止无锚点的相对词**（`yesterday`、`last week` 单说）—— 读者看不到会话，这些词没意义。
+- **精度只减不增**：源说 `last year` → 只能到年（`2022`），**不许编出月日**；源说 `yesterday`
+  → 算术精确（锚点是该消息自己的日期）、可到日。**粒度和原文一致，绝不超过。**
+- **区分点 / 段 / 大概**：`time_kind` = `point`（某一刻/某天）/ `range`（一段时间：一周、一月、
+  一年、区间）/ `approx`（模糊：`recently`、`a while ago` —— 保留模糊，但锚上消息时间）。
+
+| 源话（消息 dated 8 May 2023） | `time` | `time_kind` |
+|---|---|---|
+| "yesterday" | `7 May 2023` | point |
+| "last week" | `the week before 8 May 2023` | range |
+| "last year" | `2022` | range |
+| "last Saturday" | `the Saturday before 8 May 2023` | range |
+| "recently" | `recently (as of 8 May 2023)` | approx |
+| "on 7 May 2023"（本身绝对） | `7 May 2023` | point |
+
+**② 指代：换成原始含义。**
+
+`she`/`he`/`they`/`it`/`there`/`then` → 真名 / 真实地点 / 真实物件 / 时间。逐消息处理，并**喂
+前文消息**作为消解指代的上下文（见下）——单看一条 `"she went there"` 消解不了，看前文才知道
+`she` 是谁、`there` 是哪里。
+
+#### 消解怎么跑（`src/codemem/add/resolve.py`）
+
+- **逐消息**（LLM）—— **每条消息一次调用**。同一会话内按消息顺序**串行**（后面的消息要能看到
+  前面的原话，指代才消解得了）；**不同会话并行**。每条消息的 prompt 里附上前 N 条同会话消息
+  作为消解指代的上下文窗口。system prompt（`RESOLVE_SYSTEM_PROMPT`）定下上面两件事的规则。
+- **就地覆盖**：输入取每条记录的**原始视图**（`source_content`/`source_time` 优先，其次
+  `content`/`time`），输出写回同一文件。所以**对已消解的文件再跑一遍是幂等的**（不会把消解结果
+  当原话再消一次），也不需要另存一份 raw。
+- **失败保留原话**：某条消息消解失败/解析不出时，`content` 保留原话、`time` 留空 ——
+  宁可这条没被消解，也不把它写坏。
+
+**增量刷新**：Add 一个新会话时，只消解**变了的那个会话文件**（读它的原始视图，把"已消解的旧
+消息 + 新追加的原始消息"一起重新消解）。这就是 API 侧 "Add 返回即立即可检索" 的实现（见 §4）。
 
 > 旧的 `atommem`（原子抽取）与 `dpo`（为抽取模型造偏好数据）已删除 ——
 > 它们训练的是不再使用的抽取模型。需要时从 commit `b1b5283` 取回。
+> 旧的 `index.jsonl`（扁平三元组）与 `nodes.jsonl`/`edges.jsonl`（实体关系图）都已被本方案取代
+> —— 它们都是"额外一层导航"，而消解后的消息本身就是导航。
 
 ---
 
@@ -152,7 +211,7 @@ python -m codemem.search --experiment search
 
 | 参数 | 说明 |
 |---|---|
-| `dirs` / `--sample NAME` | speaker 目录名或路径；缺省处理全部含 `sessions.jsonl` 的目录 |
+| `dirs` / `--sample NAME` | speaker 目录名或路径；缺省处理全部含 `sessions/` 的目录 |
 | `--config PATH` / `--tool-config PATH` | 配置（默认 `configs/search.yaml` / `configs/tool.json`） |
 | `--qa 3,7,12` | **只跑指定的 QA 原始下标**（逗号/空格分隔）。优先于 `--max-qa` 与步数预算：点名了就一定跑完。配 `--list-qa` 查下标 |
 | `--repeat N` | 每条 QA 重复跑 N 次（默认 1）。用来反复测同一条 QA 看结果稳不稳、定位偶发问题 |
@@ -169,38 +228,73 @@ ADD 0 / DELETE 0`，库净变化 `+0 ~81 -0` —— 只会原地改写、从不�
 ① 检索只做一次，候选集第一步就定死（多跳问题死在这）；② 动作空间只有"单条原地精修"，没有
 能力**创造**把两条记忆连起来的事实；③ 成功判据（"更自足"）不可检验。
 
-**code agent 一次解决三条**：检索是 shell 命令，想调几次调几次（→①）；`write`/`edit` 能写出
+**code agent 一次解决三条**：检索是 shell 命令，想调几次调几次（→①）；`edit` 能写出
 全新记忆（→②）；产物是文件，可被独立验证（→③）。外加一个附带的正确性收益：agent 只见到
 `jq` 吐出的**原始 JSONL 行**，从来没有"展示串"这个概念 —— v2 把
 `[id] (time) Speaker | type |` 抄进正文的格式 bug 从根上不可能发生。
 
-### 2.2 核心抽象
+### 2.2 核心抽象：一个朴素的 agent loop
+
+整个 search 就是**一个 loop**：给定问题和一份库，agent 反复「检索 → 读 → 把结论写进
+`evidence.jsonl`」，直到它认为证据够了、回一句纯文本。跑完由独立 verifier 判一次"能否回答"，
+不足则把缺口喂回去再跑一轮。**没有阶段、没有上下文块控制工具、没有分层概览。**
 
 ```
 每条 QA 一个私有目录（QA 之间零共享 → QA 级并发；base 库只读）
 
-  <run>/{dir}/inputs/{sessions,session_summaries}.jsonl  只读硬链
+  <run>/{dir}/inputs/sessions/session_N.jsonl  只读硬链（每会话一个文件）
   <run>/{dir}/qa_{idx}/                       agent 的工作目录（bash 的 cwd）
       inputs/                                 指向公共 inputs/ 的一个链接
-      evidence.jsonl                          **唯一产物**
+      evidence.jsonl                          **唯一产物**（用 edit append 逐条追加）
 
-  agent loop（read/write/edit/bash，≤ max_steps 步）
+  agent loop（read / edit / bash，≤ max_steps 步）
+      system prompt：问题 + 会话清单 + 两种检索策略 + 证据标准
+      agent 自己选策略、自己检索、自己把结论写进 evidence.jsonl
       ↓ 不再调用工具 = "我做完了"
-  verifier（只看 question + evidence，看不到对话/编辑历史，**不看 reference**）
-      ↓ 不足 → 把 missing[] 喂回去再跑一轮（≤ max_verify_rounds）
+  verifier（只看 question + evidence，看不到检索过程，**不看 reference**）
+      ↓ 不足 → 把 missing[] 作为新一轮 user 消息喂回去，再跑一轮（≤ max_verify_rounds）
   校验 evidence.jsonl（§2.13）+ 校验 inputs/ 未被篡改
 ```
 
-**Verifier 为什么必须独立**：一个既能编辑又能宣布成功的 agent，最省力的动作永远是宣布成功
-—— v2 的 NOOP 泛滥就是这一偏差的温和版本。所以让一个**手里只有最终产物、看不到编辑过程**的
-旁观者来回答；它无法被措辞说服，只能被内容说服。**不给它参考答案**是因为用 reference 当闸门
-就是 oracle 泄漏（RL 会学会猜答案，推理时也拿不到答案键）—— 闸门检验**可回答性**，正确性只在
-评测/奖励时用 judge 算。它输出的 `missing[]` 是下一轮最有效的观测，这就是"探索"的实际含义。
+**为什么砍到这么简单**：之前试过更"结构化"的版本 —— 先读一层整体印象判答、再由 harness
+逐个注入 session summary、用 `next(discard, add)` 让 agent 显式管上下文块。结果是**流程越复杂、
+agent 越不检索**：那套版本里 150/152 条 QA 一次 grep 都没做。把流程拆掉、只留"检索工具 +
+一份写笔记的地方"之后，agent 反而开始真去 grep、真去读会话（同一批 QA 重跑，之前编造
+"Canada / 一幅马的画 / The Power of Now"的题，现在都从原文里读出了正确答案）。
 
-### 2.3 一个搜索 agent：检索就是 `grep`，按问题类型选策略
+这与项目的核心主张一致：**检索是 agent 的活，不是流程的活。** 我们该做的是把工具给好、
+把"什么算合格证据"讲清楚、把答案的判据留给模型自己；而不是替它把"先看什么、再看什么、
+什么时候丢弃"设计成一条流水线 —— 那既束缚它在不同题型上的灵活性，也在实测里直接抑制了
+它检索的意愿。拟人的做法就是：**你知道这个问题，你知道有哪些材料，你自己决定怎么找、找多少。**
 
-**这一版把 agent 砍到底**：没有向量索引、没有 embedding 服务、没有检索 CLI、没有日期工具。
-语料是两个 JSONL 文件（一行一条记录），检索就是 **`grep`**，时间算术就是 **`date -d`**。
+**开场只给"路标"，不给"成品"。** agent 拿到的是一份**会话清单**（`session_N (时间)`，
+**不含任何事实内容**）—— 它知道这段对话被切成了哪几次会话、各在什么时候，于是能决定
+"这题该 grep 什么词"或"这几次会话得通篇读"。**真正的"路标"就是消解后的消息本身**（见 §1.1）：
+grep 命中的句子已经自足（时间绝对、指代消解）。它**不会**拿到任何"浓缩成品"（整体印象、
+逐会话摘要），因为实测那两种都会让 agent 跳过检索（见 §1.1 与 §2.16）。
+
+**两种检索策略集成在一个 loop 里，agent 运行中自己切换**（写进 system prompt 但只给判据、
+不给流程）—— 因为一条 question 不一定一开始就能判定该用哪种，可能先试关键词、不行再转通读：
+
+| 策略 | 判据 | 怎么做 |
+|---|---|---|
+| **① 关键词直达** | 问题里点了可以直接 grep 的：人名、地名、书名、物件、事件 | `grep -rin "词" inputs/sessions/`；读到新名字就**再 grep 那个新词**（多跳）。语料已消解，命中即接近答案 |
+| **② 通读相关 session** | 答案是**集合**、或散落各处、或**根本不知道该搜什么词** | `grep -rln "词" inputs/sessions/` 拿到相关会话的**文件列表**，再逐个 `read inputs/sessions/session_N.jsonl` 从头读到尾、边读边收成员 |
+
+什么时候用哪种、要不要切换，是模型的判断。它**不必一开始选定**：先用①，发现收不全（集合/散布）
+就转②；②读到的成员名又能拿回①去 grep 它在别的会话的出现。我们只负责把两条路都摆在它面前。
+
+**verifier 在最后判一次**：独立 auditor 只看 `(question, evidence)`，判"能否回答"；不足就把
+`missing[]` 喂回去再跑一轮。它为什么必须独立：一个既能编辑又能宣布成功的 agent，最省力的
+动作永远是宣布成功（v2 的 NOOP 泛滥就是这一偏差的温和版本）。**不给它参考答案**是因为用
+reference 当闸门就是 oracle 泄漏（RL 会学会猜答案，推理时也拿不到答案键）—— 闸门检验的是
+**可回答性**，正确性只在评测/奖励时用 judge 算。
+
+
+### 2.3 检索就是 `grep`，时间算术就是 `date -d`
+
+**这一版把检索工具砍到底**：没有向量索引、没有 embedding 服务、没有检索 CLI。语料是 JSONL
+文件（一行一条记录），检索就是 **`grep`**，时间算术就是 **`date -d`**。
 
 **为什么要删向量检索**：向量检索换来的能力是"换个说法也能搜到"，代价却是一个必须常驻的外部服务、
 一次几十秒的索引构建（一个目录 17MB）、以及一个**无法解释的排序** —— 它为什么把这条排
@@ -209,22 +303,25 @@ ADD 0 / DELETE 0`，库净变化 `+0 ~81 -0` —— 只会原地改写、从不�
 **一切都是一条对 JSONL 文件的命令**。
 
 ```bash
-grep -in "husband" inputs/session_summaries.jsonl    # ① 哪次会话相关（先看概览）
-grep -in "husband" inputs/sessions.jsonl | head      # ② 原话在这里
-read inputs/sessions.jsonl offset=120 limit=40       # ③ 精读那一次会话
-date -d "9 Jun 2023 -5 year" +%Y                     # ④ 算时间 -> 2018
+grep -rin "husband" inputs/sessions/                 # ① 全部会话里 husband 出现在哪（命中即相关句）
+grep -rln "husband" inputs/sessions/                 # ② 哪些会话文件提到它（取文件列表）
+read inputs/sessions/session_5.jsonl                 # ③ 通读那一次会话
+date -d "9 Jun 2023 -5 year" +%Y                     # ④ 需要时算时间 -> 2018
 ```
 
-**两种策略，写进 system prompt 让模型先选再动手**（实测 LoCoMo 的标注证据里，
-1985 条 QA 中 1187 条只用 1 个 session，但有 330 条跨 2 个以上、最多跨 15 个，
-另有 57 条是集合型问题 —— 两类问题的最优动作相反）：
+**语料是一个 `sessions/` 目录**（每个会话一个文件，消解后上下文无关）：
 
-| | 什么时候用 | 怎么做 |
+| 动作 | 命令 | 何时 |
 |---|---|---|
-| **A. 关键词多跳** | 事实型：一个名字、一个数字、一件事 | grep 定位会话 → 读它 → **拿新词再 grep** |
-| **B. 遍历** | 集合型/散布型："她参加过哪些活动"、"他读过哪些书" | grep 出所有相关会话，**逐个走完**，边读边收成员 |
+| 全库关键词检索 | `grep -rin "词" inputs/sessions/` | 关键词直达（策略①）；命中即相关句，本身可回答 |
+| 定位相关会话 | `grep -rln "词" inputs/sessions/` | 通读策略②的第一步：拿到该读哪几个文件 |
+| 通读一个会话 | `read inputs/sessions/session_5.jsonl` | 集合/散布型：从头读到尾、边读边收成员 |
 
-只写一句"检索要彻底"会让模型在 B 上过早收手（收不全成员），在 A 上过早发散。
+**关键词特别明显的题可以直取**：问题里的词直接命中 `inputs/sessions/`（比如
+"charity race"）就在那条消息上落证据。集合型/散布型问题（"她参加过哪些活动"）则相反 ——
+先 `grep -rln` 看哪些会话相关，再**逐个通读、边读边收成员**：实测 LoCoMo
+的标注证据里，1985 条 QA 中 1187 条只用 1 个 session，但有 330 条跨 2 个以上、最多跨 15 个。
+用哪种、什么时候切换，由 agent 自己判断（判据见 §2.2 的策略表）。
 
 **两个实测修掉的坑**（写在这里因为它们都是 grep 特有的）：
 
@@ -398,24 +495,25 @@ judge 同理：`reason` 在前、`label` 在后，等于先做比较再下结论
 
 ### 2.6 上下文预算：工具描述不能吃掉 agent 的步数
 
-system prompt 是**每条 QA 都完整注入一次**的，所以它的每一句都在跟检索结果抢上下文。
-实测现在 **12977 字符**：
+system prompt 是**每条 QA 都完整注入一次**的（agent loop 的每次模型调用都带着它），所以它的
+每一句都在跟检索结果抢上下文。实测现在 **~14200 字符**：
 
 | 段落 | 字符 | 说明 |
 |---|---|---|
-| system body | 5039 | 两条策略的判据 + 三条 worked example（多跳 / 相对时间 / 遍历） |
-| TOOLS | 2006 | 四个工具的 description + schema |
-| COMMANDS | 1485 | grep 与 date 的用法与示例 |
-| WRITING_POLICY | 1410 | 证据是推导、不是抄的 |
-| TIME_POLICY | 1307 | 时间精度规则（§2.4） |
-| SCHEMA | 611 | evidence 记录字段 |
-| WORKSPACE | 557 | 目录布局与只读规则 |
-| PROTOCOL | 381 | 响应格式 |
+| system body | ~4900 | 检索策略（STRATEGY）+ 三条 worked example（关键词检索 / 相对时间 / 通篇读） |
+| EVIDENCE_STANDARD | 2026 | 一条证据要写法上合格（§2.8）—— 自足 / 指代 / 时间锚点 / 不编造精度 / 溯源 |
+| TOOLS | ~1700 | 三个工具（read / edit / bash）的 description + schema |
+| COMMANDS | 1485 | grep、date 的用法与示例 |
+| WRITING_POLICY | 1450 | 证据是推导、不是抄的 |
+| TIME_POLICY | 1300 | 时间精度规则（§2.4） |
+| SCHEMA | 650 | evidence 记录字段 |
+| WORKSPACE | 640 | 目录布局与只读规则 |
+| PROTOCOL | 400 | 响应格式 |
 
-**这个数字比删掉向量检索之前反而大了一点** —— 因为多了一整套时间精度规则和第二条策略。
-换来的是不再需要维护索引与嵌入服务。
+**比"有块机制"那一版反而小了一点** —— 砍掉了整套上下文块流程描述与 `next` 工具的 schema。
+"证据标准"那一段保留（它换来的是"什么算一条合格的证据"）。
 
-`test_search.py` 里有一条断言把这个上限钉住（`< 14000 字符`）——**涨回去就等于白做这次简化**，
+`test_search.py` 里有一条断言把这个上限钉住（`< 18000 字符`）——**涨回去就等于白做这次简化**，
 所以它该在 CI 里红，而不是等到某次跑完发现步数又不够用了。
 
 **Verifier 同理**：它的 prompt 里没有 few-shot 示例，唯一的例外是**时间精度的两条说明**
@@ -433,10 +531,12 @@ system prompt 是**每条 QA 都完整注入一次**的，所以它的每一句�
 `topic:activities` / `action:Swimming` / `topic:art` 四个不同的 key 上，还有 30 多个别的
 key。**没有哪一个 `--tag` 能一次收齐** —— 那是 add 侧的问题，不是检索算法的问题。
 
-这一版换了个更直接的办法：**遍历**（策略 B）。grep 出所有相关会话，逐个走完 ——
-没有"相关度天梯"这回事，命中的就是字面包含的那些行，覆盖是可数的、可验证的。
+这一版换了个更直接的办法：**通篇读**（策略 B）。扫一遍 session summaries 看哪几页相关，
+然后**把那几次会话从头读到尾**、边读边收成员 —— 没有"相关度天梯"这回事，命中的就是概览/正文里
+**字面**提到的东西，覆盖是可数的、可验证的。集合型问题往往要**对着读好几个会话**（同一个成员
+在不同会话里反复出现），这正需要 agent 自己决定读哪几页、读多深。
 
-### 2.8 证据是**推导**出来的，不是抄的
+### 2.8 证据是**推导**出来的，不是抄的（附"证据标准"）
 
 这是 search 的核心语义，也是相对上一版最大的一处变化：
 
@@ -460,8 +560,19 @@ content: "Caroline is pursuing a career in counseling and mental health,
 source:  ["session_1_9", "session_2_8", "session_1_17"]
 ```
 
+**为什么把"证据标准"单独抽成一段 prompt**：**"找到了证据"和"写出来的证据能用"是两件事。**
+实测里最常见的失败不是没检索到，而是检索到了却写成一条下游读不懂的记录 —— 指代没消解
+（"she went there"）、时间只有一个无锚点的相对词（"next month"）、或把两条只有合看才有意义的
+记录原样抄成两条。这一类问题与**检索策略**无关，只与**记录的写法**有关。所以它被提成一份
+**可核对的清单**（7 条：自足 / 指代消解 / 时间锚点 / 不编造精度 / 断言而非抄录 / source 真实 /
+该合并就合并），正文放在 `codemem/prompts.py` 的 `EVIDENCE_STANDARD`，经 `tool.json` 的
+`{{EVIDENCE_STANDARD}}` 槽位注入 system prompt（与 `writing_policy` / `time_policy` 并列，
+`tool.json` 仍可覆盖措辞）。改了它就等于改了"什么算一条合格的证据"。
+
 反幻觉护栏不变：**`source` 必须非空**，且必须是**本会话真读过的** id（不是记得或猜的），
-`source` 为空的记录一律 reject。
+`source` 为空的记录一律 reject。**唯一的例外**是"仅凭印象就答"那条路径 —— 那时模型只见过
+印象、没见过原话，所以它的 `source` 指向印象里**标注给这条事实的** `session_N`（一个可回溯到
+会话的 id），而不是某条具体消息 id。
 
 ### 2.9 code-agent loop 的几件事
 
@@ -473,6 +584,26 @@ source:  ["session_1_9", "session_2_8", "session_1_17"]
 | **60/60 步没有一次完成信号**，12~24 步全烧在重复追加 | **重复检测**：同一工具+参数、**且文件状态未变**时直接拒绝并给出脱困提示（状态感知 —— 文件变了就允许重跑） |
 | 空转被算作"有进展"（往文件里追加重复行） | 进展判据改成**唯一记录集合的指纹**，不是行数、也不是字节数；重复追加不算进展 |
 | prompt 随历史无限涨（3.3k→4.5k tok / 12 步） | **上下文压缩**：超预算即把中段坍缩成摘要，保留 system + 最近 N 条 + **工具用过的 id 集合**（保 id 是关键，否则模型会忘了已收过哪些而重复追加） |
+
+**逐条追加：`edit` 需要专门的 append 模式，不能靠"用最后一行当 oldText"去模拟。** 流程要求
+"每看完一页就把理解**追加**到 `evidence.jsonl`"。最初的做法是让模型用精确替换 `edit` 自己造
+`oldText`（拿已有的最后一行当锚点）。实测（8B）第一次跑就暴露三连击：**① 文件还不存在时
+`edit` 直接报 `File not found`**（每个 QA 的第一次追加必然踩到）；**② 摘要把行截断到 160 字符**，
+模型复不出那个精确的 `oldText`，要么填个近似串、要么留空（`edits[0].oldText must not be empty`）；
+**③ `edit` 失败后它退回 `write` 整份覆盖**，把前面几个 session 的证据全冲掉 —— 实测"访问了
+5 个 session、最后只剩 1 条记录"。
+
+修法是把这个动作**升为一等参数**，而不是继续靠 prompt 绕：
+
+- `edit` 增加 **`append` 模式**（`append="<文本>"`），**文件不存在时直接创建** —— 一次修掉
+  ① 和 ②；追加本就是这套流程的一等操作，就不该让模型用替换去拼。
+- **`write` 工具整个删掉** —— 没有"整份覆盖"这个入口，"一个 session 写错就冲掉前面全部证据"
+  在机制上不可能发生（于是 ③ 也跟着消失）。要修正已有记录用 `edit` 的 replace 模式。
+- 追加的防护：`append` 为空 → 拒绝（空写只可能是截断）；追加内容与文件**最后一行**逐字相同
+  → 拒绝（模型偶尔把刚写过的又追加一遍）。
+- 证据摘要仍把**末尾几行**给模型看（给到 200 字符），但它不再承担"要被逐字节复制"的职责。
+
+改完后同一题：连续 `edit` 追加，5 条记录全部留住；用户报告里的 `File not found` 也不再出现。
 
 外加**错误重试**与终止语义的收紧：
 
@@ -491,12 +622,12 @@ source:  ["session_1_9", "session_2_8", "session_1_17"]
 ### 2.10 存储与运行目录
 
 旧版这一节是整条链路最重的一块：向量索引（一个目录 17MB）、共享缓存、按 `corpus_sha256`
-判失效、跨运行复用、三个清理命令。**现在这些全都不存在了** —— 语料就是两个 JSONL 文件，
+判失效、跨运行复用、三个清理命令。**现在这些全都不存在了** —— 语料就是一个 `sessions/` 目录（每会话一个 JSONL 文件），
 硬链进运行目录（inode 共享，0 额外空间），agent 直接 grep。
 
 | 内容 | 位置 | 说明 |
 |---|---|---|
-| `sessions.jsonl` / `session_summaries.jsonl` | 每次运行的 `inputs/` | **硬链**（inode 共享） |
+| `sessions/session_N.jsonl` | 每次运行的 `inputs/sessions/` | **硬链**（inode 共享） |
 | evidence / trajectory / 日志 | 每次运行目录 | 每次一份（本来就该有） |
 
 **每个 QA 的工作目录只放一个链接。** 早期实现给每个 `qa_{idx}/inputs/` **逐个**软链 5 个
@@ -546,7 +677,7 @@ python -m codemem.search --prune-runs --keep-last 3 --yes  # 保留最近 3 次
 reference 是 **7 May 2023**）：
 
 ```bash
-grep -in "support group" inputs/sessions.jsonl
+grep -rin "support group" inputs/sessions/
 # -> session_1_3: "I went to a LGBTQ support group yesterday"
 #    该记录的 time 是 "1:56 pm on 8 May, 2023" —— 这就是锚点
 date -d "8 May 2023 -1 day" +"%d %b %Y"                        # -> 07 May 2023
@@ -582,7 +713,7 @@ python scripts/test_search.py
 
 | 参数 | 说明 |
 |---|---|
-| `dirs` / `--sample NAME` | speaker 目录名或路径；缺省处理全部含 `sessions.jsonl` 的目录 |
+| `dirs` / `--sample NAME` | speaker 目录名或路径；缺省处理全部含 `sessions/` 的目录 |
 | `--config PATH` | 检索配置（默认 `configs/search.yaml`） |
 | `--tool-config PATH` | 工具配置（默认 `configs/tool.json`） |
 | `--max-qa N` | **调试闸门**：每个目录最多处理前 N 条 QA（0=全部） |
@@ -597,22 +728,24 @@ python scripts/test_search.py
 | # | 不变量 | 动机 |
 |---|---|---|
 | 1 | `evidence.jsonl` 每行必须是 `{"content": 非空, "metadata.source": 非空数组}`；`score` / `changelog` 系统可补，**其余字段一律不替 agent 造** | `source` 非空是**反幻觉护栏**：它必须列出**真读过**的 msg_id |
-| 2 | `write`/`edit` 路径必须落在 `qa_{idx}/` 内 | 只读输入不被误写（软链逃逸也会被拦） |
-| 3 | 每 QA 收尾校验**两层语料**的 sha256；不一致 → `tampered=true`，该 QA 作废 | bash 可以绕开 #2，检测成本极低 |
+| 2 | `edit` 路径必须落在 `qa_{idx}/` 内 | 只读输入不被误写（软链逃逸也会被拦） |
+| 3 | 每 QA 收尾校验**整个会话语料树**的 sha256（逐文件）；不一致 → `tampered=true`，该 QA 作废 | bash 可以绕开 #2，检测成本极低 |
 | 4 | 只补全**系统自有字段**（缺 `changelog` → 补 `created`；缺 `score` → 补 0.5），其余不合规的行 **reject 并记账** | 补全语义问题会掩盖失败模式 |
 | 5 | 工具 / 解析 / 模型调用失败 = 一次 failed step，记账后继续 | 所有失败路径都退化为无害一步 |
 | 6 | 连续 `no_progress_patience` 步**唯一记录指纹**没有变化 → **提前收尾**（判据是唯一记录集合，不是行数/字节数；见 §2.7） | 把空转变成机制而不是 prompt 请求 |
 | 7 | 产物解析容忍两种 `jq` 自然输出：一行一个数组、整份美化 JSON（否则规范化会把证据全删） | `jq` 是 agent 的主要工具，它的自然输出必须能被接住 |
+| 8 | `edit append` **缺 `path` 时默认 `evidence.jsonl`** | 8B 实测常忘填 path，旧行为是报错 → 它把整条调用重复 10+ 次、12 步烧光、0 条证据（一个显然的默认值不值得判错） |
 
 ### 2.14 输出与日志
 
 `data/search_runs/{experiment}_{ts}/`：
 
 - `{dir}/qa_{idx}/evidence.jsonl` — **唯一产物**（不合规时另存 `evidence.jsonl.raw`）
-- `{dir}/inputs/` — 只读输入（硬链的两层语料）
+- `{dir}/inputs/sessions/` — 只读输入（硬链的会话语料，每会话一个文件）
 - `{dir}/{dir}.qa_trajectories.jsonl` — 每 QA 一行：`evidence_ids` / `steps` / `counts_by_tool` /
-  `verifications` / `rounds`（含每步的模型输出、工具调用、观测、evidence 行数变化）/ `tampered` /
-  `stop_reason` / `final_answer`
+  `verifications` /
+  `rounds`（每轮含每步的模型输出、工具调用、观测、evidence 行数变化）/
+  `tampered` / `stop_reason` / `final_answer`
 - `{dir}/{dir}.model_calls.jsonl` — 每次模型调用的原始输出（排错用；`--log-full-messages`
   才带完整 messages）
 - `summary.json` — 配置、每目录摘要（`qa_done` / `evidence_total` / `steps_total` /
@@ -627,12 +760,13 @@ python scripts/test_search.py
   verifier 的输入与输出、evidence.jsonl 全文、异常 traceback。
 
 `stop_reason` 取值：`sufficient`（verifier 判足够）/ `verify_rounds_exhausted`（判了几轮仍不足）
-/ `no_progress(N)`（连续 N 步无进展提前收尾）/ `steps_exhausted` / `error`。
+/ `steps_exhausted`（总步数用尽，agent 还在 `next` 翻页）/ `no_progress(N)`（连续 N 步无进展
+提前收尾）/ `error`。
 
-> ⚠️ **成本**：每条 QA ≈ `steps + verifier 次数` 次模型调用。system 段实测
-> **12977 字符（约 3.2k token）且固定** —— 可命中 prefix cache；随对话历史与工具观测增长，
-> 每步再涨 ~1–2k（见 §2.9 的压缩机制）。先用 `--max-qa 3 --max-steps 8` 试跑，
-> `--dry-run` 可先看 prompt 全貌。
+> ⚠️ **成本**：每条 QA ≈ `检索步数 + verifier 次数` 次模型调用。system 段实测 **~15900 字符（约 4k token）且固定** ——
+> 可命中 prefix cache；随对话历史与工具观测增长，每步再涨 ~1–2k（见 §2.9 的压缩机制）。
+> **唯一的关键旋钮是 `max_steps`** —— 集合型问题（要读多个 session）比事实型贵得多，按最贵的给。
+> 先用 `--max-qa 3 --max-steps 20` 试跑，`--dry-run` 可先看 prompt 全貌。
 >
 > ⚠️ **没有外部依赖**：没有嵌入服务、没有索引、没有检索 CLI。agent 用系统自带的 `grep`
 > 检索、用 `date -d` 做算术。整条链路只在调模型时联网。
@@ -642,8 +776,9 @@ python scripts/test_search.py
 
 ### 2.15 首次全量跑（Caroline_Melanie，152 QA）的实测结论
 
-> **这组数字是最早那次全量跑（三层语料时代）的结果**，保留它是为了记录下面三个诊断结论 ——
-> 它们与语料层数无关，至今仍是当前设计的依据。
+> **这组数字来自更早一次全量跑**（当时是"会话时间当事件时间"那一版 prompt），保留它是为了
+> 记录下面三个诊断结论 —— 它们与语料层数、与后来的分阶段改动都无关，至今仍是当前设计的依据。
+> **当前朴素 loop（§2.2）的实测见 §2.16**，这组数字是更早版本的，不能当作它的成绩。
 >
 > **两次完整运行的对比在 §2.4.1** —— 那里说明了为什么"58% → 47%"这个表面跌幅
 > 绝大部分是判分口径变化，而不是答案变差（用统一判据重判后是 51% → 48%，
@@ -695,7 +830,162 @@ eval     judge_accuracy 55.1%   token_f1 0.310   evidence_recall 43.6%
 
 ---
 
-## 3. answer — 根据 evidence 回答
+### 2.16 从 bad case 反推的一次大改：31.6% → 59.1%
+
+上一节那张表是"印象判答 + 逐 session"版本的。这一节记录**怎么从 bad case 找到根因、
+把 search 砍成一个朴素 loop** 的全过程 —— 这是本项目最实的一次方法改进，也是"范畴判断
+优先于堆流程"的最好例证。
+
+#### 先看数据：104 条 INCORRECT 是什么样的
+
+拿旧版全量跑（152 QA）的 `eval_eval.jsonl` 逐条分类：
+
+| 现象 | 条数 | 性质 |
+|---|---|---|
+| **一次 `grep` 都没做的 QA** | **150 / 152** | 检索被整个短路 |
+| INCORRECT 里"证据在但答错"（= 编造） | **97 / 104** | 不是检索不到，是压根没去检索 |
+| verifier 判 sufficient 的 / 其中错的 | 131 / **87** | verifier 被"看起来完整"的编造骗过 |
+| 集合型问题 `recall=0` | 17 / 18 | 只给一两个成员就收工 |
+
+#### 典型 bad case：0 步检索 + 编造 + 假来源
+
+qa92「What country is Caroline's grandma from?」（参考 **Sweden**）的完整轨迹只有两步：
+
+```
+step1 edit: {"content": "Caroline's grandma is from Canada, as Melanie mentioned
+             during their conversation...", "metadata":{"source":["session_13"]}}
+step2 纯文本 = 完成
+```
+
+它**从没读过 session_13**（正确答案在 `session_4_3`），编了一个国家名、还配了个看似
+可溯源的假 source，verifier 判 sufficient。同形态的还有：
+- qa106「新鞋用来干什么」→ 编"pottery"（答案 running），证据里写着 "**likely required** the use of her new shoes"（臆测）；
+- qa93「奶奶的礼物」→ 编"一幅马的画"（答案 necklace）；
+- qa104「推荐的书」→ 编"The Power of Now"（答案 "Becoming Nicole"）；
+- qa88「期待收养过程的什么」→ 把问题复述一遍当答案。
+
+#### 根因：**顶层概览太像"成品"，把检索短路了**
+
+这些 QA 的共同点是**开头读了一眼 speakers summary 就直接作答**。speakers summary 是
+"整段关系的浓缩印象"，里面提过几乎所有主线（家庭、职业、兴趣）。agent 看到问题沾边，
+就凭印象凑一条答案 —— 它**有把握**（因为印象里确实提过"家庭背景"），于是不去核对。
+浓缩成品 = 一条"看起来够用"的捷径，而捷径一旦存在，模型就会走。
+
+**这不是加规则能修的。** "检索要彻底"这类叮嘱在 8B 上反复失效（§2.9 已多次记录）。
+能修的是**类别判断**：既然"给成品"会诱导跳步，那就**不给成品**。
+
+#### 改法：删掉成品，砍成一个朴素 loop
+
+1. **删掉 speakers summary 这一层**（add 回到两步）。开场只给一份**会话清单**
+   （`session_N (时间)`，不含任何事实）—— 它是路标，不是答案。
+2. **删掉 `next(discard, add)` 上下文块控制工具与整套 stage 机制**，回到**一个 agent loop**：
+   `read` / `edit` / `bash` 三个工具 + 一份简短引导（这题该关键词检索还是通篇读，**由 agent
+   自己选**）。
+3. **唯一新增的引导**是一段 8 行的策略表（§2.2）：关键词检索 vs 通篇读，各给**判据 + 一句做法**，
+   **不给流程**。加一句 `write from what you READ, never from what you assume` 针对编造。
+
+#### 效果（同一目录、同一 judge、Caroline_Melanie）
+
+| | 旧（印象判答 + 逐 session） | 新（朴素 loop） |
+|---|---|---|
+| **judge_accuracy** | 31.6% (48/152) | **59.1% (78/132)** |
+| evidence_recall | — | 0.633 |
+| unsupported_rate | — | 0.083 |
+| token_f1 | — | 0.426 |
+| single_hop | 32.9% | **63.5%** |
+| temporal | 10.8% | **60.0%**（recall 0.80） |
+| multi_hop | 34.4% | **57.7%** |
+
+**检索密度**：旧版全量 **2 次 bash 调用**；新版单目录 **500+ 次**（每个 QA 平均 3-20 步
+真检索）。**这就是全部差别**：同样是 8B 模型、同样的语料，只是把它从"看一眼印象就答"
+逼回"必须真去 grep"。
+
+#### 修掉的两个 harness 级 bug（与模型能力无关）
+
+跑完新流程后仍有 23 条**零证据** QA 直接失败。逐条看轨迹，其中两个根因是**我们的工具**：
+
+- **`grep "a|b"` 没加 `-E`**：基本正则里 `|` 是**字面竖线**，这条命令永远匹配不到东西、
+  返回空，模型据此认定"库里没有"。实测一次全量 **95 次带 `|` 的 grep 有 63 次没加 `-E`**
+  （qa2 连查 12 次全是这种空 grep）。**harness 现在自动补 `-E`** 并在观测里说明修正
+  （`tools._fix_grep_alternation`）—— 这是"工具该替模型兜住的错"，不是 prompt 能解决的。
+- **`edit` 缺 `path`**：8B 写证据时常常只给 `append`、忘了 `path`，旧行为是报
+  `path must be a string, got NoneType`，然后它把**整条一模一样的调用重复 10 次**（每次
+  被重复检测拒掉），12 步烧光、0 条证据。现在缺 `path` 默认 `evidence.jsonl`。
+
+#### 仍未解决：open_domain（反事实题）从 77% 掉到 25%
+
+诚实记录：这一类（"Caroline 会不会信教""会不会写书"）旧版反而更高（77%）。原因是旧版
+凭印象作答时，对这类**没有单一事实、要拿全局印象做推理**的题恰好蒙对得多；新版逼它去
+检索，而库里根本没有一条消息直接说"她信不信教"，它检索一圈后要么返回 `null`（证据不足）、
+要么给个无锚点回答（qa77 答 "soon"）。**这类题的正确解法是"检索少量关键事实 + 让 answer
+阶段从证据推理"，而不是在 search 阶段硬找"那句不存在的话"** —— 属于 §2.2 说的
+"哪些判断该留给下游"的问题，待办。但代价是值得的：用它的 4 个点换 temporal +49 点、
+single_hop +31 点、multi_hop +23 点。
+
+
+### 2.17 又一次大改：引入跨会话索引，31.6%→59.1%→等待新数字
+
+§2.16 把 search 从"印象判答"救回"必须真检索"（31.6%→59.1%）。但 59.1% 的跑次
+（`search_20260930_173758`）逐条看 INCORRECT，**检索已经发生了**（141 条 QA 里 0 条零
+bash），瓶颈换成了两处：
+
+1. **时间推理仍不稳**：temporal 类 16 条答错、9 条找到了却**算错**；只有 7/37 条用了
+   `date -d` —— 模型习惯把会话日期直接当事件日期写（正是 §2.4 反复强调、却仍会犯的错）。
+2. **跨会话联系收不全**：cat1 multi_hop 平均要跨 **2.41 个 session**（最多 7 个），而 agent
+   逐 session 读时"读到后面忘了前面"；只有 33/152 条 QA 读过定位层。散落在几次会话里的
+   同一件事（"Caroline 为帮孩子做过的事"分散在 4 次会话）总是只收到一部分。
+
+#### 改法：把定位层从"摘要"换成"索引"
+
+**删掉 `session_summaries`，改成 `index.jsonl`**（设计见 §1.1）：逐会话抽 `(主体, 关系, 对象)`
+三元组，合并同一关系在不同会话的出现，每条标注它出现在哪些 session/msg_id/源话时间词。
+
+| | 摘要（已删） | 索引（当前） |
+|---|---|---|
+| 形态 | 一段浓缩成品 | 一条条 (s,r,o) + 来源标注 |
+| agent 拿它干什么 | "哦大致讲了这些" → 常不读原文 | "这事在 session 2、8、13 都出现过" → 去读原文核对 |
+| 跨会话连接 | 无（每会话独立） | **合并后有**（一条记录带多个 session 号） |
+
+同时按 §2.16 的教训继续**做减法**：search agent 不再有 `next`，只剩 `read`/`edit`/`bash`；
+引导由"关键词检索 vs 通篇读"两条改为"grep 索引 / grep 原文 / 读整段会话"三条（§2.2）；
+system prompt 明确**核心目标**是产出符合证据标准的 `evidence.jsonl`。
+
+（本节待新跑次数字回来补齐效果对比表。）
+
+### 2.18 又一次大改：不做导航层，直接把消息消解成上下文无关
+
+§2.17 的 `index.jsonl`（扁平三元组）与 §2.18（原）的 `nodes/edges` 图，都是为"跨会话定位"
+**额外造一层导航**：agent 先 grep 指针，再回头读原文。这条路有效，但始终是**两层**——指针
+会漏、会压缩、措辞与原文不一致，agent 得在"指针"和"原文"之间来回对。这一版**把导航层整个
+去掉**，改成**把每条消息本身改写成自足的**（`add/resolve.py`）：
+
+- **时间消解**：把相对时间锚定成**绝对时间**或**带绝对锚点的相对时间**，粒度严格照源话
+  （`last year` → `2022`，不编月日），并标注 `time_kind` = point / range / approx。
+- **指代消解**：`she`/`it`/`there` → 真名 / 真实地点，逐消息、喂前文消息作上下文。
+- **原话保留**：消解结果进 `content`/`time`，原话进 `source_content`/`source_time`
+  （溯源 + re-resolve 幂等的底）。
+
+于是 grep 命中的**就是能回答问题的原料**，不需要指针，也不需要回头对原文；同一实体跨会话
+都写成同一个真名，`grep -rin NAME inputs/sessions/` 一次命中它的全部会话——这正是图"边带
+session 号"想做的事，但不需要单独一层。
+
+**为什么值得再把图也砍掉**（三条，都是"少一层结构"的收益）：
+
+1. **单一事实源。** 图是原文的**压缩**，压缩就有损；消解是原文的**改写**，无损（原话还在
+   `source_*`）。agent 只需读一种东西。
+2. **两种检索策略更自然。** 关键词直达（策略①）直接命中自足句；通读（策略②）时每个会话
+   文件也自足——不会"读到后面忘了前面"。而图路线下，两种策略都要先经"指针"这一跳。
+3. **增量更简单。** 图要"逐会话重抽 + 全局重新合并"；消解只需"重新消解那一个会话文件"
+   （读原始视图，天然幂等），没有跨会话的合并态要维护。
+
+代价说清楚：消解是 **O(消息数)** 次 LLM 调用（图是 O(会话数)×逐消息，两者同量级），且
+**消解质量直接决定检索质量**——消解错了（把事件时间写成会话时间、把代词解成错的人）就会
+固化进语料。所以 prompt 里把三条时间硬约束（自足 / 精度只减不增 / 区分点段大概）写成规则，
+并对每条消息都给出**会话时间锚点**（`source_time`）。
+
+（本节待新跑次数字回来补齐效果对比表。）
+
+
 
 **输入是 search 的产物 `evidence.jsonl`**，不是整个记忆库 —— 这正是整条链路的意义：
 search 已经把"回答这个问题所需的记忆"提炼成一份小列表（含推理结论、时间已解析），
@@ -749,14 +1039,15 @@ uvicorn codemem.api.server:app --port 8000
 
 - **Add 幂等**。`request_id` 是幂等键 —— 重试时同一个 `request_id` **不会再写一遍**
   （由 `meta.applied_request_ids` 记录）。响应的三个 id 原样回显。
-- **Add 返回即"立即可检索"**。写入原始消息后，**在返回前**同步刷新受影响的 session summary，
-  所以返回 `success:true` 时消息与它的概览层都已落盘。
+- **Add 返回即"立即可检索"**。写入原始消息后，**在返回前**同步重抽该会话的实体/边并重新
+  消解该会话文件（时间锚定 + 指代消解），所以返回 `success:true` 时消息已消解、可直接检索。
 - **Search 的 `data` 永不为缺失**。没有记忆（该 user 从没 Add 过）或没有证据，一律返回
   `{"data": []}`，绝不给 5xx 空响应。
 
-**Search 复用 search 步骤的 code-agent 管线**：`query` 归一化成 question → 建运行目录（硬链
-两层语料进 `inputs/`）→ agent 用 `grep` 检索、把**推导出的**证据写进 `evidence.jsonl` →
-verifier 判"够不够"→ 映射成协议 `data[]`（按 `metadata.score` 降序、`top_k` 截断）。
+**Search 复用 search 步骤的同一套编排**（`runner.run_phases`，与离线 search 完全一致）：
+`query` 归一化成 question → 建运行目录（硬链 `sessions/` 语料进 `inputs/`）→ 一个朴素 agent loop：
+`grep` 检索、把**推导出的**证据用 `edit` 追加进 `evidence.jsonl` → verifier 判"够不够"
+（不足则回灌再补一轮）→ 映射成协议 `data[]`（按 `metadata.score` 降序、`top_k` 截断）。
 **不是朴素关键词检索** —— 协议要的是"能直接回答问题的记忆列表"，而 agent 会把 `yesterday`
 折算成绝对日期、消解指代、把散落的事实合并成一条。代价：每条 query 一次（或多次）LLM 调用。
 
@@ -764,8 +1055,7 @@ verifier 判"够不够"→ 映射成协议 `data[]`（按 `metadata.score` 降�
 
 ```
 meta.json                 session_id -> 会话号、每会话消息数、已应用的 request_id
-sessions.jsonl            原始消息（session_template 格式，msg_id=session_1_3）
-session_summaries.jsonl   每个 session 一份（role="summary"）
+sessions/session_{n}.jsonl  一次会话一个文件（消解后；原话在 source_content/source_time）
 runs/{ts}/                每次 Search 的运行目录（inputs/ 硬链 + qa/evidence.jsonl，可审计）
 ```
 
@@ -783,7 +1073,7 @@ runs/{ts}/                每次 Search 的运行目录（inputs/ 硬链 + qa/ev
 python scripts/test_api.py     # 37 项断言：幂等 / 多 user 隔离 / msg_id 与时间 / data 映射 / 多模态
 ```
 
-配置在 `configs/api.yaml`：`generator`（agent+verifier 模型）、`summary`（Add 侧模型）、
+配置在 `configs/api.yaml`：`generator`（agent+verifier 模型）、`index`（Add 侧消解模型）、
 `store_dir`、`concurrency`、`top_k` 与 agent 预算。
 
 ### 4.1 实现要点
@@ -791,9 +1081,11 @@ python scripts/test_api.py     # 37 项断言：幂等 / 多 user 隔离 / msg_i
 - **`models.py`**：协议模型（pydantic）+ `ContentPart[]` → 文本的归一化（唯一实现，
   Add 与 Search 共用）。
 - **`store.py`**：每 `user_id` 一个目录；`UserStore.append` 在**写锁**内完成"查幂等键 →
-  分配 `msg_id` → 追加消息 → 刷新该 session 的 summary → 记 request_id"，两层语料原子写回。
-- **`retriever.py`**：直接驱动 `search.agent.run_agent_round` + `search.verifier.verify`，
+  分配 `msg_id` → 追加消息 → 刷新该 session 的 summary → **刷新顶层印象** → 记 request_id"，
+  会话语料原子写回。
+- **`retriever.py`**：直接调 `search.runner.run_phases`（与离线 search 同一套块编排），
   复用现成的 `ModelRunner` / `build_shell_prefix` / `link_dir_or_copy` / `validate_file`。
+  **不另写一套**：在线与离线的检索行为必须一致，否则"本地调好的 prompt 上线就不准了"。
 - **`server.py`**：FastAPI app，协程级 `asyncio.Semaphore` 限流；`create_app(config)` 供测试注入。
 - 一处实测踩坑：agent 的 cwd 是 `qa/`、prompt 里所有检索示例写的是 `inputs/...`（相对 cwd），
   所以 `qa/inputs` 必须**也**存在一份链接（与 `runner.run_qa` 一致），否则 grep 永远空。
@@ -1007,22 +1299,45 @@ python scripts/test_api.py          # 封装 API 自测（37 项）
 - [x] **S3** search 步骤（code-agent 式证据构建）：见 §2
 - [x] **S4** answer / eval 两个步骤打通，`answers.jsonl` + `eval.jsonl` 端到端可跑
 - [x] **S5** 静态回归网：`test_search.py` 用 AST 扫全包，杜绝"调用了但没导入"
-- [x] **S6** add 只留 session summary（删掉顶层 speakers summary）；search 简化为
-      「检索就是 grep、按问题类型选策略」的搜索 agent；补上时间精度规则
-      （见 §2.3 / §2.4）；删掉向量检索与检索 CLI（约 1670 行）
+- [x] **S6** add 只留 session summary（当时删掉了顶层 speakers summary）；search 简化为
+      「检索就是 grep」的搜索 agent；补上时间精度规则（见 §2.3 / §2.4）；删掉向量检索与检索 CLI
 - [x] **S7** `scripts/run_eval.py` 一条命令跑通三步并打印摘要；补一项静态检查
       （过时关键字参数 —— 它正是 S6 在真机上炸的那个错因）
 - [x] **S8** 封装 API（Add / Search）：多用户隔离、request_id 幂等、复用 search agent 管线、
       多模态降级（见 §4）
+- [x] **S9** 证据标准抽为独立 prompt 段 `EVIDENCE_STANDARD`；`edit` 加 append 模式、删掉 `write`
+- [x] **S10** **从 bad case 反推的大改**（2026-09-30，见 §2.16）：删掉顶层 speakers summary
+      （实测它把检索短路 —— 150/152 条 QA 一次 grep 都没做）、删掉 `next` 上下文块控制工具与
+      整套 stage 机制，search 砍成**一个朴素 agent loop**；唯一引导是"关键词检索 vs 通篇读"
+      的策略表（由 agent 自己选）。同目录同 judge：**31.6% → 59.1%**（temporal 10.8%→60%、
+      single_hop 32.9%→63.5%、multi_hop 34.4%→57.7%）。顺带修两个 harness 级 bug：
+      `grep` 缺 `-E` 自动补、`edit` 缺 `path` 默认 evidence.jsonl
+- [x] **S11** **引入跨会话索引**（2026-10-01，见 §1.1 / §2.17）：删掉 `session_summaries`
+      这一层，add 第二阶段改为逐会话抽 `(主体,关系,对象)` 三元组、合并成 `index.jsonl`
+      （每条带它出现在哪些 session/msg/源话时间词）。索引是**导航不是摘要** —— 摘要（无论
+      顶层印象还是逐会话）实测都让 agent 跳过检索。跨会话连接是它的核心价值（multi_hop
+      平均跨 2.41 个 session）。search 侧继续做减法：不再有 `next`，只剩 read/edit/bash；
+      引导改为"grep 索引 / grep 原文 / 读整段会话"三条；system prompt 明确核心目标
+- [x] **S12**（已废弃，被 S13 取代）定位层升级为实体关系图：`nodes.jsonl` / `edges.jsonl`
+- [x] **S13** **消解取代导航层**（2026-10-02，见 §1.1 / §2.18）：删掉 `nodes/edges` 图与
+      `index.jsonl` 一路的"额外导航层"，add 第二阶段改为**逐消息消解**——
+      **时间**锚定成绝对时间或带绝对锚点的相对时间（`time` + `time_kind` point/range/approx，
+      粒度只减不增）、**指代**消解成真名（逐消息、喂前文消息作上下文）、**原话**保留在
+      `source_content`/`source_time`（re-resolve 幂等的底）。产物改为
+      `data/{dir}/sessions/session_N.jsonl`（**一次会话一个文件**）。search 侧：语料是
+      `inputs/sessions/` 目录，两种检索策略（keyword 直达 / 通读相关 session）集成在一个
+      agent loop 里、运行中自行切换；`evidence.jsonl` 同时是**笔记**（相关即可写，不必只写答案）
 
 待办：
 
-- [ ] **N1** 效果评估：用本地 `Qwen3-8B` 跑 `--max-qa 3` 校准 search 的 prompt 与 `max_steps`，
-      再跑完 10 个目录，对比 baseline 的 evidence recall 与 judge 准确率；盯 `sufficient_rate`、
-      eval 的 `failures` 归类、以及 `verifier_sufficient` vs `judge_correct` 的背离。
-      §2.15 那张表还是三层语料时代的数字，重跑后要更新
+- [ ] **N0**（最高优先）**open_domain（反事实题）从 77% 掉到 25%**（§2.16 末）：这类题没有
+      单一事实、要拿全局信息推理，而 search 阶段硬找"那句不存在的话"只能返回 null。方向是把
+      少量关键事实检索出来、让 **answer 阶段**从证据推理，而不是在 search 阶段逼它找反事实结论
+- [ ] **N1** 效果评估：跑完整 10 个目录，对比 baseline 的 evidence recall 与 judge 准确率；
+      盯 `sufficient_rate`、eval 的 `failures` 归类、`verifier_sufficient` vs `judge_correct`
+      的背离。§2.15/§2.16 目前只有 Caroline_Melanie 一个目录的数字
 - [ ] **N2** search 的多跳补强：`missing[]` 回灌已实现，可考虑让 verifier 能"点名要某条记忆"
-      （当前只能描述缺口，由 agent 自己检索）
+      （当前只能描述缺口，由 agent 自己检索）—— 零证据的 23 条 QA 是这条的实证
 - [ ] **N3** `ANSWER_PROMPT` 加 `used_ids` 字段（后续做 credit 归因要用）
 - [ ] **N4** search 的强化学习：QA 驱动的证据构建已是一条完整 trajectory（状态 = evidence.jsonl，
       终局奖励 = judge 答案），可直接在其上做 oracle 轨迹采样 + GRPO

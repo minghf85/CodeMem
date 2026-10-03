@@ -11,7 +11,7 @@
 5. **多模态归一化**：有序 ``ContentPart[]`` → 可 grep 的文本（图片降级成 ``[image: ...]``）。
 
 做法：把 ``codemem.llm.chat_completion`` 换成一个**脚本化**的假实现 —— 它按 system prompt 判断
-这次调用是 agent / verifier / summary，返回预先写好的回复。工具、存储、agent loop、verifier
+这次调用是 agent / verifier / index，返回预先写好的回复。工具、存储、agent loop、verifier
 编排、evidence 校验全部是**真的**，只有"模型"是假的。
 
     python scripts/test_api.py
@@ -63,7 +63,7 @@ async def fake_chat_completion(client, config, messages):  # noqa: ANN001
     必须是 **async**（真实现是 async；这里替换它，签名要一致）。
 
     - verifier（"evidence auditor"）→ 判足够
-    - summary（"summarize ONE conversation session"）→ 一段 summary
+    - resolve（"You rewrite ONE message"）→ 消解后的 content/time
     - agent（默认）→ 第一轮写 evidence.jsonl，之后回纯文本表示完成
     """
     system = str(messages[0].get("content", "")) if messages else ""
@@ -76,18 +76,18 @@ async def fake_chat_completion(client, config, messages):  # noqa: ANN001
             "sufficient": True,
         })
 
-    if "summarize ONE conversation session" in system:
+    if "You rewrite ONE message" in system:
         return json.dumps({
-            "summary": "Caroline mentioned a support group.",
-            "key_facts": ["Caroline went to an LGBTQ support group"],
-            "time": "",
+            "content": "Caroline went to a LGBTQ support group on 7 May 2023.",
+            "time": "7 May 2023", "time_kind": "point", "time_raw": "yesterday",
         })
 
-    # agent loop
+    # agent loop: 第一轮 append 一条证据，之后回纯文本表示完成
     has_assistant = any(m.get("role") == "assistant" for m in messages)
     if not has_assistant:
         body = json.dumps(_EVIDENCE_RECORD, ensure_ascii=False) + "\n"
-        return json.dumps({"tool": "write", "args": {"path": "evidence.jsonl", "content": body}})
+        return json.dumps({"tool": "edit", "args": {
+            "path": "evidence.jsonl", "append": body}})
     return "The evidence already answers the question."   # 纯文本 = 完成信号
 
 
@@ -153,7 +153,7 @@ def _app_with_temp_store(tmp: Path):
         "store_dir": str(tmp / "store"),
         "tool_config": str(PROJECT_ROOT / "configs" / "tool.json"),
         "generator": {"base_url": "http://127.0.0.1:1/v1", "model": "fake"},
-        "summary": {"base_url": "http://127.0.0.1:1/v1", "model": "fake"},
+        "index": {"base_url": "http://127.0.0.1:1/v1", "model": "fake"},
         "top_k": 100,
         "concurrency": 4,
         "add_concurrency": 4,
@@ -196,16 +196,24 @@ def test_endpoints(tmp: Path) -> None:
     sessions_after_first = store.sessions()
     check("写入了 2 条消息", len(sessions_after_first) == 2)
     check("msg_id 形如 session_1_1", sessions_after_first[0]["msg_id"] == "session_1_1")
-    check("时间转成 ISO", sessions_after_first[0]["time"] == "2023-05-08T16:00:00Z")
-    check("生成了 session summary", len(store.summaries()) == 1
-          and store.summaries()[0]["msg_id"] == "session_1_summary")
+    check("原始会话时间锚点保留在 source_time",
+          sessions_after_first[0]["source_time"] == "2023-05-08T16:00:00Z")
+    check("消息已被消解（content 是消解结果）",
+          "7 May 2023" in sessions_after_first[0]["content"]
+          and sessions_after_first[0]["time"] == "7 May 2023"
+          and sessions_after_first[0]["time_kind"] == "point",
+          str(sessions_after_first[0]))
+    check("原话保留在 source_content",
+          sessions_after_first[0]["source_content"] == "I went to a LGBTQ support group yesterday")
+    check("消息落在 sessions/session_1.jsonl",
+          (store.root / "sessions" / "session_1.jsonl").exists())
 
     # 幂等：同一个 request_id 再送一次
     resp2 = client.post("/add", json=add_body)
     check("重放仍返回 200", resp2.status_code == 200)
     store2 = store_mod.UserStore(add_body["user_id"], Path(app.state.api.store_root))
     check("幂等：语料未被重复写入", len(store2.sessions()) == 2, str(len(store2.sessions())))
-    check("幂等：summary 也未变", len(store2.summaries()) == 1)
+    check("幂等：消解语料也未变", len(store2.sessions()) == 2)
 
     # 同一 session 再追加（新 request_id）→ 序号接续
     follow = dict(add_body, request_id="eval:run1:locomo:conv-0:chunk-1")

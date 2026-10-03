@@ -18,9 +18,11 @@
 - **检索到的不是答案**：语料里说的是 `yesterday`、`she`、`that lake sunrise`，下游拿到这些
   片段仍然无法作答。
 
-CodeMem 的答案是让一个 **code agent** 自己检索与推导：它用 `grep` 在 JSONL 语料上多跳检索、
-用 `date -d` 做时间算术，然后**写出一份能直接回答问题的证据**（`evidence.jsonl`），由一个
-独立的 verifier 判定"够不够"，不够就把缺口喂回去再跑一轮。
+CodeMem 的答案是让一个 **code agent 自己检索与推导**：给它一份会话清单和 `grep`/`read` 两个
+工具，**由它自己决定**这题该关键词检索（`grep` 一个词、拿新词再 `grep`）还是通篇读（把那几个
+会话文件从头读到尾）—— 用 `date -d` 做时间算术，把结论**逐条写进** `evidence.jsonl`。跑完由一个
+独立的 verifier 判定"够不够"，不够就把缺口喂回去再跑一轮，最后产出一份**能直接回答问题的
+证据**。**没有流程图：从哪找、找多少、什么时候停，都是模型自己的判断。**
 
 **零外部依赖**：没有向量索引、没有 embedding 服务、没有检索 CLI。整条链路只在调模型时联网。
 
@@ -31,7 +33,7 @@ CodeMem 的答案是让一个 **code agent** 自己检索与推导：它用 `gre
 四个步骤，依赖方向严格单向，步骤之间**只通过数据文件耦合**（不互相 import）：
 
 ```
-add ──► sessions.jsonl ──► session_summaries.jsonl
+add ──► sessions/session_N.jsonl   （原始措辞 → 消解后上下文无关）
                              │
                              ▼
 search ──────────────► evidence.jsonl      （question + 记忆库 → 能回答该问题的记忆列表）
@@ -45,8 +47,8 @@ eval ────────────────► eval.jsonl          （
 
 | 步骤 | 做什么 | 入口 |
 |---|---|---|
-| **add** | 一段对话记忆 → 原始消息 + 每个 session 一份 summary | `python -m codemem.add` |
-| **search** | question + 两层语料 → `evidence.jsonl`（搜索 agent：grep 多跳检索 + 时间推导） | `python -m codemem.search` |
+| **add** | 一段对话记忆 → 消解后的会话文件（时间锚定 + 指代消解，上下文无关） | `python -m codemem.add` |
+| **search** | question + `sessions/` 语料 → `evidence.jsonl`（朴素 agent loop：检索 → 取证 → 验证） | `python -m codemem.search` |
 | **answer** | question + `evidence.jsonl` → 答案（只用证据，不检索） | `python -m codemem.answer` |
 | **eval** | 答案正确性 + 指标（judge / token F1 / evidence recall / 失败归类） | `python -m codemem.eval` |
 | **api** | Add / Search 的 HTTP 封装（多用户隔离、request_id 幂等） | `python -m codemem.api` |
@@ -56,7 +58,7 @@ eval ────────────────► eval.jsonl          （
 ## 快速开始
 
 ```bash
-pip install openai pyyaml tqdm fastapi uvicorn      # Python 3.12+，另需可执行的 jq
+pip install openai pyyaml tqdm fastapi uvicorn      # Python 3.12+（grep / date 用系统自带命令）
 ```
 
 ### 1. 构建记忆（add）
@@ -66,8 +68,12 @@ python -m codemem.add                       # 全部目录
 python -m codemem.add Caroline_Melanie      # 指定目录
 ```
 
-产出两层语料（`data/{speaker_a}_{speaker_b}/`）：`sessions.jsonl`（原始消息）与
-`session_summaries.jsonl`（每个 session 一份概览，供检索由粗到细定位）。
+产出 `data/{speaker_a}_{speaker_b}/sessions/session_N.jsonl`（**一次会话一个文件**）。add 的
+第二步 `resolve` 把每条消息改写成**上下文无关**的形式：**时间**锚定成绝对时间（`7 May 2023`）
+或带绝对锚点的相对时间（`the week before 9 June 2023`），**指代**消解成真名 —— 粒度严格照源话，
+绝不擅自加精度；原话保留在 `source_content` / `source_time`。于是 grep 命中的**就是能回答问题的
+原料**，同一实体跨会话都写成同一个真名。**没有摘要层，也没有额外的索引/图层** —— 消解后的消息
+本身就是导航。
 
 ### 2. 检索证据（search）
 
@@ -77,7 +83,9 @@ python -m codemem.search --sample Caroline_Melanie --max-qa 3 --max-steps 8   # 
 python -m codemem.search --experiment search                        # 全部
 ```
 
-每条 QA 的产物是 `evidence.jsonl` —— 一份**能直接回答问题**的记忆列表。
+每条 QA 的产物是 `evidence.jsonl` —— 一份**能直接回答问题**的记忆列表。search 走三步：
+agent 自己选检索方式（关键词 grep / 通篇读会话），把结论逐条追加进 `evidence.jsonl`，
+最后交给独立 verifier 判一次。
 
 ### 3. 作答与评测（answer / eval）
 
@@ -109,7 +117,8 @@ data/               原始数据 + 各步骤的产物（语料、证据、运行
 docs/core.md        技术报告（完整设计依据与实测结论）
 src/codemem/
   io.py llm.py log.py dataset.py    共享层
-  add/ search/ answer/ eval/        四个步骤
+  prompts.py                        所有 prompt 常量（含 search 的证据标准 EVIDENCE_STANDARD）
+  add/ search/ answer/ eval/        四个步骤（add 含 session / resolve 两步）
   api/                              Add / Search 的 HTTP 封装
 scripts/            run_eval.py（端到端）、test_search.py / test_api.py（纯 CPU 自测）
 ```
@@ -156,5 +165,6 @@ python -m codemem.api --host 0.0.0.0 --port 8000 --config configs/api.yaml
 ```
 
 三条契约保证：**Add 幂等**（同一 `request_id` 重试不重复写入）；**Add 返回即"立即可检索"**
-（返回前已同步刷新 session summary）；**Search 的 `data` 永不为缺失**（无记忆或无证据一律
-返回 `{"data": []}`）。详细设计与存储布局见 [`docs/core.md` §4](docs/core.md)。
+（返回前已同步消解该会话：时间锚定 + 指代消解）；
+**Search 的 `data` 永不为缺失**（无记忆或无证据一律返回 `{"data": []}`）。详细设计与存储
+布局见 [`docs/core.md` §4](docs/core.md)。

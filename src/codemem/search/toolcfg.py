@@ -38,7 +38,7 @@ DEFAULT_TOOL_CONFIG = PROJECT_ROOT / "configs" / "tool.json"
 # system prompt 里的槽位名 -> catalog 属性。渲染时逐一替换。
 # 新增槽位时记得同时加进 ``validate`` 的检查，否则拼错槽位会静默留一个 {{XXX}} 在 prompt 里。
 PROMPT_SLOTS = ("TOOLS", "COMMANDS", "WORKSPACE", "SCHEMA", "PROTOCOL", "WRITING_POLICY",
-                "TIME_POLICY")
+                "TIME_POLICY", "EVIDENCE_STANDARD", "STRATEGY")
 
 
 class ToolConfigError(ValueError):
@@ -158,12 +158,18 @@ class ToolCatalog:
     prompt: dict[str, str]
     writing_policy: dict[str, Any] = field(default_factory=dict)
     time_policy: dict[str, Any] = field(default_factory=dict)
+    evidence_standard: str = ""
+    strategy: str = ""
     source_path: Path | None = None
 
     # -- 校验 ---------------------------------------------------------------
 
     def validate(self, available: list[str]) -> None:
-        """与执行层注册的工具名对齐。缺描述 / 多描述都在启动时就报出来。"""
+        """与执行层注册的工具名对齐。缺描述 / 多描述都在启动时就报出来。
+
+        ``available`` 是执行层注册的工具（read / edit / bash）。tool.json 的描述必须与它
+        完全一致 —— 没有"控制工具"例外了（``next`` 已删除，流程回到朴素 loop）。
+        """
         described = set(self.tools)
         missing = [name for name in available if name not in described]
         if missing:
@@ -264,6 +270,25 @@ class ToolCatalog:
         lines.extend(f"- {rule}" for rule in self.time_policy.get("rules", []))
         return "\n".join(lines)
 
+    def render_evidence_standard(self) -> str:
+        """渲染"证据标准"这一段。
+
+        它约束的是**一条证据的写法**（而不是检索策略）：自足、指代消解、时间带锚点、
+        不编造精度、是断言而非抄录、source 真实、该合并就合并。与检索能力无关 ——
+        实测最常见的失败是"检索到了却写成一条下游读不懂的记录"。
+
+        正文来自 ``codemem.prompts.EVIDENCE_STANDARD``（单独维护的一份可核对清单），
+        由 ``load_catalog`` 填进 ``self.evidence_standard``。
+        """
+        return self.evidence_standard.strip()
+
+    def render_strategy(self) -> str:
+        """渲染"检索策略引导"这一段：什么题该关键词检索、什么题该通篇读。
+
+        刻意只给**判据 + 一句做法**，不给固定流程 —— 策略由 agent 自己选，这是设计的一部分。
+        """
+        return self.strategy.strip()
+
     def render_protocol(self) -> str:
         lines = [
             str(self.protocol.get("response_format", "")).strip(),
@@ -284,6 +309,8 @@ class ToolCatalog:
             "{{PROTOCOL}}": self.render_protocol(),
             "{{WRITING_POLICY}}": self.render_writing_policy(),
             "{{TIME_POLICY}}": self.render_time_policy(),
+            "{{EVIDENCE_STANDARD}}": self.render_evidence_standard(),
+            "{{STRATEGY}}": self.render_strategy(),
             "{{QUESTION}}": question.strip(),
         }
         for slot, value in replacements.items():
@@ -327,5 +354,20 @@ def load_catalog(path: str | Path | None = None) -> ToolCatalog:
         prompt=raw["prompt"],
         writing_policy=raw.get("writing_policy") or {},
         time_policy=raw.get("time_policy") or {},
+        # 证据标准：优先取 tool.json 里的覆盖，缺省用 prompts.py 的常量（单一事实源）
+        evidence_standard=str(raw.get("evidence_standard") or _default_evidence_standard()),
+        strategy=str(raw.get("strategy") or ""),
         source_path=target,
     )
+
+
+def _default_evidence_standard() -> str:
+    """证据标准的缺省正文 —— ``codemem.prompts.EVIDENCE_STANDARD``。
+
+    放在 prompts.py 而不是 tool.json，是因为它是一份**与检索策略无关的清单**，
+    与 add 侧其它 prompt 同居更便于统一维护；tool.json 仍可覆盖它（``evidence_standard``
+    顶层键），以便不改代码就调措辞。
+    """
+    from ..prompts import EVIDENCE_STANDARD
+
+    return EVIDENCE_STANDARD

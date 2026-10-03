@@ -1,1 +1,1 @@
-{"memory":"", "metadata": {"id": "", "type": "inner|outer|raw", "time": "multi-format time", "tag": ["entity1", "tag1"], "source": ["id_list"], "changelog": [{"time": "", "content": ""}]}}
+{"memory":"", "metadata": {"time": "multi-format time", "role": "", "tag": ["entity1", "tag1"], "source": ["id_list"], "id": "", "type": "msg|atom|summary"}, "changelog": [{"content": "", "time": "realtime"}]}

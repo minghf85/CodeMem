@@ -2,8 +2,8 @@
 
 四个核心步骤（严格单向依赖，步骤之间只通过**数据文件**耦合）：
 
-    add     一段对话记忆 → sessions.jsonl（原始消息）+ session_summaries.jsonl
-    search  question + 两层语料 → evidence.jsonl（能回答该问题的记忆列表）
+    add     一段对话记忆 → sessions/session_N.jsonl（消解后、上下文无关的会话文件）
+    search  question + sessions/ 语料 → evidence.jsonl（能回答该问题的记忆列表）
     answer  question + evidence.jsonl → 答案
     eval    答案正确性 + 各项指标
 

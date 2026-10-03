@@ -9,7 +9,7 @@
 模块分工：
 
     models.py     协议模型（pydantic）+ ContentPart 归一化
-    store.py      每 user_id 一个目录：追加消息、request_id 去重、物化两层语料、刷新 session summary
+    store.py      每 user_id 一个目录：追加消息、request_id 去重、物化两层语料、刷新跨会话索引
     retriever.py  复用 search 的 code-agent 管线：query -> evidence.jsonl -> data[]
     server.py     FastAPI app：POST /add、POST /search、GET /health
     __main__.py   python -m codemem.api 启动 uvicorn

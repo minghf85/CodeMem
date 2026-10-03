@@ -1,14 +1,13 @@
-"""按 ``user_id`` 隔离的持久化存储：追加消息、request_id 去重、物化两层语料、刷新 summary。
+"""按 ``user_id`` 隔离的持久化存储：追加消息、request_id 去重、物化语料、消解。
 
 **一个 user 一个目录**，结构对齐既有管线：
 
     data/api_store/{slug(user_id)}/
       meta.json                 session_id -> 会话号、每会话消息数、已应用的 request_id
-      sessions.jsonl            原始消息（session_template 格式，msg_id=session_{n}_{i}）
-      session_summaries.jsonl   每个 session 一份（role="summary"）
+      sessions/session_{n}.jsonl  一次会话一个文件（消解后上下文无关；原话在 source_*）
 
-**为什么沿用 ``session_template`` 与 ``session_1_3`` 这套约定**：search agent 的 system prompt、
-evidence 的 ``source`` 校验（只认 ``msg_id``）、`date -d` 时间锚点示例全部建立在这套约定上。
+**为什么沿用 ``session_1_3`` 这套约定**：search agent 的 system prompt、evidence 的
+``source`` 校验（只认 ``msg_id``）、`date -d` 时间锚点示例全部建立在这套约定上。
 存储层照抄它，整条 search 管线就**一行都不用改**。
 
 **幂等**是协议硬要求：Add 重试时 ``request_id`` 不变，同一条不能写入两次。所以每次 Add 先查
@@ -28,10 +27,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..add import summary as summary_mod
+from ..add import resolve as resolve_mod
+from ..add.resolve import list_session_files
+from ..add.session import SESSIONS_DIR, session_filename
 from ..io import (
     DATA_DIR,
-    is_summary,
     make_session_record,
     msg_time,
     read_jsonl,
@@ -39,8 +39,6 @@ from ..io import (
 )
 from .models import normalize_content
 
-SESSIONS_NAME = "sessions.jsonl"
-SUMMARIES_NAME = "session_summaries.jsonl"
 META_NAME = "meta.json"
 
 _SLUG_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -127,16 +125,15 @@ class UserStore:
         return self.root / META_NAME
 
     @property
-    def sessions_path(self) -> Path:
-        return self.root / SESSIONS_NAME
+    def sessions_dir(self) -> Path:
+        return self.root / SESSIONS_DIR
 
-    @property
-    def summaries_path(self) -> Path:
-        return self.root / SUMMARIES_NAME
+    def session_path(self, session_index: int) -> Path:
+        return self.sessions_dir / session_filename(session_index)
 
     def exists(self) -> bool:
         """该 user 是否已经有落盘语料（Search 据此决定是"没记忆"还是"去检索"）。"""
-        return self.sessions_path.exists()
+        return self.sessions_dir.is_dir() and any(self.sessions_dir.glob("session_*.jsonl"))
 
     # -- 读 -----------------------------------------------------------------
 
@@ -144,12 +141,11 @@ class UserStore:
         return _read_meta(self.meta_path, self.user_id)
 
     def sessions(self) -> list[dict[str, Any]]:
-        """全部原始消息（跳过 summary 记录）。"""
-        return [r for r in read_jsonl(self.sessions_path) if not is_summary(r)]
-
-    def summaries(self) -> list[dict[str, Any]]:
-        """全部 session summary。"""
-        return [r for r in read_jsonl(self.summaries_path) if is_summary(r)]
+        """全部消息（合并 sessions/ 下的全部会话文件，按会话号、消息序号排序）。"""
+        records: list[dict[str, Any]] = []
+        for _, path in list_session_files(self.root):
+            records.extend(read_jsonl(path))
+        return records
 
     # -- 写 -----------------------------------------------------------------
 
@@ -169,9 +165,13 @@ class UserStore:
 
         1. 取该 user 的写锁；
         2. **幂等**：``request_id`` 已应用 → 直接返回（不碰语料）；
-        3. 分配 ``msg_id``、转时间，追加到当前 session；
-        4. **在返回前**刷新该 session 的 summary（LLM）—— 兑现"持久化后立即可检索"；
-        5. 原子写回两层语料 + meta。
+        3. 分配 ``msg_id``、转时间，把新消息**以原始措辞**追加到该 session 文件；
+        4. **在返回前**消解该 session 文件（时间锚定 + 指代消解，LLM）——
+           兑现"持久化后立即可检索"；
+        5. 原子写回语料 + meta。
+
+        消解读取每条记录的**原始视图**（``source_content``/``source_time`` 优先），所以
+        "已消解的旧消息 + 新追加的原始消息"能一起重新消解，幂等。
         """
         lock = _lock_for(self.user_id)
         async with lock:
@@ -193,7 +193,11 @@ class UserStore:
             session_index = int(entry["index"])
 
             # ---- 追加消息（沿用同一个会话号，序号接在已有条数之后）----
-            records = read_jsonl(self.sessions_path)
+            # 新消息写成**原始格式**（content=原话、time=会话时间戳）；该文件的既有记录
+            # 可能已消解（带 source_content/source_time），resolve 会各取各的原始视图。
+            self.sessions_dir.mkdir(parents=True, exist_ok=True)
+            path = self.session_path(session_index)
+            records = read_jsonl(path)
             start = int(entry.get("count", 0))
             for offset, message in enumerate(messages, start=1):
                 content = normalize_content(message.get("content"))
@@ -206,13 +210,11 @@ class UserStore:
                     )
                 )
             entry["count"] = start + len(messages)
-            write_jsonl(self.sessions_path, records)
+            write_jsonl(path, records)
 
-            # ---- 刷新该 session 的 summary（其余 session 原样保留）----
-            refreshed = await self._refresh_summary(
+            # ---- 消解该 session（其余 session 原样保留）----
+            refreshed = await self._resolve_session(
                 session_index=session_index,
-                sessions_map=sessions_map,
-                records=records,
                 config=config,
                 client=client,
                 log=log,
@@ -225,57 +227,45 @@ class UserStore:
             if log is not None:
                 log.info(
                     f"Add 写入 {len(messages)} 条 -> session {session_index}"
-                    f"（共 {entry['count']} 条）summary={'刷新' if refreshed else '未变'}"
+                    f"（共 {entry['count']} 条）resolve={'成功' if refreshed else '未变'}"
                 )
             return {"written": len(messages), "duplicate": False, "session_index": session_index}
 
-    async def _refresh_summary(
+    async def _resolve_session(
         self,
         *,
         session_index: int,
-        sessions_map: dict[str, Any],
-        records: list[dict[str, Any]],
         config: dict[str, Any],
         client: Any,
         log: Any | None,
     ) -> bool:
-        """重新生成 ``session_index`` 那份 summary，覆盖写回（保留其它 session 的）。"""
-        group = [r for r in records if r.get("msg_id", "").startswith(f"session_{session_index}_")]
-        if not group:
-            return False
-        session_time = next((msg_time(r) for r in group if msg_time(r)), "")
-        call_config = _summary_call_config(config)
+        """消解 ``session_index`` 的会话文件（就地覆盖）。失败不抛 —— 消解不出来不该让 Add 失败。
+
+        见 ``add.resolve.refresh_session``。输入取原始视图，所以旧消息不会被重复消解。
+        """
         try:
-            record = await summary_mod.summarize_session(
-                messages=group,
-                session_index=session_index,
-                session_time=session_time,
+            return await resolve_mod.refresh_session(
+                self.root,
+                session_index,
+                _index_call_config(config),
+                client,
                 speaker_a="user",
                 speaker_b="assistant",
-                config=call_config,
-                client=client,
             )
-        except Exception as exc:  # noqa: BLE001 - summary 失败不该让 Add 整体失败
+        except Exception as exc:  # noqa: BLE001 - 消解失败不该让 Add 整体失败
             if log is not None:
-                log.warn(f"session {session_index} summary 生成失败：{type(exc).__name__}: {exc}")
+                log.warn(f"session {session_index} 消解失败：{type(exc).__name__}: {exc}")
             return False
 
-        others = [
-            r for r in read_jsonl(self.summaries_path)
-            if is_summary(r) and r.get("msg_id") != f"session_{session_index}_summary"
-        ]
-        write_jsonl(self.summaries_path, [*others, record])
-        return True
 
-
-def _summary_call_config(config: dict[str, Any]) -> dict[str, Any]:
-    """从 api 配置里取出 summary 调用参数（``summary`` 段 + 顶层重试参数）。
+def _index_call_config(config: dict[str, Any]) -> dict[str, Any]:
+    """从 api 配置里取出 index 抽取调用参数（``index`` 段 + 顶层重试参数）。
 
     与 ``search.runner.gen_call_config`` 同一套做法：模型参数在子段里，重试参数在顶层，
     ``llm.chat_completion`` 需要的是合起来的一份。
     """
     merged: dict[str, Any] = {}
-    section = config.get("summary") or {}
+    section = config.get("index") or config.get("summary") or {}
     if isinstance(section, dict):
         merged.update(section)
     for key in ("timeout", "max_retries", "backoff_base", "rate_limit_backoff",
@@ -296,6 +286,6 @@ def debug_dump(store: UserStore, stream: Any | None = None) -> None:
     stream = stream or sys.stderr
     print(
         f"[store] user={store.user_id} root={store.root} "
-        f"sessions={len(store.sessions())} summaries={len(store.summaries())}",
+        f"sessions={len(store.sessions())}",
         file=stream,
     )

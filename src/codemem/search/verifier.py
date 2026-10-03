@@ -1,6 +1,6 @@
 """Verifier：对"这份 evidence 能不能回答这个问题"做独立判定。
 
-设计见 ``docs/search.md``。三条不可省的约束：
+设计见 ``docs/core.md``。三条不可省的约束：
 
 1. **只看 ``(question, evidence)``**，看不到 agent 的对话、检索过程、编辑历史。一个既能编辑
    又能宣布成功的 agent，最省力的动作永远是宣布成功 —— 旧版 NOOP 泛滥就是这一偏差的温和版本。
@@ -207,8 +207,9 @@ async def verify(
             "evidence.jsonl. Reading records without writing them down makes no progress."
         )
         missing.append(
-            "Write with `write` (whole file at once), then re-read the file to confirm it is "
-            "non-empty."
+            "Append with `edit`: "
+            '{"tool":"edit","args":{"path":"evidence.jsonl","append":"<one JSON record>\\n"}}. '
+            "Then re-read the file to confirm it is non-empty."
         )
         log.warn(
             f"verifier 跳过：evidence 为空（{'文件不存在/空' if not evidence_present else '全部被拒'}），"

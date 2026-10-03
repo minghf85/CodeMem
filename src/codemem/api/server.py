@@ -38,8 +38,8 @@ CONFIG_FILE = PROJECT_ROOT / "configs" / "api.yaml"
 DEFAULT_CONFIG: dict[str, Any] = {
     "generator": {"base_url": "http://127.0.0.1:30000/v1", "api_key": "sglang", "model": "local",
                   "temperature": 0.2, "max_tokens": 4096, "enable_thinking": False},
-    "summary": {"base_url": "http://127.0.0.1:30000/v1", "api_key": "sglang", "model": "local",
-                "temperature": 0.2, "max_tokens": 4096, "enable_thinking": False},
+    "index": {"base_url": "http://127.0.0.1:30000/v1", "api_key": "sglang", "model": "local",
+              "temperature": 0.2, "max_tokens": 4096, "enable_thinking": False},
     "store_dir": "data/api_store",
     "tool_config": "configs/tool.json",
     "concurrency": 8,
@@ -78,14 +78,14 @@ class ApiState:
     """进程级共享状态：配置、日志、模型客户端、并发闸门。
 
     客户端**长驻复用**（连接池 / keep-alive）；并发用 asyncio.Semaphore —— API 是单进程多协程，
-    一个信号量即可对 agent loop 与 summary 调用统一限流。
+    一个信号量即可对 agent loop 与索引抽取调用统一限流。
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
         self.log = Logger.from_config(config, prefix="api")
         self.client = llm.make_client(_client_config(config))
-        self.add_client = llm.make_client(_client_config(config, section="summary"))
+        self.add_client = llm.make_client(_client_config(config, section="index"))
         self.store_root = _resolve_dir(config.get("store_dir", "data/api_store"))
         self.tool_config = _resolve_path(config.get("tool_config", "configs/tool.json"))
         self.search_sem = asyncio.Semaphore(max(1, int(config.get("concurrency", 8))))

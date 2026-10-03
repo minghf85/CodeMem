@@ -1,12 +1,15 @@
-"""code agent 的四个通用工具：``read`` / ``write`` / ``edit`` / ``bash``。
+"""code agent 的三个通用工具：``read`` / ``edit`` / ``bash``。
 
 语义移植自 ``reference/tools.py``（原文件依赖未安装的 ``tau_agent`` 包），保留其关键行为：
 
 - ``read``：UTF-8 读文本，截断到 2000 行 / 50KB，附续读提示（offset/limit）。
-- ``write``：覆盖写，自动建父目录。
-- ``edit``：``edits[].oldText`` 必须**唯一且互不重叠**，**全部校验通过才落盘**；返回 diff。
+- ``edit``：两种模式 —— **append**（追加，文件不存在则创建）与 **replace**
+  （``edits[].oldText`` 必须**唯一且互不重叠**，**全部校验通过才落盘**）。**唯一的写文件工具。**
 - ``bash``：stdout+stderr 合并，**tail** 截断 2000 行 / 50KB，超时杀整个进程组；
-  支持 ``shell_command_prefix``（本方案用它注入 PATH / PYTHONPATH / 索引路径）。
+  支持 ``shell_command_prefix``（注入 PATH / PYTHONPATH / 语料目录）。
+
+**``write`` 已删除**：这套流程是逐条追加证据，``edit`` 的 append 模式覆盖了全部写入需求，
+保留一个"整份覆盖"入口反而把"一个会话写错就冲掉前面全部证据"的风险摆在那里。
 
 相对参考实现的三处必要改动（都是为了"agent 只允许写自己的工作目录"这条约束）：
 
@@ -533,15 +536,87 @@ def apply_edits(normalized: str, edits: list[dict[str, str]], path: str) -> tupl
 
 
 def create_edit_tool(*, cwd: Path, confine: bool = True) -> ToolDefinition:
+    """``edit`` —— **唯一的写文件工具**（覆盖写已删除）。
+
+    两种模式，靠参数二选一：
+
+    - **replace**：``edits=[{oldText, newText}, ...]``，精确替换。用于修正已有记录。
+    - **append**：``append="<新记录>"``，把文本追加到文件末尾（**文件不存在则创建**）。
+
+    **为什么要有 append 模式**：这套流程是"每看完一个 session 就记一条"，也就是**逐条追加**。
+    早先让模型用替换模式自己造 ``oldText``（拿已有的最后一行当锚点），实测 8B 经常复不出那
+    一行精确文本 —— 要么近似、要么留空，``edit`` 失败后退回 ``write`` 整份覆盖，把前面几个
+    session 的证据全冲掉。**追加是这套流程的一等操作，就该是一等参数**，不该让模型用替换去模拟。
+    同时 append 模式**文件不存在时直接创建**，修掉了"第一次追加时 evidence.jsonl 还不存在、
+    edit 直接报 File not found"这个 bug —— 反复出现的 edit 失败里，第一个 session 那次必然踩到。
+
+    追加的防护：``append`` 文本为空 → 拒绝（空写只可能是截断）；追加内容与文件末尾已有的
+    最后一条**逐字重复** → 拒绝（模型有时会把刚刚写过的又追加一遍）。
+    """
     async def execute(arguments: Mapping[str, Any]) -> ToolResult:
+        # 缺 `path` 时默认 evidence.jsonl：这是本流程**唯一**要写的文件，而 8B 实测会忘记
+        # 填 path（只给 append），旧行为是报 "path must be a string, got NoneType" —— 然后
+        # 它把整条一模一样的调用重复 10 次（每次都被重复检测拒掉），12 步全烧光、0 条证据。
+        # 与其为一个显然的默认值判错，不如替它补上。
+        if arguments.get("path") is None and arguments.get("append") is not None:
+            arguments = {**arguments, "path": "evidence.jsonl"}
         path = _path_arg(arguments, "path", cwd=cwd)
-        edits = _edits_arg(arguments)
         if confine:
             _ensure_inside(path, cwd)
-        if not path.exists():
-            raise ToolError(f"Could not edit file: {path}. File not found.")
         if path.is_dir():
             raise ToolError(f"Could not edit file: {path}. Path is a directory.")
+
+        # ---- append 模式（文件不存在则创建）----
+        if "append" in arguments and arguments.get("append") is not None:
+            appended = _str_arg(arguments, "append")
+            if not appended.strip():
+                raise ToolError(
+                    "append must not be empty -- an empty append is almost always a truncated "
+                    "or malformed record. Write the record text inside `append`."
+                )
+            existed = path.exists()
+            if existed:
+                previous = path.read_text(encoding="utf-8", errors="replace")
+            else:
+                previous = ""
+            # 逐字重复防护：新内容与文件里已有的最后一条完全相同 → 拒绝。
+            # 模型偶尔会把刚写过的记录又追加一遍（它看不到自己写的内容时尤其如此）。
+            stripped = appended.strip()
+            if existed and stripped:
+                existing_lines = [line.strip() for line in previous.splitlines() if line.strip()]
+                if existing_lines and existing_lines[-1] == stripped:
+                    raise ToolError(
+                        f"That record is already the LAST line in {path.name} -- the file did "
+                        f"not change. Append a DIFFERENT record, or reply with plain text if "
+                        f"you are done."
+                    )
+            new_content = previous + appended + ("" if appended.endswith("\n") else "\n")
+            async with _FileLock(path):
+                atomic_write_text(path, new_content)
+            added_lines = appended.count("\n") + (0 if appended.endswith("\n") else 1)
+            return ToolResult(
+                text=(
+                    f"Appended {len(appended)} characters ({added_lines} line(s)) to "
+                    f"{path.name}"
+                    + (f" ({len(previous.splitlines())} -> {len(new_content.splitlines())} lines)."
+                       if existed else f" (created it).")
+                ),
+                details={
+                    "path": str(path), "mode": "append",
+                    "appended_chars": len(appended), "created": not existed,
+                    "previous_bytes": len(previous.encode()),
+                    "bytes": len(new_content.encode()),
+                },
+            )
+
+        # ---- replace 模式（精确替换）----
+        edits = _edits_arg(arguments)
+        if not path.exists():
+            raise ToolError(
+                f"Could not edit file: {path}. File not found. "
+                f"(To create it with your first record, use append instead: "
+                f'{{"tool":"edit","args":{{"path":"{path.name}","append":"<record>"}}}})'
+            )
 
         async with _FileLock(path):
             raw = path.read_text(encoding="utf-8")
@@ -558,7 +633,7 @@ def create_edit_tool(*, cwd: Path, confine: bool = True) -> ToolDefinition:
         diff = "\n".join(difflib.ndiff(old_lines, new_lines))
         return ToolResult(
             text=f"Successfully applied {len(edits)} replacement(s) to {path}.\n\n{diff}",
-            details={"path": str(path), "edits": len(edits), "diff": diff},
+            details={"path": str(path), "mode": "replace", "edits": len(edits), "diff": diff},
         )
 
     return ToolDefinition(
@@ -587,6 +662,39 @@ def _shell_executable() -> str | None:
     return shutil.which("bash")
 
 
+def _fix_grep_alternation(command: str) -> str:
+    """给"用了 ``|`` 却没加 ``-E``"的 grep 补上 ``-E``。
+
+    **这是 harness 该替模型兜住的一类错**，不是 prompt 能解决的：``grep "study|learn"``
+    在基本正则里 ``|`` 是**字面竖线**，于是这条命令永远匹配不到任何东西，返回空 ——
+    模型得到的观测是"没找到"，它据此判定"库里没有"，然后要么换词、要么直接放弃。
+    实测一次全量里 **95 次带 ``|`` 的 grep 有 63 次没加 ``-E``**，直接造成了若干条
+    零证据 QA（如 qa2 "What fields would Caroline pursue" 连查 12 次全是这种空 grep）。
+
+    判定要保守：只处理**确实在正则里用了 ``|`` 分隔**的情形。所以取第一条 ``grep``
+    之后引号里的那个 pattern 看有没有 ``|`` —— 不看整条命令（命令里其它地方的 ``|``
+    是管道，不能当 alternation）。已经带 ``-E`` / ``-e`` 的不动。
+    """
+    import re
+
+    def fix_one(match: re.Match[str]) -> str:
+        head, quote, pattern = match.group(1), match.group(2), match.group(3)
+        if "|" not in pattern:
+            return match.group(0)
+        # head 是 "grep -in " 这种（到 pattern 的开引号为止）；已有 -E/-e 就不动
+        if re.search(r"(?:^|\s)-[A-Za-z]*[Ee]", head):
+            return match.group(0)
+        # 在 grep 与其选项之后插入 -E：把 "grep -in " -> "grep -Ein "
+        new_head = re.sub(r"\bgrep\b(\s+-[A-Za-z]+)?", lambda m: "grep" +
+                          (m.group(1).rstrip() + "E" if m.group(1) else " -E"), head, count=1)
+        if new_head == head:  # 兜底：没匹配到就粗暴加 -E
+            new_head = head.replace("grep", "grep -E", 1)
+        return new_head + quote + pattern + quote
+
+    # 匹配 grep ... "<pattern>" 或 grep ... '<pattern>'（只看第一个引号串）
+    return re.sub(r'(\bgrep\b[^"\']*?)(["\'])([^"\']*)\2', fix_one, command, count=1)
+
+
 def create_bash_tool(
     *,
     cwd: Path,
@@ -600,6 +708,15 @@ def create_bash_tool(
 
     async def execute(arguments: Mapping[str, Any]) -> ToolResult:
         command = _str_arg(arguments, "command")
+        fixed = _fix_grep_alternation(command)
+        note = ""
+        if fixed != command:
+            note = (
+                f"\n\n[note: your grep used `|` as alternation but lacked `-E`, so it would "
+                f"have matched a literal `|` and found nothing. Ran it as: "
+                f"{fixed.splitlines()[0][:160]}]"
+            )
+            command = fixed
         timeout = _optional_float_arg(arguments, "timeout")
         if timeout is not None and timeout <= 0:
             raise ToolError("timeout must be greater than 0")
@@ -682,6 +799,7 @@ def create_bash_tool(
             status = f"Command exited with code {exit_code}"
         if status:
             output_text = f"{output_text}\n\n{status}" if output_text else status
+        output_text += note
 
         return ToolResult(
             text=output_text,
@@ -738,16 +856,18 @@ def build_tools(
     confine: bool = True,
     max_lines: int = DEFAULT_MAX_OUTPUT_LINES,
     max_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
-    protect_filenames: tuple[str, ...] = ("evidence.jsonl",),
 ) -> dict[str, ToolDefinition]:
     """建出这一套工具。返回 ``{name: ToolDefinition}``。
 
     描述与 schema 是**空壳**，由 ``toolcfg.apply_catalog`` 从 ``tool.json`` 填 ——
     元信息统一管理，执行器在此注册。
+
+    **只有三个工具**：``read`` / ``edit`` / ``bash``。**``write`` 已删除** —— 这套流程是逐条
+    追加证据，``edit`` 的 append 模式覆盖了全部写入需求，保留一个"整份覆盖"入口反而是把
+    "一个会话写错就冲掉前面全部证据"的风险摆在那里。
     """
     tools = [
         create_read_tool(cwd=cwd, max_lines=max_lines, max_bytes=max_bytes),
-        create_write_tool(cwd=cwd, confine=confine, protect_filenames=protect_filenames),
         create_edit_tool(cwd=cwd, confine=confine),
         create_bash_tool(
             cwd=cwd,

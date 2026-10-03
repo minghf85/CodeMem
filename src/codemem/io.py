@@ -333,9 +333,22 @@ def msg_time(record: dict[str, Any]) -> str:
     return memory_time(record)
 
 
-def is_summary(record: dict[str, Any]) -> bool:
-    """是不是 summary 记录（两层 summary 的产物，相对原始消息而言）。"""
-    return msg_role(record).lower() == "summary" or str(record.get("msg_id", "")).endswith("_summary")
+def msg_kind(record: dict[str, Any]) -> str:
+    """时间种类：``point`` / ``range`` / ``approx``（消解阶段写入；原始消息为空）。"""
+    value = record.get("time_kind")
+    return value if isinstance(value, str) else ""
+
+
+def source_content(record: dict[str, Any]) -> str:
+    """原始措辞（消解前）。未消解过的记录为空 —— 此时 ``content`` 就是原话。"""
+    value = record.get("source_content")
+    return value if isinstance(value, str) else ""
+
+
+def source_time(record: dict[str, Any]) -> str:
+    """原始时间词（会话时间戳）。未消解过的记录为空。"""
+    value = record.get("source_time")
+    return value if isinstance(value, str) else ""
 
 
 def make_session_record(
