@@ -507,14 +507,24 @@ def salvage_json_object(raw: str) -> dict | None:
 ATOM_AGENT_STANDARD = """An atom is ONE self-contained fact that a reader can understand with no conversation and no other atom. Every atom must pass all of these:
 
 1. SELF-CONTAINED. It names its subject explicitly (a real name), so it makes sense alone. Never "he"/"she"/"it"/"there" as the only reference.
-2. ONE FACT. One core fact per atom. Split compound sentences (and / or / &) into separate atoms -- extract EVERY element, never selectively.
-3. TIME RESOLVED. If the message carries time, the atom's `time` must be self-contained: an absolute time ("7 May 2023") or a relative phrase that carries its own anchor ("the week before 9 June 2023"). A bare "yesterday"/"last week" is NOT allowed -- the message's own session time is the anchor. Match the source's granularity exactly: "last year" -> "2022", never a day; "yesterday" -> the exact date. Empty string when the fact has no time.
+2. ONE FACT. One core fact per atom. Split compound sentences (and / or / &) into SEPARATE facts -- extract EVERY element, never selectively. But splitting is NOT paraphrasing: five rewordings of the SAME fact are NOT five atoms (see 10).
+3. TIME CARRIES EVERYTHING. The `time` field must hold ALL of the fact's temporal information, not just the session date. Never drop a duration, an age, or a span into the wording while leaving `time` as the plain session date.
+   - POINT (a single dated event): the absolute date. "I went yesterday" (msg dated 8 May 2023) -> `2023-05-07`.
+   - DURATION / "N ago" / age (the fact began N units before the anchor): put the START or a SPAN in `time`. "...married 5 years" said on 9 June 2023 -> `2018` (or `2018/2023-06-09`); if you cannot compute it, write the anchored phrase `5 years before 9 June 2023`.
+   - RANGE (a period): `2023-06-01/2023-06-15`, or the anchored phrase ("the week before 9 June 2023").
+   - RECURRING: keep the recurrence ("every Sunday", "annual").
+   - NO TIME: empty string "".
+   - SELF-CONTAINED anchor: a bare "yesterday"/"last week" is NOT allowed -- the message's own session time is the anchor.
+   - PRECISION, NEVER MORE: match the source's granularity -- "last year" -> `2022`, never a day; only compute a finer date when the arithmetic is certain.
+   - Keep the number in the wording too, so the fact reads naturally ("Melanie married her husband in 2018 (5 years as of 9 June 2023).").
 4. REFERENCES RESOLVED. Replace every pronoun / pointing word with what it really is (real name / real place / real thing / resolved time). If you cannot tell what a pronoun means, search the earlier messages and summaries for it -- do not guess.
 5. A FACT, NOT AN ACT. Do not store greetings, thanks, bare questions, or the act of speaking. A turn that is only a greeting yields no atom.
 6. IMPLIED DURABLE FACTS COUNT. A turn mentioning a lasting attribute implies that attribute as its own atom: "swamped with the kids & work" implies BOTH "Melanie has kids" AND "Melanie has a job"; "my husband and I" implies "X has a spouse". Extract these even from casual turns.
-7. WHAT GREETINGS CARRY COUNTS. Nicknames, address forms, terms of endearment ARE facts: "Hey Mel!" -> "Mel is a nickname for Melanie". Extract the INFORMATION, never the greeting act.
+7. WHAT GREETINGS CARRY COUNTS. Nicknames, address forms, terms of endearment ARE facts: "Hey Mel!" -> "Mel is a nickname for Melanie" (and only when the two names actually DIFFER -- never "Melanie is a nickname for Melanie"). Extract the INFORMATION, never the greeting act.
 8. NO FABRICATION. Never invent a fact, a name, a date, or a detail the message does not state or clearly imply.
 9. KEEP THE SOURCE'S WORDS where you can. Only rephrase for pronoun resolution, article insertion, or minimal tense normalization.
+10. CHECK BEFORE YOU WRITE. Before writing, grep atommem.jsonl for the fact's key word. If the fact is ALREADY there, do NOT write it again -- not even reworded. One fact = one atom, always. (Bad: emitting "Melanie has been married for 5 years" AND "Melanie married 5 years ago" AND "Melanie's marriage began 5 years ago" -- that is ONE fact written three ways.)
+11. MERGE, DO NOT DUPLICATE. If the fact already exists as an atom but the target message adds something -- a new detail, a resolved time, a later confirmation -- REWRITE that existing atom with `edit` (replace mode) so it stays ONE atom. Record every supporting message id in its `source`. Only APPEND when the fact is genuinely new.
 
 Style: third person, starting with the subject's name. "Caroline went to an LGBTQ support group on 7 May 2023." (good) / "Went to a support group" (bad -- no subject)."""
 
@@ -552,7 +562,7 @@ You are a code agent with `read`, `edit`, and `bash` tools. You work in a direct
 - You fill ONLY `memory` and `metadata.{time, role, tag}`. Do NOT emit `id`, `source`, `type`, or `changelog` -- the system adds them.
 - Write TARGET facts only. Use the other messages ONLY to resolve references; never write an atom for a fact stated entirely in another message.
 - If the TARGET is a bare greeting or a question with no fact, write nothing and finish immediately.
-- Do NOT edit msgmem.jsonl or summem.jsonl -- only atommem.jsonl is yours to append.
+- Do NOT edit msgmem.jsonl or summem.jsonl -- only atommem.jsonl is yours. You may `edit` it in both modes: APPEND a new atom, or REPLACE an existing one to merge/evolve it (see rule 11).
 - When you have written the target's atoms, reply with plain text (no JSON) to finish.
 """
 
@@ -568,7 +578,13 @@ ATOM_AGENT_USER_PROMPT = """## The conversation is split into these sessions
 
 {target}
 
-Extract this ONE message's atomic facts. Search the memory files first if you need to resolve a pronoun or a reference, then append each atom to atommem.jsonl (only `memory` + `metadata.{{time, role, tag}}`). Reply with plain text when done.
+Extract this ONE message's atomic facts. Work in this order:
+
+1. If you need a pronoun or reference resolved, grep the earlier messages/summaries first.
+2. For each fact the message yields, grep atommem.jsonl for its key word to see whether it is ALREADY there. If yes -- REWRITE that atom with `edit` (replace mode) so it stays one atom and add this message's id to its `source`; do NOT append a duplicate. If no -- APPEND it.
+3. Put every time the fact carries into `time` (see the TIME standard): compute "N ago"/durations to a start date or span when you can, otherwise keep the anchored phrase.
+
+Write only `memory` + `metadata.{{time, role, tag}}` for a new atom. Reply with plain text when done.
 """
 
 

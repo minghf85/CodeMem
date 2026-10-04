@@ -1429,38 +1429,137 @@ def test_add_memory_module(tmp: Path) -> None:
     check("summem 解析：纯文本兜底", summem_mod.parse_summary("just a summary") == "just a summary")
     check("summem 解析：空输入 -> 空", summem_mod.parse_summary("") == "")
 
-    # --- atommem：finalize_atoms 补系统字段（模型只填 4 个字段）---
-    raw_atoms = [
+    # --- atommem：finalize_file 补系统字段 + 合并/演化 + 去重兜底 ---
+    # 场景 1：全部是新行（before 空）—— 模型只填 4 个字段
+    new_atoms = [
         {"memory": "Caroline went to a group on 7 May 2023",
          "metadata": {"time": "7 May 2023", "role": "Caroline", "tag": ["activity:group"]}},
         {"memory": "Melanie has kids", "metadata": {}},                 # 缺 time/role -> 回落
         {"memory": "", "metadata": {}},                                 # 空 -> 丢弃
-        {"memory": "Caroline went to a group on 7 May 2023", "metadata": {}},
+        {"memory": "Caroline went to a group on 7 May 2023", "metadata": {}},  # 同事实 -> 去重
     ]
-    atoms = atommem_mod.finalize_atoms(
-        raw_atoms, source_id="session_1_3",
+    atoms = atommem_mod.finalize_file(
+        before={}, after=new_atoms, source_id="session_1_3",
         default_time="1:56 pm on 8 May, 2023", default_role="Caroline",
     )
-    check("finalize：空 memory 与重复被丢弃", len(atoms) == 2, str(len(atoms)))
+    check("finalize：空 memory 与同事实重复被丢弃", len(atoms) == 2, str(len(atoms)))
     check("finalize：id 顺序编号 session_1_3_K",
           [a["metadata"]["id"] for a in atoms] == ["session_1_3_1", "session_1_3_2"],
           str([a["metadata"]["id"] for a in atoms]))
     check("finalize：type 恒为 atom", all(a["metadata"]["type"] == "atom" for a in atoms))
-    check("finalize：source 恒为本 message 的 id",
-          all(a["metadata"]["source"] == ["session_1_3"] for a in atoms))
+    check("finalize：source 含本 message 的 id",
+          all("session_1_3" in a["metadata"]["source"] for a in atoms))
     check("finalize：changelog 被补", all(a["metadata"]["changelog"] for a in atoms))
     check("finalize：缺 time 时回落到会话时间",
           atoms[1]["metadata"]["time"] == "1:56 pm on 8 May, 2023")
     check("finalize：缺 role 时回落到说话人", atoms[1]["metadata"]["role"] == "Caroline")
-    # 模型若违规带了 id/source/type，一律被覆盖
-    overridden = atommem_mod.finalize_atoms(
-        [{"memory": "x", "metadata": {"id": "hack", "type": "inner", "source": ["bad"]}}],
+
+    # 场景 2：模型带了假 id/source/type —— 作为新行一律被覆盖
+    overridden = atommem_mod.finalize_file(
+        before={}, after=[{"memory": "x", "metadata": {"id": "hack", "type": "inner", "source": ["bad"]}}],
         source_id="session_9_9", default_time="", default_role="R",
     )
     check("finalize：覆盖模型带的 id/type/source",
           overridden[0]["metadata"]["id"] == "session_9_9_1"
           and overridden[0]["metadata"]["type"] == "atom"
           and overridden[0]["metadata"]["source"] == ["session_9_9"])
+
+    # 场景 3：合并/演化 —— 已有 atom 被改写（保留 id / 累加 source / changelog 记旧值）；
+    # 另一条被删除（吸收进合并后的那条）；再新增一条续号。
+    before = {
+        "session_3_16_1": {"memory": "Melanie married 5 years ago",
+                           "metadata": {"id": "session_3_16_1", "type": "atom", "time": "2018",
+                                        "role": "Melanie", "tag": [], "source": ["session_3_16"],
+                                        "changelog": [{"time": "t0", "content": "created"}]}},
+        "session_3_16_2": {"memory": "Melanie is married",
+                           "metadata": {"id": "session_3_16_2", "type": "atom", "time": "",
+                                        "role": "Melanie", "tag": [], "source": ["session_3_16"],
+                                        "changelog": [{"time": "t0", "content": "created"}]}},
+    }
+    after = [
+        # 合并：把 _1 改写成更完整的一条，source 收下两个 message id
+        {"memory": "Melanie married her partner in 2018",
+         "metadata": {"id": "session_3_16_1", "time": "2018", "role": "Melanie", "tag": [],
+                      "source": ["session_3_16", "session_8_16"]}},
+        # _2 被删（吸收进 _1）——after 里不再出现；
+        # 新增一条**全新事实**（无 id）-> 续号为 session_3_16_3
+        {"memory": "Melanie's partner is her husband", "metadata": {"time": "", "role": "Melanie", "tag": []}},
+    ]
+    merged = atommem_mod.finalize_file(
+        before=before, after=after, source_id="session_8_16",
+        default_time="1:51 pm on 15 July, 2023", default_role="Melanie",
+    )
+    by_id = {a["metadata"]["id"]: a for a in merged}
+    check("合并：改写保留原 id 且累加 source",
+          by_id["session_3_16_1"]["metadata"]["source"] == ["session_3_16", "session_8_16"],
+          str(by_id.get("session_3_16_1", {}).get("metadata", {}).get("source")))
+    check("合并：changelog 记下改动前的 memory",
+          any(c["content"] == "Melanie married 5 years ago"
+              for c in by_id["session_3_16_1"]["metadata"]["changelog"]))
+    check("合并：新增行续号用**本 message** 的 id（session_8_16_1）",
+          "session_8_16_1" in by_id, str(sorted(by_id)))
+    check("合并：被删的行不再出现（_2 已消失）",
+          all(a["metadata"]["id"] != "session_3_16_2" for a in merged))
+    check("合并：新原子只带本 message 的 source（忽略模型自带）",
+          by_id["session_8_16_1"]["metadata"]["source"] == ["session_8_16"],
+          str(by_id["session_8_16_1"]["metadata"]["source"]))
+
+    # 场景 4：CPU 去重兜底 —— 大小写/标点不同的同事实合并成一条，source 取并集
+    dup = atommem_mod.finalize_file(
+        before={}, after=[
+            {"memory": "Melanie painted a lake sunrise last year.", "metadata": {"source": ["s1"]}},
+            {"memory": "melanie painted a lake sunrise last year", "metadata": {"source": ["s2"]}},
+        ],
+        source_id="session_4_1", default_time="", default_role="Melanie",
+    )
+    check("去重兜底：标点/大小写差异的同事实合成一条", len(dup) == 1, str(len(dup)))
+    check("去重兜底：新原子只带本 message id（模型自带 source 被忽略）",
+          dup[0]["metadata"]["source"] == ["session_4_1"],
+          str(dup[0]["metadata"]["source"]))
+
+    # 场景 5（回归）：**未被改动的旧 atom 不能累积本 message 的 source**。
+    # 旧版把所有 before 里的行都当"被改写"，每处理一条 message 就给全库每个 atom 的
+    # source 追加一个 id —— 20 条 message 后每个 source 涨到 ~20，检索/幂等全乱。
+    untouched = atommem_mod.finalize_file(
+        before={"session_1_1_1": {"memory": "Melanie has kids",
+                                  "metadata": {"id": "session_1_1_1", "type": "atom", "time": "",
+                                               "role": "Melanie", "tag": [], "source": ["session_1_1"],
+                                               "changelog": [{"time": "t0", "content": "created"}]}}},
+        after=[{"memory": "Melanie has kids",
+                "metadata": {"id": "session_1_1_1", "type": "atom", "time": "", "role": "Melanie",
+                             "tag": [], "source": ["session_1_1"],
+                             "changelog": [{"time": "t0", "content": "created"}]}},
+               {"memory": "Melanie adopted a cat", "metadata": {"time": "", "role": "Melanie", "tag": []}}],
+        source_id="session_1_2", default_time="", default_role="Melanie",
+    )
+    untouched_by_id = {a["metadata"]["id"]: a for a in untouched}
+    check("回归：未被改动的旧 atom 不累加本 message source",
+          untouched_by_id["session_1_1_1"]["metadata"]["source"] == ["session_1_1"],
+          str(untouched_by_id["session_1_1_1"]["metadata"]["source"]))
+    check("回归：本 message 的新事实仍正确落 source",
+          untouched_by_id["session_1_2_1"]["metadata"]["source"] == ["session_1_2"],
+          str(untouched_by_id.get("session_1_2_1", {}).get("metadata", {}).get("source")))
+
+    # 场景 6：**近义去重兜底** —— 同一事实的不同措辞合并（source 并集）；
+    # 主客体颠倒（Caroline 欣赏 Melanie vs Melanie 欣赏 Caroline）**不能**误合并。
+    nd = atommem_mod._dedup_atoms([
+        {"memory": "Caroline believes adoption is a great way to add to a family",
+         "metadata": {"id": "a", "source": ["session_1_1"]}},
+        {"memory": "Caroline mentions adoption is a great way to add to a family",
+         "metadata": {"id": "b", "source": ["session_1_2"]}},
+        {"memory": "Melanie appreciates Caroline's support",
+         "metadata": {"id": "c", "source": ["session_1_3"]}},
+        {"memory": "Caroline appreciates Melanie's support",
+         "metadata": {"id": "d", "source": ["session_1_4"]}},
+    ])
+    nd_by_id = {a["metadata"]["id"]: a for a in nd}
+    check("近义去重：换说法的同事实合并成一条",
+          len(nd) == 3 and "b" not in nd_by_id, str(sorted(nd_by_id)))
+    check("近义去重：合并后 source 取并集",
+          nd_by_id["a"]["metadata"]["source"] == ["session_1_1", "session_1_2"],
+          str(nd_by_id.get("a", {}).get("metadata", {}).get("source")))
+    check("近义去重：主客体颠倒的不同事实不误合并",
+          "c" in nd_by_id and "d" in nd_by_id, str(sorted(nd_by_id)))
 
 
 async def test_atommem_agent(tmp: Path) -> None:
@@ -1513,9 +1612,11 @@ async def test_atommem_agent(tmp: Path) -> None:
         check("atommem：处理了 2 条 message", result["messages"] == 2, str(result))
         check("atommem：写出了 atom", result["atoms"] >= 1, str(result))
         content = (sample / "atommem.jsonl").read_text(encoding="utf-8")
+        # 假模型对两条 message **append 同一句** —— 第二条是"重复追加"，不改变 source
+        # （真正的跨 message 合并要 agent 用 edit replace + 显式写 source，见场景 3）。
         check("atommem：atom 带系统补的 id/source/type",
-              '"id": "session_1_1_1"' in content and '"source": ["session_1_1"]' in content
-              and '"type": "atom"' in content, content[:300])
+              '"id": "session_1_1_1"' in content and '"type": "atom"' in content
+              and '"source": ["session_1_1"]' in content, content[:300])
         check("atommem：memory 是 agent 写的 fact",
               "Melanie has kids" in content, content[:300])
     finally:

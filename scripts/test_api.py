@@ -225,7 +225,7 @@ def test_endpoints(tmp: Path) -> None:
     atoms = read_jsonl(store.atommem_path)
     check("atommem 有原子且补齐系统字段",
           atoms and atoms[0]["metadata"]["type"] == "atom"
-          and atoms[0]["metadata"]["source"] == ["session_1_1"],
+          and "session_1_1" in atoms[0]["metadata"]["source"],
           str(atoms[:1]))
     check("atom 的 memory 消解了时间",
           atoms and "7 May 2023" in atoms[0]["memory"], str(atoms[:1]))

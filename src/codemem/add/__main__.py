@@ -20,7 +20,7 @@ search 用同一套 grep/read 检索它们。
 **atommem 的核心原理**：逐个 message 处理。后面的 message 的信息可能受**前面内容**影响、
 可能**跨 session 影响**，所以处理一条 message 时，agent 需要在 msgmem/summem/已有的 atommem
 里检索前面**相关的**信息，才能把指代消解对、把隐含事实补全 —— 于是它是一个 agent loop
-（默认 ``max_step=6``），工具与 search 一样是 ``read`` / ``edit`` / ``bash``。
+（默认 ``max_step=8``），工具与 search 一样是 ``read`` / ``edit`` / ``bash``。
 
 用法::
 

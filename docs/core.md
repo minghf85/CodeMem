@@ -110,7 +110,7 @@ python -m codemem.add --stage atommem --limit-messages 20   # 只跑前 20 条 m
 |---|---|---|---|
 | `msgmem.jsonl` | `msg` | 每条原始消息（**原话**）；`time` 是会话时间戳，`role` 是说话人真名 | 纯 CPU，由 dataset 直接转换 |
 | `summem.jsonl` | `summary` | 每个会话一份总结 | LLM，**逐 session 一次** |
-| `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **add agent 逐 message 处理**，默认 `max_step=6` |
+| `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **add agent 逐 message 处理**，默认 `max_step=8` |
 
 记录格式对齐 `memory_template.jsonl`：
 
@@ -172,11 +172,11 @@ atom 的 `time` 要么是绝对时间（`7 May 2023`），要么是带绝对锚�
 #### 逐消息 agent 怎么跑（`src/codemem/add/atommem.py`）
 
 ```bash
-# 每处理一条 message：一个 agent loop（read / edit / bash，≤ max_step=6 步）
+# 每处理一条 message：一个 agent loop（read / edit / bash，≤ max_step=8 步）
 #   system prompt：原子标准 + 三层记忆说明 + 检索策略 + 只填 4 个字段的协议
-#   user prompt：目标 message + 同会话前 N 条消息（消解窗口）+ 会话清单
-#   agent：grep 前面的 msgmem/summem/atommem 确认指代 → edit append 原子进 atommem.jsonl
-#   收尾：系统补 id / source / type / changelog（finalize_atoms）
+#   user prompt：目标 message + 同会话前 N 条消息（消解窗口=12）+ 会话清单
+#   agent：先 grep atommem 查重 → 已有则 edit replace 合并演化、没有才 edit append 新原子
+#   收尾：finalize_file 对比处理前后的快照，补 id / source / type / changelog
 ```
 
 **核心原理（用户原话）**：在已有的 msgmem/summem/atommem 中逐个 message 处理生成 atommem —— 后面的
@@ -186,7 +186,19 @@ message 的信息可能受前面内容影响、可能**跨 session 影响**，�
 - **串行**：同一目录内按 message 顺序**串行**（后面的 message 要看到前面已生成的 atommem）；
   **不同目录并行**。
 - **agent 只填四个字段**（`memory` + `metadata.{time, role, tag}`）；`id` / `source` / `type` /
-  `changelog` 由系统在 `finalize_atoms` 收尾时补上 —— 省了 agent 的力气，也保证这些字段永远正确。
+  `changelog` 由系统在 `finalize_file` 收尾时补上 —— 省了 agent 的力气，也保证这些字段永远正确。
+- **合并 / 演化（`finalize_file`）**：收尾时对比处理前的快照（`id -> record`）与处理后的整份文件，
+  分成三种情况 ——
+  - **新增行**（没有系统 `id`）：补 `id = {本 message}_k`（续号不撞已有），`source=[本 message]`，
+    `changelog=[created]`。
+  - **改写行**（`id` 在快照里，且内容变了）：**保留原 id**，`source` 收下 agent 写的多来源 id 并
+    补上本 message，`changelog` 追加一条**改动前的 memory**（这就是"演化"）。
+  - **原样行**（`id` 在快照里，内容没变 = agent 没碰）：**原样保留，绝不把本 message 的 id 塞进它的
+    source** —— 否则每处理一条 message，全库旧 atom 的 source 都会多一个 id。
+  - **消失行**：尊重删除（合并时"吸收进另一条"）。
+  - 最后按 memory 归一化做一次 **CPU 去重兜底**：同一事实（大小写/标点差异）只留一条，`source` 取并集。
+- **`time` 承载该事实的**全部**时间信息**：时点 → 绝对日期；时长/年龄/"N ago" → 起点或区间；区间 →
+  `YYYY-MM-DD/YYYY-MM-DD` 或带锚点措辞；无时间 → `""`。精度只减不增。
 - **增量/幂等**：重跑一条 message 时，先把 atommem 里 `source` 指向它的旧 atom 去掉、再重新生成
   （"就地覆盖是幂等的"的 agent 版）。
 
@@ -1344,8 +1356,8 @@ python scripts/test_api.py          # 封装 API 自测（37 项）
       升级为**分层**——`msgmem.jsonl`（`type=msg`，原话 + 会话时间锚点，纯 CPU 转换）/
       `summem.jsonl`（`type=summary`，逐 session 一次 LLM 总结）/ `atommem.jsonl`
       （`type=atom`，**add agent 逐 message 处理**：复用 search 的 `run_agent_round` /
-      `build_tools` / `ToolCatalog`，默认 `max_step=6`，agent 只填 `memory` + `metadata.{time,
-      role, tag}`，`id`/`source`/`type`/`changelog` 由 `finalize_atoms` 系统补）。记录格式对齐
+      `build_tools` / `ToolCatalog`，默认 `max_step=8`，agent 只填 `memory` + `metadata.{time,
+      role, tag}`，`id`/`source`/`type`/`changelog` 由 `finalize_file` 系统补、并支持合并演化）。记录格式对齐
       `memory_template.jsonl`。同目录逐 message **串行**（后面的 message 能 grep 到前面已生成的
       atommem，消解跨 session 指代）、不同目录并行；按 `source` 增量覆盖 = 幂等。search 语料换成
       硬链的三个记忆文件；api 的 `store.append` 在返回前重建该会话的 summem + atommem。

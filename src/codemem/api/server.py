@@ -46,8 +46,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "concurrency": 8,
     "add_concurrency": 8,
     "top_k": 100,
-    # Add 侧：summem / atommem 的预算（atommem 是逐 message 的 add agent，默认 6 步）
-    "add_max_steps": 6,
+    # Add 侧：summem / atommem 的预算（atommem 是逐 message 的 add agent，默认 8 步）
+    "add_max_steps": 8,
     "timeout": 300,
     "max_retries": 3,
     "backoff_base": 2.0,
