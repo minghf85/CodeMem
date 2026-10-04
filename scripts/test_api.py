@@ -28,6 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import codemem.llm as llm_mod  # noqa: E402
+from codemem.io import read_jsonl  # noqa: E402
 from codemem.api import retriever, store as store_mod  # noqa: E402
 from codemem.api.models import normalize_content  # noqa: E402
 from codemem.api.server import create_app  # noqa: E402
@@ -63,8 +64,8 @@ async def fake_chat_completion(client, config, messages):  # noqa: ANN001
     必须是 **async**（真实现是 async；这里替换它，签名要一致）。
 
     - verifier（"evidence auditor"）→ 判足够
-    - resolve（"You rewrite ONE message"）→ 消解后的 content/time
-    - agent（默认）→ 第一轮写 evidence.jsonl，之后回纯文本表示完成
+    - summem（"You summarize ONE session"）→ 一段会话总结
+    - atommem agent（默认）→ 第一轮 append 一条 atom，之后回纯文本表示完成
     """
     system = str(messages[0].get("content", "")) if messages else ""
 
@@ -76,19 +77,29 @@ async def fake_chat_completion(client, config, messages):  # noqa: ANN001
             "sufficient": True,
         })
 
-    if "You rewrite ONE message" in system:
+    if "You summarize ONE session" in system:
         return json.dumps({
-            "content": "Caroline went to a LGBTQ support group on 7 May 2023.",
-            "time": "7 May 2023", "time_kind": "point", "time_raw": "yesterday",
+            "memory": "Caroline went to a LGBTQ support group on 7 May 2023.",
         })
 
-    # agent loop: 第一轮 append 一条证据，之后回纯文本表示完成
+    # search 的 agent loop（system 说 "You build the evidence"）：写 evidence.jsonl
+    if "You build the evidence" in system or "evidence.jsonl" in system:
+        has_assistant = any(m.get("role") == "assistant" for m in messages)
+        if not has_assistant:
+            body = json.dumps(_EVIDENCE_RECORD, ensure_ascii=False) + "\n"
+            return json.dumps({"tool": "edit", "args": {
+                "path": "evidence.jsonl", "append": body}})
+        return "The evidence already answers the question."
+
+    # atommem agent: 第一轮 append 一条 atom，之后回纯文本表示完成
     has_assistant = any(m.get("role") == "assistant" for m in messages)
     if not has_assistant:
-        body = json.dumps(_EVIDENCE_RECORD, ensure_ascii=False) + "\n"
-        return json.dumps({"tool": "edit", "args": {
-            "path": "evidence.jsonl", "append": body}})
-    return "The evidence already answers the question."   # 纯文本 = 完成信号
+        body = json.dumps({
+            "memory": "Caroline went to an LGBTQ support group on 7 May 2023.",
+            "metadata": {"time": "7 May 2023", "role": "Caroline", "tag": ["activity:group"]},
+        }, ensure_ascii=False) + "\n"
+        return json.dumps({"tool": "edit", "args": {"append": body}})
+    return "The atoms are written."   # 纯文本 = 完成信号
 
 
 def _install_fake_model() -> None:
@@ -152,11 +163,13 @@ def _app_with_temp_store(tmp: Path):
     config = {
         "store_dir": str(tmp / "store"),
         "tool_config": str(PROJECT_ROOT / "configs" / "tool.json"),
+        "add_tool_config": str(PROJECT_ROOT / "configs" / "add_tool.json"),
         "generator": {"base_url": "http://127.0.0.1:1/v1", "model": "fake"},
         "index": {"base_url": "http://127.0.0.1:1/v1", "model": "fake"},
         "top_k": 100,
         "concurrency": 4,
         "add_concurrency": 4,
+        "add_max_steps": 6,
         "max_steps": 6,
         "max_verify_rounds": 2,
         "log": {"level": "error", "output": ""},
@@ -193,34 +206,42 @@ def test_endpoints(tmp: Path) -> None:
           and body["session_id"] == add_body["session_id"])
 
     store = store_mod.UserStore(add_body["user_id"], Path(app.state.api.store_root))
-    sessions_after_first = store.sessions()
-    check("写入了 2 条消息", len(sessions_after_first) == 2)
-    check("msg_id 形如 session_1_1", sessions_after_first[0]["msg_id"] == "session_1_1")
-    check("原始会话时间锚点保留在 source_time",
-          sessions_after_first[0]["source_time"] == "2023-05-08T16:00:00Z")
-    check("消息已被消解（content 是消解结果）",
-          "7 May 2023" in sessions_after_first[0]["content"]
-          and sessions_after_first[0]["time"] == "7 May 2023"
-          and sessions_after_first[0]["time_kind"] == "point",
-          str(sessions_after_first[0]))
-    check("原话保留在 source_content",
-          sessions_after_first[0]["source_content"] == "I went to a LGBTQ support group yesterday")
-    check("消息落在 sessions/session_1.jsonl",
-          (store.root / "sessions" / "session_1.jsonl").exists())
+    msgs = store.sessions()
+    check("msgmem 写入 2 条消息", len(msgs) == 2)
+    check("id 形如 session_1_1", msgs[0]["metadata"]["id"] == "session_1_1")
+    check("type=msg", msgs[0]["metadata"]["type"] == "msg")
+    check("memory 是原始消息", msgs[0]["memory"] == "I went to a LGBTQ support group yesterday")
+    check("原始会话时间锚点保留在 time",
+          msgs[0]["metadata"]["time"] == "2023-05-08T16:00:00Z")
+    check("role 是原始说话人", msgs[0]["metadata"]["role"] == "user")
+    check("msgmem.jsonl 已落盘", store.msgmem_path.exists())
+    # 返回前已生成 summem 与 atommem（"Add 返回即立即可检索"）
+    check("summem.jsonl 已生成", store.summem_path.exists())
+    check("summem 有一条会话总结",
+          any((r.get("metadata") or {}).get("type") == "summary"
+              for r in read_jsonl(store.summem_path)),
+          store.summem_path.read_text()[:200])
+    check("atommem.jsonl 已生成", store.atommem_path.exists())
+    atoms = read_jsonl(store.atommem_path)
+    check("atommem 有原子且补齐系统字段",
+          atoms and atoms[0]["metadata"]["type"] == "atom"
+          and atoms[0]["metadata"]["source"] == ["session_1_1"],
+          str(atoms[:1]))
+    check("atom 的 memory 消解了时间",
+          atoms and "7 May 2023" in atoms[0]["memory"], str(atoms[:1]))
 
     # 幂等：同一个 request_id 再送一次
     resp2 = client.post("/add", json=add_body)
     check("重放仍返回 200", resp2.status_code == 200)
     store2 = store_mod.UserStore(add_body["user_id"], Path(app.state.api.store_root))
     check("幂等：语料未被重复写入", len(store2.sessions()) == 2, str(len(store2.sessions())))
-    check("幂等：消解语料也未变", len(store2.sessions()) == 2)
 
     # 同一 session 再追加（新 request_id）→ 序号接续
     follow = dict(add_body, request_id="eval:run1:locomo:conv-0:chunk-1")
     follow["messages"] = [{"role": "user", "content": "Another message"}]
     client.post("/add", json=follow)
     store3 = store_mod.UserStore(add_body["user_id"], Path(app.state.api.store_root))
-    ids = [r["msg_id"] for r in store3.sessions()]
+    ids = [r["metadata"]["id"] for r in store3.sessions()]
     check("追加消息序号接续", ids == ["session_1_1", "session_1_2", "session_1_3"], str(ids))
 
     # 多 user 隔离

@@ -5,8 +5,8 @@
     "src/codemem/search/toolcfg.py 渲染注入；src/codemem/search/tools.py 只负责执行语义。",
     "改 agent 行为 = 改这里，不动代码。",
     "",
-    "**没有分层概览/印象层**：agent 拿到的是消解后的会话文件 + 三个工具，定位与取证全靠它自己。",
-    "语料已在 add 阶段消解（时间是绝对时间或带绝对锚点的相对时间；指代已换回原始含义），",
+    "**没有分层概览/印象层**：agent 拿到的是三个记忆文件（msgmem/summem/atommem）+ 三个工具，",
+    "定位与取证全靠它自己。原子记忆（atommem）是提炼过的、自足的事实（时间锚定、指代消解），",
     "所以 grep 一个词命中的就是能回答问题的原料，同一实体跨会话都写成同一个真名。",
     "",
     "**两种检索策略**（keyword 直达 / 通读相关 session）集成在一起，agent 运行中自行切换。",
@@ -119,36 +119,32 @@
   },
   "commands": {
     "grep": {
-      "summary": "Your search tool. One JSON object per line, so `-n` gives you line numbers you can hand to `read`.",
+      "summary": "Your search tool. All memory files are one JSON object per line, so `-n` gives you line numbers you can hand to `read`.",
       "recipes": [
         {
-          "why": "Find every place a word appears, across ALL session files. Multi-hop workhorse: grep one term, read what it names, grep THAT.",
-          "cmd": "grep -rin \"husband\" inputs/sessions/ | head -20"
+          "why": "Find every place a word appears, across ALL three memory files at once. Multi-hop workhorse: grep one term, read what it names, grep THAT.",
+          "cmd": "grep -rin \"husband\" inputs/ | head -20"
         },
         {
-          "why": "Find every session an entity turns up in. Because references and times are already resolved, the same name means the same thing everywhere -- this is the cross-session hop.",
-          "cmd": "grep -rin \"Caroline\" inputs/sessions/ | head -20"
+          "why": "Search only the atomic memories (the distilled facts). Because references and times are already resolved, the same name means the same thing everywhere -- this is the cross-session hop.",
+          "cmd": "grep -rin \"Caroline\" inputs/atommem.jsonl | head -20"
         },
         {
-          "why": "Read one session in full (each session is its own file). Use `grep -n` first to find the line, or read the whole file.",
-          "cmd": "read inputs/sessions/session_5.jsonl"
+          "why": "Find which session a topic came up in (the per-session summaries).",
+          "cmd": "grep -rin \"pottery\" inputs/summem.jsonl | head"
         },
         {
-          "why": "Several words at once (alternation), or a whole phrase, across all sessions.",
-          "cmd": "grep -Ein \"pottery|camping|painting|swimming\" inputs/sessions/ | head -30"
+          "why": "Several words at once (alternation), or a whole phrase, across all memory files.",
+          "cmd": "grep -Ein \"pottery|camping|painting|swimming\" inputs/ | head -30"
         },
         {
-          "why": "See the shape of the corpus (how many messages in total, and per session).",
-          "cmd": "wc -l inputs/sessions/*.jsonl"
-        },
-        {
-          "why": "See how many sessions there are.",
-          "cmd": "ls inputs/sessions/"
+          "why": "See the shape of the corpus (how many records per memory file).",
+          "cmd": "wc -l inputs/*.jsonl"
         }
       ]
     },
     "time": {
-      "summary": "Compute a date in bash when you need one (`date -d`). Do NOT do the arithmetic in your head -- you will get it wrong. Anchor on the session timestamp that every message carries. The environment is pinned to LC_ALL=C so month and weekday names always come out in English.",
+      "summary": "Compute a date in bash when you need one (`date -d`). Do NOT do the arithmetic in your head -- you will get it wrong. Anchor on the message's own session time. The environment is pinned to LC_ALL=C so month and weekday names always come out in English.",
       "recipes": [
         {
           "why": "Relative -> absolute. The raw form ('1:56 pm on 8 May, 2023') is accepted as-is.",
@@ -167,22 +163,24 @@
   },
   "workspace": {
     "layout": [
-      "inputs/sessions/session_1.jsonl, session_2.jsonl, ...  -- the corpus. ONE FILE PER SESSION. Each line is one message (msg_id = session_N_M). The wording is ALREADY RESOLVED: time is an absolute date or an absolute-anchored phrase (never a bare 'yesterday'), and pronouns are already replaced by names. So a line means the same thing with no context.",
-      "evidence.jsonl                -- YOUR output, in the working directory. One record per line."
+      "inputs/atommem.jsonl  -- the ATOMIC memories (id = session_N_M_K, type 'atom'). Each is ONE self-contained fact, already pronoun-resolved and time-anchored. START HERE: a line means the same thing with no context.",
+      "inputs/msgmem.jsonl   -- the RAW messages (id = session_N_M, type 'msg'). The exact wording and the concrete answer often live only here. Read it to confirm a specific fact or a date.",
+      "inputs/summem.jsonl   -- one summary per session (id = session_N_summary, type 'summary'). Use it to see WHICH session a topic came up in.",
+      "evidence.jsonl        -- YOUR output, in the working directory. One record per line."
     ],
     "rules": [
       "Never write under inputs/ -- it is read-only and your writes there are rejected.",
       "All files are JSONL: one record per line, so grep works on them directly and line numbers are stable.",
-      "Use `grep -rin \"word\" inputs/sessions/` to search ALL sessions at once (recursive), or `read inputs/sessions/session_5.jsonl` to read one session in full.",
-      "A session's messages all share the prefix `session_N_` (e.g. session_3_1). Because references are already resolved, a name you grep means the same entity in every session it appears in."
+      "Use `grep -rin \"word\" inputs/` to search ALL three memory files at once (recursive), or `read inputs/atommem.jsonl` to read the whole atom layer.",
+      "A session's records all share the prefix `session_N_` (atoms: session_N_M_K; messages: session_N_M). Because references are already resolved, a name you grep means the same entity in every session it appears in."
     ]
   },
-  "strategy": "Your goal: evidence.jsonl that, ON ITS OWN, lets a reader answer the question -- and it is also your notebook, so write down anything relevant you learn, not only the final answer.\n\nThere are TWO ways to search, and you mix them freely. You do NOT have to pick one up front: start with whichever the question suggests, and switch if it is not working.\n\n**Strategy 1 -- keyword lookup.** When the question names something concrete (a person, a place, a title, an object, an event), grep for it directly. The corpus is already RESOLVED -- times are absolute and pronouns are already names -- so a hit is usually close to the answer. Recipe: `grep -rin \"<key word>\" inputs/sessions/`. Every NEW name, number or date you read is a new key: grep THAT next. This is how a chain of facts connects.\n\n**Strategy 2 -- read through related sessions.** When the answer is a SET (\"what activities does X do\", \"where has X been\"), or is spread across several sessions, or you simply do not know what word to grep, then locate the relevant sessions and READ them end to end, collecting members as you go. Since references are resolved, one member named in one session is greppable to find its other sessions. Recipe: `grep -rln \"<key word>\" inputs/sessions/` gives the FILE list, then `read inputs/sessions/session_N.jsonl` each one.\n\n**Read, do not just grep, for SET / spread-out questions.** A grep hit is a pointer -- read the session around it for the exact fact, the time, and the ids you will cite. The answer often needs several sessions read together.\n\nDo not get stuck on one word: two empty greps mean try another word, or switch to reading. The corpus is small; when in doubt, read the sessions.",
+  "strategy": "Your goal: evidence.jsonl that, ON ITS OWN, lets a reader answer the question -- and it is also your notebook, so write down anything relevant you learn, not only the final answer.\n\nThere are TWO ways to search, and you mix them freely. You do NOT have to pick one up front: start with whichever the question suggests, and switch if it is not working.\n\n**Strategy 1 -- keyword lookup.** When the question names something concrete (a person, a place, a title, an object, an event), grep for it directly. The atomic memories are already RESOLVED -- times are absolute and pronouns are already names -- so a hit is usually close to the answer. Recipe: `grep -rin \"<key word>\" inputs/`. Every NEW name, number or date you read is a new key: grep THAT next. This is how a chain of facts connects.\n\n**Strategy 2 -- read through related sessions.** When the answer is a SET (\"what activities does X do\", \"where has X been\"), or is spread across several sessions, or you simply do not know what word to grep, then locate the relevant sessions (grep summem.jsonl) and READ them -- grep the session prefix (`session_N`) across the files, or read the messages. Collect members as you go. Because references are resolved, one member named in one session is greppable to find its other sessions.\n\n**Grep atommem first, read msgmem to confirm.** The atoms are distilled; the raw messages hold the exact wording and the concrete dates. When a fact matters, check it against msgmem.jsonl.\n\nDo not get stuck on one word: two empty greps mean try another word, or switch to reading. The corpus is small; when in doubt, read it.",
   "writing_policy": {
-    "headline": "Every fact you use MUST be written into evidence.jsonl. A downstream reader sees ONLY that file -- not the index, not the messages. Searching without writing makes no progress.",
+    "headline": "Every fact you use MUST be written into evidence.jsonl. A downstream reader sees ONLY that file -- not the memory files. Searching without writing makes no progress.",
     "rules": [
-      "SHAPE: {\"content\": \"<one self-contained statement>\", \"metadata\": {\"source\": [\"<msg_id>\", ...], \"score\": <0.0-1.0>}}. Input records have msg_id/role/time/content -- copying one straight in is REJECTED for having no source. Write the record yourself, listing the msg_ids you actually read.",
-      "**Write from what you READ, never from what you assume.** If you have not seen a message that states the fact, do not write the record -- search until you find it, or leave that part out. A confident guess with a plausible source id is the worst outcome: it looks right and is wrong.",
+      "SHAPE: {\"content\": \"<one self-contained statement>\", \"metadata\": {\"source\": [\"<id>\", ...], \"score\": <0.0-1.0>}}. Input records have memory/metadata.{id,time,role} -- copying one straight in is REJECTED for having no source. Write the record yourself, listing the ids you actually read.",
+      "**Write from what you READ, never from what you assume.** If you have not seen a record that states the fact, do not write the record -- search until you find it, or leave that part out. A confident guess with a plausible source id is the worst outcome: it looks right and is wrong.",
       "REASON, do not just copy. An event question may need two records joined into the one that states the conclusion. A personality/attribute question needs several scattered statements summarised into one record.",
       "You MAY add a record for a conclusion no single input record states. Its source must list every id you reasoned from.",
       "KEEP IT MINIMAL: 5-15 records is right for almost every question. Fewer, sharper records beat a dump.",
@@ -213,7 +211,7 @@
       {
         "name": "metadata.source",
         "required": true,
-        "note": "NON-EMPTY array of msg_ids whose CONTENT you actually read (e.g. [\"session_1_9\", \"session_1_11\"]). Never cite an id you only guessed or remembered -- if you did not read it, do not cite it."
+        "note": "NON-EMPTY array of record ids whose CONTENT you actually read (e.g. [\"session_1_9\", \"session_1_11_2\"]). A message id is `session_N_M`; an atom id is `session_N_M_K`. Never cite an id you only guessed or remembered -- if you did not read it, do not cite it."
       },
       {
         "name": "metadata.score",
@@ -228,9 +226,9 @@
     ]
   },
   "prompt": {
-    "system": "You build the evidence for ONE question. A downstream reader sees ONLY evidence.jsonl -- not the library -- so it must already contain the answer.\n\n# RESPONSE FORMAT\n\n{{PROTOCOL}}\n\n# HOW TO SEARCH\n\n{{STRATEGY}}\n\n# WRITE AS YOU GO\n\n- The moment a message gives you a fact the answer needs, write it with `edit` append. Do not save writes for the end.\n- Never finish with an empty file. Zero records scores zero no matter how well you searched.\n- Before finishing, re-read evidence.jsonl as if you had never seen the inputs: does it answer the question by itself, with no pronouns pointing outside it?\n\n# TOOLS\n\n{{TOOLS}}\n\n# COMMANDS (use through bash)\n\n{{COMMANDS}}\n\n# WORKSPACE\n\n{{WORKSPACE}}\n\n# TIME QUESTIONS\n\n{{TIME_POLICY}}\n\n# WHAT AN EVIDENCE RECORD IS\n\n{{SCHEMA}}\n\n{{WRITING_POLICY}}\n\n# WHAT MAKES A RECORD ACCEPTABLE\n\n{{EVIDENCE_STANDARD}}\n\n# RULES\n\n- NEVER guess an id. Input records are id'd by `msg_id` (`session_1_11`, `session_3`). List the real ones with `grep -oh '\"msg_id\": \"[^\"]*\"' inputs/sessions/ | head`.\n- A `source` must be an id whose content you actually saw -- not one you remember or guessed. The graph gives you session numbers to LOOK IN, never ids to cite.\n- Do not re-run the same grep and do not keep trying variants of one word. Two empty attempts mean it is not in that file: try another word, or read the sessions instead of grepping.\n- Never write under inputs/. Only evidence.jsonl matters.\n- When evidence.jsonl contains everything the question needs, reply with plain text (no JSON) to finish.\n\n# WORKED EXAMPLE (keyword search, one hop)\n\nQUESTION: When did Caroline go to the LGBTQ support group?\n\n`grep -rin \"support group\" inputs/sessions/`\n  --> session_1_3: Caroline: \"I went to a LGBTQ support group yesterday...\" (record time: 1:56 pm on 8 May, 2023)\n\nThe word 'yesterday' is relative to THAT message's own time:\n  `date -d \"8 May 2023 -1 day\" +\"%d %b %Y\"`  --> 07 May 2023\n\nAppend one record: content \"Caroline went to an LGBTQ support group on 7 May 2023 (she said 'yesterday' in the session of 8 May 2023).\", source [\"session_1_3\"].\n\n# WORKED EXAMPLE (Strategy 2: a set spread across sessions)\n\nQUESTION: What activities does Melanie partake in?\n\nThe answer is a SET and the words are unpredictable. Find which sessions are about her:\n`grep -rln \"Melanie\" inputs/sessions/`  ->  session_1.jsonl, session_2.jsonl, session_5.jsonl, session_9.jsonl\nRead each and collect members as you confirm them:\n`read inputs/sessions/session_5.jsonl`  ->  \"Melanie does pottery\", \"Melanie goes camping\" ...\nBecause times and names are already resolved, you can also grep a member to find its other sessions:\n`grep -rin \"violin\" inputs/sessions/`\nPut them in ONE record:\n{\"content\": \"Melanie's activities include pottery, camping, painting and swimming.\", \"metadata\": {\"source\": [\"session_5_12\", \"session_9_3\"], \"score\": 0.9}}\nReading every related session is how you avoid stopping at the first member.\n\n# THE QUESTION\n\n{{QUESTION}}",
-    "user_begin": "Answer this question from the conversation in inputs/. It is split into sessions -- one file per session under inputs/sessions/. Every line is already resolved: times are absolute (or anchored to an absolute date) and pronouns are already replaced by names, so a line means the same thing with no context.\n\nSessions that exist:\n\n{{SESSIONS}}\n\nYour goal is evidence.jsonl: records that answer the question on their own. It is also your notebook -- write down anything relevant you find, not only the final answer. Start searching (grep a key word, or read whole sessions), write each fact you confirm as you go, and reply with plain text (no JSON) when you are done.",
-    "user_gaps": "Your evidence does NOT yet answer the question.\n\nStill missing or unclear:\n{{MISSING}}\n\nFrom evidence alone you concluded:\n{{ATTEMPTED_ANSWER}}\n\nFix it -- go back to inputs/sessions/ and find what is missing. If the question is a set or is spread out, grep -rln the name to see every session it touches, then read the ones you skipped. Then write the missing records and reply with plain text (no JSON).",
+    "system": "You build the evidence for ONE question. A downstream reader sees ONLY evidence.jsonl -- not the memory files -- so it must already contain the answer.\n\n# RESPONSE FORMAT\n\n{{PROTOCOL}}\n\n# HOW TO SEARCH\n\n{{STRATEGY}}\n\n# WRITE AS YOU GO\n\n- The moment a memory gives you a fact the answer needs, write it with `edit` append. Do not save writes for the end.\n- Never finish with an empty file. Zero records scores zero no matter how well you searched.\n- Before finishing, re-read evidence.jsonl as if you had never seen the inputs: does it answer the question by itself, with no pronouns pointing outside it?\n\n# TOOLS\n\n{{TOOLS}}\n\n# COMMANDS (use through bash)\n\n{{COMMANDS}}\n\n# WORKSPACE\n\n{{WORKSPACE}}\n\n# TIME QUESTIONS\n\n{{TIME_POLICY}}\n\n# WHAT AN EVIDENCE RECORD IS\n\n{{SCHEMA}}\n\n{{WRITING_POLICY}}\n\n# WHAT MAKES A RECORD ACCEPTABLE\n\n{{EVIDENCE_STANDARD}}\n\n# RULES\n\n- NEVER guess an id. Input records are id'd in `metadata.id` (`session_1_11` for a message, `session_1_11_2` for an atom). List the real ones with `grep -oh '\"id\": \"[^\"]*\"' inputs/atommem.jsonl | head`.\n- A `source` must be an id whose content you actually saw -- not one you remember or guessed. The atoms give you facts to reason from; cite the ids you actually read.\n- Do not re-run the same grep and do not keep trying variants of one word. Two empty attempts mean it is not in that file: try another word, or read msgmem.jsonl instead of grepping.\n- Never write under inputs/. Only evidence.jsonl matters.\n- When evidence.jsonl contains everything the question needs, reply with plain text (no JSON) to finish.\n\n# WORKED EXAMPLE (keyword search, one hop)\n\nQUESTION: When did Caroline go to the LGBTQ support group?\n\n`grep -rin \"support group\" inputs/`\n  --> atommem: session_1_3_1: \"Caroline went to a LGBTQ support group on 7 May 2023.\" (anchor message session_1_3, time: 1:56 pm on 8 May, 2023)\n  --> msgmem:  session_1_3: Caroline: \"I went to a LGBTQ support group yesterday...\" (session time: 1:56 pm on 8 May, 2023)\n\nIf you needed to compute it yourself, 'yesterday' is relative to THAT message's own time:\n  `date -d \"8 May 2023 -1 day\" +\"%d %b %Y\"`  --> 07 May 2023\n\nAppend one record: content \"Caroline went to an LGBTQ support group on 7 May 2023 (she said 'yesterday' in the session of 8 May 2023).\", source [\"session_1_3\"].\n\n# WORKED EXAMPLE (Strategy 2: a set spread across sessions)\n\nQUESTION: What activities does Melanie partake in?\n\nThe answer is a SET and the words are unpredictable. Find which sessions are about her:\n`grep -rin \"Melanie\" inputs/atommem.jsonl`  --> atoms from several sessions\nRead the atoms and the messages of each to collect members:\n`grep -rin \"session_5\" inputs/msgmem.jsonl`  -->  \"Melanie does pottery\", \"Melanie goes camping\" ...\nBecause times and names are already resolved, you can also grep a member to find its other sessions:\n`grep -rin \"violin\" inputs/`\nPut them in ONE record:\n{\"content\": \"Melanie's activities include pottery, camping, painting and swimming.\", \"metadata\": {\"source\": [\"session_5_12\", \"session_9_3\"], \"score\": 0.9}}\nReading every related session is how you avoid stopping at the first member.\n\n# THE QUESTION\n\n{{QUESTION}}",
+    "user_begin": "Answer this question from the conversation in inputs/. It is split into three memory files: inputs/atommem.jsonl (the atomic facts -- already pronoun-resolved and time-anchored, so a line means the same thing with no context), inputs/msgmem.jsonl (the raw messages -- the exact wording and concrete dates), and inputs/summem.jsonl (one summary per session).\n\nSessions that exist:\n\n{{SESSIONS}}\n\nYour goal is evidence.jsonl: records that answer the question on their own. It is also your notebook -- write down anything relevant you find, not only the final answer. Start searching (grep a key word across inputs/, or read the atom layer / the messages), write each fact you confirm as you go, and reply with plain text (no JSON) when you are done.",
+    "user_gaps": "Your evidence does NOT yet answer the question.\n\nStill missing or unclear:\n{{MISSING}}\n\nFrom evidence alone you concluded:\n{{ATTEMPTED_ANSWER}}\n\nFix it -- go back to inputs/ and find what is missing. If the question is a set or is spread out, grep the name across inputs/ to see every session it touches, then read the ones you skipped. Then write the missing records and reply with plain text (no JSON).",
     "user_no_progress": "Several turns have passed without evidence.jsonl changing. If it is already sufficient, reply with plain text (no JSON) now. Otherwise make the change.",
     "user_steps_exhausted": "You have used your last turn. Reply with plain text (no JSON) now so your evidence can be evaluated."
   }

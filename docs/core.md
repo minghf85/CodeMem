@@ -12,10 +12,10 @@
 整个架构围绕**四个步骤**组织，依赖方向严格单向，步骤之间**只通过数据文件耦合**（不互相 import）：
 
 ```
-add ──► sessions/session_N.jsonl   （原始措辞 → 消解后上下文无关）
+add ──► msgmem.jsonl / summem.jsonl / atommem.jsonl   （原始话 + 会话总结 + 原子事实）
                              │
                              ▼
-search ──────────────► evidence.jsonl          （question + 记忆库 → 能回答该问题的记忆列表）
+search ──────────────► evidence.jsonl          （question + 三层记忆 → 能回答该问题的记忆列表）
                              │
                              ▼
 answer ──────────────► answers.jsonl           （question + evidence → 答案）
@@ -26,8 +26,8 @@ eval ────────────────► eval.jsonl / summary.js
 
 | 步骤 | 做什么 | 入口 |
 |---|---|---|
-| **add** | 一段对话记忆 → 消解后的会话文件（时间锚定 + 指代消解，上下文无关） | `python -m codemem.add` |
-| **search** | question + `sessions/` 语料 → `evidence.jsonl`（朴素 agent loop：检索 → 取证 → 验证） | `python -m codemem.search` |
+| **add** | 一段对话记忆 → 三层记忆文件（`msg` / `summary` / `atom`） | `python -m codemem.add` |
+| **search** | question + 三层记忆 → `evidence.jsonl`（朴素 agent loop：检索 → 取证 → 验证） | `python -m codemem.search` |
 | **answer** | question + `evidence.jsonl` → 答案（只用证据，不检索） | `python -m codemem.answer` |
 | **eval** | 答案正确性 + 指标（judge / token F1 / evidence recall / 失败归类） | `python -m codemem.eval` |
 
@@ -38,18 +38,21 @@ eval ────────────────► eval.jsonl / summary.js
 
 ```
 configs/
-  add.yaml      # add 的模型参数（session 阶段纯 CPU；resolve 阶段逐消息消解时间/指代）
+  add.yaml      # add 的模型参数（msgmem 阶段纯 CPU；summem 一次/session；atommem 逐消息 agent）
   search.yaml   # search 的 agent/检索/预算参数
   answer.yaml   # answer 的模型参数
   eval.yaml     # eval 的 judge 参数
-  tool.json     # search 的工具描述/schema/prompt/示例/检索策略引导（agent 上下文的单一事实源）
+  tool.json     # search 的工具描述/schema/prompt/示例/检索策略引导（检索 agent 上下文的事实源）
+  add_tool.json # add agent 的工具描述/prompt/原子标准（逐消息抽 atommem 用）
   api.yaml      # 封装 API 的模型/存储/预算参数
 data/
   correct_locomo10.json        # 原始对话数据（含 QA 与 evidence 标注）
   {speaker_a}_{speaker_b}/
-    sessions/session_N.jsonl   # add 产物：一次会话一个文件，已消解（时间锚定 + 指代消解）
+    msgmem.jsonl               # add 产物：逐条原始消息（type=msg，会话时间戳是锚点）
+    summem.jsonl               # add 产物：每会话一条总结（type=summary）
+    atommem.jsonl              # add 产物：逐消息抽出的原子事实（type=atom）
   search_runs/{experiment}_{ts}/   # search/answer/eval 的运行目录
-    {dir}/inputs/sessions/          只读输入（硬链的会话语料，每会话一个文件）
+    {dir}/inputs/                   只读输入（硬链的三层记忆文件）
     {dir}/qa_{idx}/evidence.jsonl   search 的产物
     answers.jsonl                   answer 的产物（该次运行的全部回答）
     eval.jsonl / summary.json       eval 的产物
@@ -57,8 +60,8 @@ data/
   api_store/{slug(user_id)}/   # 封装 API 的多用户语料（见 §4）
 src/codemem/
   io.py llm.py log.py dataset.py    # 共享层：四个步骤都依赖，自身不依赖任何步骤
-  prompts.py                        # 所有 prompt 常量（含 search 的证据标准 EVIDENCE_STANDARD）
-  add/    session.py resolve.py __main__.py
+  prompts.py                        # 所有 prompt 常量（search 的 EVIDENCE_STANDARD、add 的 ATOM_AGENT_STANDARD）
+  add/    msgmem.py summem.py atommem.py memory.py __main__.py
   search/ runner.py agent.py tools.py toolcfg.py verifier.py evidence.py
           prune.py __main__.py
   answer/ answer.py __main__.py
@@ -80,7 +83,7 @@ scripts/
 | `llm.py` | chat completion：退避/重试/截断检测/qwen3 关思考 |
 | `log.py` | 分级日志（终端 + 落盘，支持 `bind` 加前缀） |
 | `dataset.py` | LoCoMo 数据模型：sample/QA/evidence 映射（`D1:3` → `session_1_3` 的唯一实现） |
-| `prompts.py` | 各步骤的 prompt 常量。search 的**证据标准**（`EVIDENCE_STANDARD`）也在这里 |
+| `prompts.py` | 各步骤的 prompt 常量。search 的**证据标准**（`EVIDENCE_STANDARD`）与 add 的**原子标准**（`ATOM_AGENT_STANDARD`）都在这里 |
 
 ### 环境
 
@@ -92,105 +95,104 @@ Python 3.12+。`grep` / `date` 是系统自带命令，agent 直接通过 `bash`
 
 ---
 
-## 1. add — 把对话记忆添加进来（消解成上下文无关的形式）
+## 1. add — 把对话记忆添加进来（三层记忆）
 
 ```bash
-python -m codemem.add                      # session + resolve，全部目录
+python -m codemem.add                      # msgmem → summem → atommem，全部目录
 python -m codemem.add Caroline_Melanie     # 只处理指定目录
-python -m codemem.add --stage session      # 只跑第一步（纯 CPU，不调模型）
-python -m codemem.add --stage resolve --limit-sessions 3   # 只跑前 3 个 session（调试）
+python -m codemem.add --stage msgmem       # 只跑第一层（纯 CPU，不调模型）
+python -m codemem.add --stage atommem --limit-messages 20   # 只跑前 20 条 message（调试）
 ```
 
-**两步，产出一份消解后的会话语料**（在 `data/{speaker_a}_{speaker_b}/sessions/` 下）：
+**三层，产出三种记忆文件**（都在 `data/{speaker_a}_{speaker_b}/` 下，JSONL 一行一条）：
 
-| 文件 | 内容 |
-|---|---|
-| `sessions/session_N.jsonl` | 一次会话一个文件：一条消息一行，**已消解**（时间锚定 + 指代消解） |
+| 文件 | `type` | 内容 | 生成方式 |
+|---|---|---|---|
+| `msgmem.jsonl` | `msg` | 每条原始消息（**原话**）；`time` 是会话时间戳，`role` 是说话人真名 | 纯 CPU，由 dataset 直接转换 |
+| `summem.jsonl` | `summary` | 每个会话一份总结 | LLM，**逐 session 一次** |
+| `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **add agent 逐 message 处理**，默认 `max_step=6` |
 
-记录格式沿用 `session_template.jsonl`：`{"msg_id", "role", "time", "content"}` ——
-消解后额外带 `time_kind`（`point`/`range`/`approx`）与 `source_content` / `source_time`
-（保留原话与原始会话时间戳，供溯源与 re-resolve）。**agent 只需理解一种格式。**
+记录格式对齐 `memory_template.jsonl`：
+
+```json
+{"memory": "...", "metadata": {"id": "", "type": "msg|summary|atom", "time": "", "role": "",
+                               "tag": [], "source": [], "changelog": [{"time": "", "content": ""}]}}
+```
+
+**msgmem 是锚点，atommem 是产物。** msgmem 保留原始措辞与原始会话时间戳 —— 它是消解指代与折算
+时间的**依据**；atommem 才是消解后的结果（指代消解成真名、时间折算成绝对日期或带绝对锚点的相对
+时间，精度只减不增）。summem 居中，是「哪次会话谈过什么」的路标。
 
 三个刻意的取舍（不变）：
 
-- **`msg_id` 用 1-indexed**（`session_1_1`），与 LoCoMo 的 `dia_id`（`D1:1`）对齐 ——
-  这样 evidence 映射是恒等变换，不需要每处 ±1（那是 bug 的温床）。
-- **`role` 用真实人名**（`Caroline`/`Melanie`）而不是 `speaker1`/`speaker2` ——
-  指代消解（"she"是谁）依赖它，丢掉就等于让 agent 从对话里猜。
-- **`source_time` 保留原始会话时间戳**（`"1:56 pm on 8 May, 2023"`）—— 它是消解相对时间的
-  **锚点**；`time` 是消解后的结果，原话留在 `source_content`。
+- **id 用 1-indexed**（`session_{s}_{i}`，与 LoCoMo 的 `dia_id`（`D1:1`）对齐）—— evidence 映射
+  是恒等变换，不需要每处 ±1（那是 bug 的温床）。atom 的 id 是 `session_{s}_{i}_{k}`。
+- **`role` 用真实人名**（`Caroline`/`Melanie`）而不是 `speaker1`/`speaker2` —— 指代消解（"she"
+  是谁）依赖它，丢掉就等于让 agent 从对话里猜。
+- **msgmem 的 `time` 保留原始会话时间戳**（如 `"1:56 pm on 8 May, 2023"`）—— 它是折算相对时间的
+  **锚点**；atommem 的 `time` 是消解后的结果。
 
-### 1.1 消解（`resolve`）——为什么是"改写消息本身"而不是"另建一层导航"
+### 1.1 为什么是"三层记忆 + 逐消息 agent"，而不是"改写消息本身"
 
-**两条"浓缩成品"路线都已实测淘汰**（见 §2.16）：
+上一版（S13）把每条消息**改写成上下文无关的形式**，让 grep 命中的就是答案原料（见 §2.18 的历史）。
+那一版有效，但它有两个结构性问题：**① 一条消息被压成一行**，无法拆出多个独立事实（"swamped
+with the kids & work" 里既有"有孩子"又有"有工作"）；**② 会话内的相对时间只能靠"该消息自己的
+时间戳"这一条锚点**，遇到需要看更早消息才能定的指代（"the same lake as last time"）就消解不了。
 
-| 层 | 给检索什么 | 实测结果 |
+这一版换成**分层**：
+
+| 层 | 给检索什么 | 为什么保留 |
 |---|---|---|
-| 顶层 speakers summary（19 份压成一段印象） | 一段"整体印象" | 152 条 QA 里 **150 条一次 grep 都没做** —— 印象太像答案，agent 直接凭它编 |
-| session summary（每会话一份摘要） | "哪次会话谈过这件事" | 119/152 条 QA **压根不读它** —— agent 只 grep 原文 |
-| `index.jsonl`（扁平 `(s,r,o)` 三元组）/ `nodes+edges`（图） | "这件事在哪些 session 出现过" | 有效，但都是**额外一层**结构，要单独维护、agent 要先读指针再读原文 |
-| **消解后的消息本身**（当前方案） | "看到这句就懂，不需要任何前后文" | ← 当前方案 |
+| `msgmem`（原话） | 逐条原始消息 | 锚点与溯源；agent 消解指代时要读它 |
+| `summem`（会话总结） | "哪次会话谈过这件事" | 跨会话定位的路标（但**只给 agent grep，不注入 prompt** —— §2.2） |
+| `atommem`（原子事实） | 拆开、消解、自足的单条事实 | **检索的首选原料** —— grep 命中的就是能直接用的原子 |
 
-**为什么直接改消息，而不是再加一层。** 三元组/图做的是"**导航**"：agent 先 grep 指针，再去
-读原文核对。这多了一层：指针本身会漏、会压缩、措辞与原文不一致。而**如果消息本身就是自足的**
-（时间绝对、指代消解），那么 grep 命中的**就是能回答问题的原料**——不需要指针，也不需要回头
-读原文。这一版把 add 的目标从"造一层导航"换成"**把每条消息改写成上下文无关的形式**"。
+**atommem 才是 search 检索的首选**：一条消息可以拆成若干原子（复合句拆开、隐含的持久事实补出来），
+每条自足、单一事实、≤20 词。于是集合型问题（"她参加过哪些活动"）能收到干净、可数的成员，而不必
+读一整条含多个话题的消息。
 
-**它同时解决 bad case 里最实的两处缺口：**
+#### 消解的两件事（写进 add agent 的原子标准）
 
-1. **时间推理**（temporal 类曾只有 27%）。消解后 `time` 是**绝对时间**（`7 May 2023`）或
-   **带绝对锚点的相对时间**（`the week before 9 June 2023`）—— **看到它就对应现实中的一个
-   时间，不需要任何辅助信息**。这正是不再让 agent 在检索时现算的收益。
-2. **跨会话联系**（multi_hop 平均跨 2.41 个 session，最多 7 个）。同一实体在**每次会话里都
-   写成同一个真名**，于是 `grep -rin "Caroline" inputs/sessions/` 一次命中她出现的全部会话
-   —— 这正是图里"边带 session 号"想干的事，但**不需要单独一层**：消解后的文本本身就是索引。
+**① 时间：自足 + 精度只减不增。**
 
-#### 消解的两件事
+atom 的 `time` 要么是绝对时间（`7 May 2023`），要么是带绝对锚点的相对时间（`the week before
+9 June 2023`）。**禁止无锚点的相对词**（`yesterday` 单说）。**精度只减不增**：源说 `last year`
+→ 只能是年份（`2022`），不许编月日。
 
-**① 时间：自足 + 精度只减不增 + 区分点/段/大概。**
+| 源话（消息 dated 8 May 2023） | atom 的 time |
+|---|---|
+| "yesterday" | `7 May 2023` |
+| "last week" | `the week before 8 May 2023` |
+| "last year" | `2022` |
+| "on 7 May 2023"（本身绝对） | `7 May 2023` |
 
-`time` 必须让读者**不依赖任何其它信息**就能定位现实时间。三条硬约束：
+**② 指代：换成原始含义。** `she`/`he`/`it`/`there` → 真名 / 真实地点 / 真实物件。单看一条
+`"she went there"` 消解不了 —— agent 要 grep `msgmem` 里前面的相关消息才知道 `she` 是谁。
 
-- **自足**：绝对时间（`7 May 2023`）或带绝对锚点的相对时间（`the week before 9 June 2023`）。
-  **禁止无锚点的相对词**（`yesterday`、`last week` 单说）—— 读者看不到会话，这些词没意义。
-- **精度只减不增**：源说 `last year` → 只能到年（`2022`），**不许编出月日**；源说 `yesterday`
-  → 算术精确（锚点是该消息自己的日期）、可到日。**粒度和原文一致，绝不超过。**
-- **区分点 / 段 / 大概**：`time_kind` = `point`（某一刻/某天）/ `range`（一段时间：一周、一月、
-  一年、区间）/ `approx`（模糊：`recently`、`a while ago` —— 保留模糊，但锚上消息时间）。
+#### 逐消息 agent 怎么跑（`src/codemem/add/atommem.py`）
 
-| 源话（消息 dated 8 May 2023） | `time` | `time_kind` |
-|---|---|---|
-| "yesterday" | `7 May 2023` | point |
-| "last week" | `the week before 8 May 2023` | range |
-| "last year" | `2022` | range |
-| "last Saturday" | `the Saturday before 8 May 2023` | range |
-| "recently" | `recently (as of 8 May 2023)` | approx |
-| "on 7 May 2023"（本身绝对） | `7 May 2023` | point |
+```bash
+# 每处理一条 message：一个 agent loop（read / edit / bash，≤ max_step=6 步）
+#   system prompt：原子标准 + 三层记忆说明 + 检索策略 + 只填 4 个字段的协议
+#   user prompt：目标 message + 同会话前 N 条消息（消解窗口）+ 会话清单
+#   agent：grep 前面的 msgmem/summem/atommem 确认指代 → edit append 原子进 atommem.jsonl
+#   收尾：系统补 id / source / type / changelog（finalize_atoms）
+```
 
-**② 指代：换成原始含义。**
+**核心原理（用户原话）**：在已有的 msgmem/summem/atommem 中逐个 message 处理生成 atommem —— 后面的
+message 的信息可能受前面内容影响、可能**跨 session 影响**，所以 agent 需要看到前面**相关的**信息
+才能做出优秀的操作。这就是它不是一个单次 LLM 调用、而是一个朴素 agent loop 的原因。
 
-`she`/`he`/`they`/`it`/`there`/`then` → 真名 / 真实地点 / 真实物件 / 时间。逐消息处理，并**喂
-前文消息**作为消解指代的上下文（见下）——单看一条 `"she went there"` 消解不了，看前文才知道
-`she` 是谁、`there` 是哪里。
+- **串行**：同一目录内按 message 顺序**串行**（后面的 message 要看到前面已生成的 atommem）；
+  **不同目录并行**。
+- **agent 只填四个字段**（`memory` + `metadata.{time, role, tag}`）；`id` / `source` / `type` /
+  `changelog` 由系统在 `finalize_atoms` 收尾时补上 —— 省了 agent 的力气，也保证这些字段永远正确。
+- **增量/幂等**：重跑一条 message 时，先把 atommem 里 `source` 指向它的旧 atom 去掉、再重新生成
+  （"就地覆盖是幂等的"的 agent 版）。
 
-#### 消解怎么跑（`src/codemem/add/resolve.py`）
-
-- **逐消息**（LLM）—— **每条消息一次调用**。同一会话内按消息顺序**串行**（后面的消息要能看到
-  前面的原话，指代才消解得了）；**不同会话并行**。每条消息的 prompt 里附上前 N 条同会话消息
-  作为消解指代的上下文窗口。system prompt（`RESOLVE_SYSTEM_PROMPT`）定下上面两件事的规则。
-- **就地覆盖**：输入取每条记录的**原始视图**（`source_content`/`source_time` 优先，其次
-  `content`/`time`），输出写回同一文件。所以**对已消解的文件再跑一遍是幂等的**（不会把消解结果
-  当原话再消一次），也不需要另存一份 raw。
-- **失败保留原话**：某条消息消解失败/解析不出时，`content` 保留原话、`time` 留空 ——
-  宁可这条没被消解，也不把它写坏。
-
-**增量刷新**：Add 一个新会话时，只消解**变了的那个会话文件**（读它的原始视图，把"已消解的旧
-消息 + 新追加的原始消息"一起重新消解）。这就是 API 侧 "Add 返回即立即可检索" 的实现（见 §4）。
-
-> 旧的 `atommem`（原子抽取）与 `dpo`（为抽取模型造偏好数据）已删除 ——
-> 它们训练的是不再使用的抽取模型。需要时从 commit `b1b5283` 取回。
-> 旧的 `index.jsonl`（扁平三元组）与 `nodes.jsonl`/`edges.jsonl`（实体关系图）都已被本方案取代
-> —— 它们都是"额外一层导航"，而消解后的消息本身就是导航。
+> 旧的 `resolve.py`（逐消息一次 LLM 调用改写消息）与 `session.py` 已删除，被本节的
+> `msgmem` / `summem` / `atommem` 三层取代。旧的 `atommem`（抽取模型训练态）与 `dpo` 更早就删了
+> —— 它们训练的是不再使用的抽取模型。需要时从 git history 取回。
 
 ---
 
@@ -211,7 +213,7 @@ python -m codemem.search --experiment search
 
 | 参数 | 说明 |
 |---|---|
-| `dirs` / `--sample NAME` | speaker 目录名或路径；缺省处理全部含 `sessions/` 的目录 |
+| `dirs` / `--sample NAME` | speaker 目录名或路径；缺省处理全部含 `msgmem.jsonl` 的目录 |
 | `--config PATH` / `--tool-config PATH` | 配置（默认 `configs/search.yaml` / `configs/tool.json`） |
 | `--qa 3,7,12` | **只跑指定的 QA 原始下标**（逗号/空格分隔）。优先于 `--max-qa` 与步数预算：点名了就一定跑完。配 `--list-qa` 查下标 |
 | `--repeat N` | 每条 QA 重复跑 N 次（默认 1）。用来反复测同一条 QA 看结果稳不稳、定位偶发问题 |
@@ -242,7 +244,7 @@ ADD 0 / DELETE 0`，库净变化 `+0 ~81 -0` —— 只会原地改写、从不�
 ```
 每条 QA 一个私有目录（QA 之间零共享 → QA 级并发；base 库只读）
 
-  <run>/{dir}/inputs/sessions/session_N.jsonl  只读硬链（每会话一个文件）
+  <run>/{dir}/inputs/msgmem.jsonl  summem.jsonl  atommem.jsonl   只读硬链（三层记忆）
   <run>/{dir}/qa_{idx}/                       agent 的工作目录（bash 的 cwd）
       inputs/                                 指向公共 inputs/ 的一个链接
       evidence.jsonl                          **唯一产物**（用 edit append 逐条追加）
@@ -269,17 +271,18 @@ agent 越不检索**：那套版本里 150/152 条 QA 一次 grep 都没做。�
 
 **开场只给"路标"，不给"成品"。** agent 拿到的是一份**会话清单**（`session_N (时间)`，
 **不含任何事实内容**）—— 它知道这段对话被切成了哪几次会话、各在什么时候，于是能决定
-"这题该 grep 什么词"或"这几次会话得通篇读"。**真正的"路标"就是消解后的消息本身**（见 §1.1）：
-grep 命中的句子已经自足（时间绝对、指代消解）。它**不会**拿到任何"浓缩成品"（整体印象、
-逐会话摘要），因为实测那两种都会让 agent 跳过检索（见 §1.1 与 §2.16）。
+"这题该 grep 什么词"或"这几次会话得通篇读"。**"路标"就是三层记忆文件本身**（见 §1.1）：
+`atommem.jsonl` 的原子已经自足（时间绝对、指代消解），`summem.jsonl` 的会话总结给定位，
+但**两者都只让 agent 自己 grep**，**不把总结正文塞进 prompt**。它**不会**在 prompt 里拿到任何
+"浓缩成品"（整体印象、逐会话摘要）—— 因为实测那两种都会让 agent 跳过检索（见 §2.16）。
 
 **两种检索策略集成在一个 loop 里，agent 运行中自己切换**（写进 system prompt 但只给判据、
 不给流程）—— 因为一条 question 不一定一开始就能判定该用哪种，可能先试关键词、不行再转通读：
 
 | 策略 | 判据 | 怎么做 |
 |---|---|---|
-| **① 关键词直达** | 问题里点了可以直接 grep 的：人名、地名、书名、物件、事件 | `grep -rin "词" inputs/sessions/`；读到新名字就**再 grep 那个新词**（多跳）。语料已消解，命中即接近答案 |
-| **② 通读相关 session** | 答案是**集合**、或散落各处、或**根本不知道该搜什么词** | `grep -rln "词" inputs/sessions/` 拿到相关会话的**文件列表**，再逐个 `read inputs/sessions/session_N.jsonl` 从头读到尾、边读边收成员 |
+| **① 关键词直达** | 问题里点了可以直接 grep 的：人名、地名、书名、物件、事件 | `grep -rin "词" inputs/`；读 `inputs/atommem.jsonl` 里的原子（提炼过的、首选），需要原话再 `inputs/msgmem.jsonl`。读到新名字就**再 grep 那个新词**（多跳） |
+| **② 通读相关 session** | 答案是**集合**、或散落各处、或**根本不知道该搜什么词** | `grep -rln "词" inputs/` 定位相关会话（`summem.jsonl` 给会话号），再 `read` 那几段 `msgmem.jsonl` 从头读到尾、边读边收成员 |
 
 什么时候用哪种、要不要切换，是模型的判断。它**不必一开始选定**：先用①，发现收不全（集合/散布）
 就转②；②读到的成员名又能拿回①去 grep 它在别的会话的出现。我们只负责把两条路都摆在它面前。
@@ -303,23 +306,26 @@ reference 当闸门就是 oracle 泄漏（RL 会学会猜答案，推理时也�
 **一切都是一条对 JSONL 文件的命令**。
 
 ```bash
-grep -rin "husband" inputs/sessions/                 # ① 全部会话里 husband 出现在哪（命中即相关句）
-grep -rln "husband" inputs/sessions/                 # ② 哪些会话文件提到它（取文件列表）
-read inputs/sessions/session_5.jsonl                 # ③ 通读那一次会话
-date -d "9 Jun 2023 -5 year" +%Y                     # ④ 需要时算时间 -> 2018
+grep -rin "husband" inputs/                          # ① 三个记忆文件里 husband 出现在哪（命中原子即相关）
+grep -rln "husband" inputs/                          # ② 哪些行提到它（取定位，配 summem 判会话）
+read inputs/atommem.jsonl                            # ③ 读提炼过的原子（首选原料）
+read inputs/msgmem.jsonl                             # ④ 需要原话核对时读原始消息
+date -d "9 Jun 2023 -5 year" +%Y                     # ⑤ 需要时算时间 -> 2018
 ```
 
-**语料是一个 `sessions/` 目录**（每个会话一个文件，消解后上下文无关）：
+**语料是三个记忆文件**（`inputs/msgmem.jsonl` / `inputs/summem.jsonl` / `inputs/atommem.jsonl`，
+都是 JSONL 一行一条，消解后的原料在 atommem，原话在 msgmem）：
 
 | 动作 | 命令 | 何时 |
 |---|---|---|
-| 全库关键词检索 | `grep -rin "词" inputs/sessions/` | 关键词直达（策略①）；命中即相关句，本身可回答 |
-| 定位相关会话 | `grep -rln "词" inputs/sessions/` | 通读策略②的第一步：拿到该读哪几个文件 |
-| 通读一个会话 | `read inputs/sessions/session_5.jsonl` | 集合/散布型：从头读到尾、边读边收成员 |
+| 全库关键词检索 | `grep -rin "词" inputs/` | 关键词直达（策略①）；命中即相关行 |
+| 定位相关会话 | `grep -rln "词" inputs/` | 通读策略②的第一步：拿到该读哪几段（配 `summem.jsonl` 的会话号） |
+| 读原子记忆 | `read inputs/atommem.jsonl` | 首选原料：已拆分、已消解、自足的原子 |
+| 读原始消息 | `read inputs/msgmem.jsonl` | 需要原话/更早上下文时 |
 
-**关键词特别明显的题可以直取**：问题里的词直接命中 `inputs/sessions/`（比如
-"charity race"）就在那条消息上落证据。集合型/散布型问题（"她参加过哪些活动"）则相反 ——
-先 `grep -rln` 看哪些会话相关，再**逐个通读、边读边收成员**：实测 LoCoMo
+**关键词特别明显的题可以直取**：问题里的词直接命中 `inputs/`（比如
+"charity race"）就在那条原子上落证据。集合型/散布型问题（"她参加过哪些活动"）则相反 ——
+先 `grep -rln` 看哪些行相关、`summem.jsonl` 定位会话，再**通读那几段 `msgmem.jsonl`、边读边收成员**：实测 LoCoMo
 的标注证据里，1985 条 QA 中 1187 条只用 1 个 session，但有 330 条跨 2 个以上、最多跨 15 个。
 用哪种、什么时候切换，由 agent 自己判断（判据见 §2.2 的策略表）。
 
@@ -622,12 +628,12 @@ source:  ["session_1_9", "session_2_8", "session_1_17"]
 ### 2.10 存储与运行目录
 
 旧版这一节是整条链路最重的一块：向量索引（一个目录 17MB）、共享缓存、按 `corpus_sha256`
-判失效、跨运行复用、三个清理命令。**现在这些全都不存在了** —— 语料就是一个 `sessions/` 目录（每会话一个 JSONL 文件），
-硬链进运行目录（inode 共享，0 额外空间），agent 直接 grep。
+判失效、跨运行复用、三个清理命令。**现在这些全都不存在了** —— 语料就是 `data/{dir}/` 下的三个 JSONL
+记忆文件，硬链进运行目录（inode 共享，0 额外空间），agent 直接 grep。
 
 | 内容 | 位置 | 说明 |
 |---|---|---|
-| `sessions/session_N.jsonl` | 每次运行的 `inputs/sessions/` | **硬链**（inode 共享） |
+| `msgmem.jsonl` / `summem.jsonl` / `atommem.jsonl` | 每次运行的 `inputs/` | **硬链**（inode 共享） |
 | evidence / trajectory / 日志 | 每次运行目录 | 每次一份（本来就该有） |
 
 **每个 QA 的工作目录只放一个链接。** 早期实现给每个 `qa_{idx}/inputs/` **逐个**软链 5 个
@@ -677,13 +683,14 @@ python -m codemem.search --prune-runs --keep-last 3 --yes  # 保留最近 3 次
 reference 是 **7 May 2023**）：
 
 ```bash
-grep -rin "support group" inputs/sessions/
-# -> session_1_3: "I went to a LGBTQ support group yesterday"
-#    该记录的 time 是 "1:56 pm on 8 May, 2023" —— 这就是锚点
-date -d "8 May 2023 -1 day" +"%d %b %Y"                        # -> 07 May 2023
+grep -rin "support group" inputs/
+# -> atommem.jsonl: "Caroline went to an LGBTQ support group on 7 May 2023." (source session_1_3)
+#    msgmem.jsonl:  "I went to a LGBTQ support group yesterday" (time "1:56 pm on 8 May, 2023")
+#                   —— 原话 + 锚点：atommem 里的 7 May 就是 add agent 由它算出的
+date -d "8 May 2023 -1 day" +"%d %b %Y"                        # -> 07 May 2023（复核）
 ```
 
-然后**写一条改写过的记录**（不是抄那一行）：
+agent 拿到的 atommem 里**已经是消解后的原子**，它据此**写一条证据**：
 
 ```
 content: "Caroline went to an LGBTQ support group on 7 May 2023."
@@ -691,9 +698,9 @@ source:  ["session_1_3"]
 ```
 
 一条记录，直接回答"什么时候"，下游不需要再做任何解析。**注意这中间发生的事**：语料里的
-`yesterday` 在证据里变成了绝对日期 —— 这就是 §2.8 说的"推导"。
-（`yesterday` 相对于该消息自己的时间，算术精确、锚点已知 —— 属于 §2.4 说的"该算就算"的
-那一类；如果源说的是 "last year"，答案就该是年份而不是日期。）
+`yesterday` 早在 add 阶段就被消解成绝对日期（写进 atommem）—— 这就是 §1.1 说的"add 侧消解"，
+search 阶段只需照取。（`yesterday` 相对于该消息自己的时间，算术精确、锚点已知；如果源说的是
+"last year"，atom 的 time 就该是年份而不是日期。）
 
 ### 2.12 用法
 
@@ -713,7 +720,7 @@ python scripts/test_search.py
 
 | 参数 | 说明 |
 |---|---|
-| `dirs` / `--sample NAME` | speaker 目录名或路径；缺省处理全部含 `sessions/` 的目录 |
+| `dirs` / `--sample NAME` | speaker 目录名或路径；缺省处理全部含 `msgmem.jsonl` 的目录 |
 | `--config PATH` | 检索配置（默认 `configs/search.yaml`） |
 | `--tool-config PATH` | 工具配置（默认 `configs/tool.json`） |
 | `--max-qa N` | **调试闸门**：每个目录最多处理前 N 条 QA（0=全部） |
@@ -741,7 +748,7 @@ python scripts/test_search.py
 `data/search_runs/{experiment}_{ts}/`：
 
 - `{dir}/qa_{idx}/evidence.jsonl` — **唯一产物**（不合规时另存 `evidence.jsonl.raw`）
-- `{dir}/inputs/sessions/` — 只读输入（硬链的会话语料，每会话一个文件）
+- `{dir}/inputs/` — 只读输入（硬链的三层记忆文件 `msgmem` / `summem` / `atommem`）
 - `{dir}/{dir}.qa_trajectories.jsonl` — 每 QA 一行：`evidence_ids` / `steps` / `counts_by_tool` /
   `verifications` /
   `rounds`（每轮含每步的模型输出、工具调用、观测、evidence 行数变化）/
@@ -987,6 +994,8 @@ session 号"想做的事，但不需要单独一层。
 
 
 
+## 3. answer — 从证据作答
+
 **输入是 search 的产物 `evidence.jsonl`**，不是整个记忆库 —— 这正是整条链路的意义：
 search 已经把"回答这个问题所需的记忆"提炼成一份小列表（含推理结论、时间已解析），
 answer 只需要基于它作答。
@@ -1039,28 +1048,30 @@ uvicorn codemem.api.server:app --port 8000
 
 - **Add 幂等**。`request_id` 是幂等键 —— 重试时同一个 `request_id` **不会再写一遍**
   （由 `meta.applied_request_ids` 记录）。响应的三个 id 原样回显。
-- **Add 返回即"立即可检索"**。写入原始消息后，**在返回前**同步重抽该会话的实体/边并重新
-  消解该会话文件（时间锚定 + 指代消解），所以返回 `success:true` 时消息已消解、可直接检索。
+- **Add 返回即"立即可检索"**。写入原始消息后，**在返回前**同步重建该会话的 `summem`（一次 LLM
+  总结）与 `atommem`（逐 message 的 add agent），所以返回 `success:true` 时消息已消解、可直接检索。
 - **Search 的 `data` 永不为缺失**。没有记忆（该 user 从没 Add 过）或没有证据，一律返回
   `{"data": []}`，绝不给 5xx 空响应。
 
 **Search 复用 search 步骤的同一套编排**（`runner.run_phases`，与离线 search 完全一致）：
-`query` 归一化成 question → 建运行目录（硬链 `sessions/` 语料进 `inputs/`）→ 一个朴素 agent loop：
+`query` 归一化成 question → 建运行目录（硬链三个记忆文件进 `inputs/`）→ 一个朴素 agent loop：
 `grep` 检索、把**推导出的**证据用 `edit` 追加进 `evidence.jsonl` → verifier 判"够不够"
 （不足则回灌再补一轮）→ 映射成协议 `data[]`（按 `metadata.score` 降序、`top_k` 截断）。
-**不是朴素关键词检索** —— 协议要的是"能直接回答问题的记忆列表"，而 agent 会把 `yesterday`
-折算成绝对日期、消解指代、把散落的事实合并成一条。代价：每条 query 一次（或多次）LLM 调用。
+**不是朴素关键词检索** —— 协议要的是"能直接回答问题的记忆列表"，而 agent 会照取 atommem 的
+绝对日期、消解指代、把散落的事实合并成一条。代价：每条 query 一次（或多次）LLM 调用。
 
 **存储布局**（按 `user_id` 一目录，`data/api_store/{slug(user_id)}/`）：
 
 ```
 meta.json                 session_id -> 会话号、每会话消息数、已应用的 request_id
-sessions/session_{n}.jsonl  一次会话一个文件（消解后；原话在 source_content/source_time）
+msgmem.jsonl              逐条原始消息（type=msg；会话时间戳是锚点）
+summem.jsonl              每会话一条总结（type=summary）
+atommem.jsonl             逐消息抽出的原子事实（type=atom）
 runs/{ts}/                每次 Search 的运行目录（inputs/ 硬链 + qa/evidence.jsonl，可审计）
 ```
 
-**刻意沿用现有 `session_template` 与 `session_1_3` 约定**，于是 search 的 prompt、evidence 的
-`source` 校验、`date -d` 时间锚点全都照常工作 —— **search / add 现有代码一行都没改**。
+**沿用离线 add 的三层记忆文件与 `session_1_3` 约定**，于是 search 的 prompt、evidence 的
+`source` 校验、`date -d` 时间锚点全都照常工作。
 `time` 由协议的 `timestamp`（Unix 毫秒）转成 ISO-8601 UTC（`date -d` 可无歧义解析）。
 
 **多模态**：`content` 允许是 `str` 或有序 `ContentPart[]`；数组按原顺序归一化成**一个字符串**，
@@ -1070,20 +1081,21 @@ runs/{ts}/                每次 Search 的运行目录（inputs/ 硬链 + qa/ev
 自测（纯 CPU、零模型成本、零网络 —— 假模型 + 真工具 / 真存储）：
 
 ```bash
-python scripts/test_api.py     # 37 项断言：幂等 / 多 user 隔离 / msg_id 与时间 / data 映射 / 多模态
+python scripts/test_api.py     # 44 项断言：幂等 / 多 user 隔离 / msg_id 与时间 / data 映射 / 多模态
 ```
 
-配置在 `configs/api.yaml`：`generator`（agent+verifier 模型）、`index`（Add 侧消解模型）、
-`store_dir`、`concurrency`、`top_k` 与 agent 预算。
+配置在 `configs/api.yaml`：`generator`（search 的 agent+verifier 模型）、`index`（Add 侧
+summem/atommem 模型）、`add_tool_config`（Add agent 的工具配置）、`store_dir`、`concurrency`、
+`top_k`、`add_max_steps` 与 agent 预算。
 
 ### 4.1 实现要点
 
 - **`models.py`**：协议模型（pydantic）+ `ContentPart[]` → 文本的归一化（唯一实现，
   Add 与 Search 共用）。
 - **`store.py`**：每 `user_id` 一个目录；`UserStore.append` 在**写锁**内完成"查幂等键 →
-  分配 `msg_id` → 追加消息 → 刷新该 session 的 summary → **刷新顶层印象** → 记 request_id"，
-  会话语料原子写回。
-- **`retriever.py`**：直接调 `search.runner.run_phases`（与离线 search 同一套块编排），
+  分配 `msg_id` → 追加消息到 `msgmem.jsonl` → 重建该会话的 `summem`（一次 LLM）与 `atommem`
+  （逐 message 的 add agent）→ 记 request_id"，三层记忆文件原子写回。
+- **`retriever.py`**：直接调 `search.runner.run_phases`（与离线 search 同一套编排），
   复用现成的 `ModelRunner` / `build_shell_prefix` / `link_dir_or_copy` / `validate_file`。
   **不另写一套**：在线与离线的检索行为必须一致，否则"本地调好的 prompt 上线就不准了"。
 - **`server.py`**：FastAPI app，协程级 `asyncio.Semaphore` 限流；`create_app(config)` 供测试注入。
@@ -1129,9 +1141,10 @@ judge 对 category 5（adversarial，故意不可回答）**只记录不评分**
 
 ## 6. Baseline 对照（三个独立评测脚本）
 
-这三个脚本各自"检索 + 作答 + 评判"一条龙，**早于 answer/eval 两个步骤**。它们读的是
-`msgmem.jsonl` / `atommem.jsonl` —— **旧原子记忆体系的产物，当前 add 流程已不再生成**
-（代码仍在：它与 `eval/legacy.py` 一起构成历史对照，`atommem.jsonl` 的数据也还在盘上）。
+这三个脚本各自"检索 + 作答 + 评判"一条龙，**早于 answer/eval 两个步骤**。它们读 `msgmem.jsonl`
+与 `atommem.jsonl` —— 这两个文件现在由 add 的三层记忆流水线生成（记录格式已对齐
+`memory_template.jsonl`）。脚本是**独立的历史对照链路**（自带的检索/作答/评判口径与现管线不同），
+代码保留在 `scripts/` 与 `eval/legacy.py`。新增能力请走四个步骤，不要往这里加。
 新增能力请走四个步骤，不要往这里加。
 
 ### 6.1 Baseline 评测（完整上下文）
@@ -1327,6 +1340,16 @@ python scripts/test_api.py          # 封装 API 自测（37 项）
       `data/{dir}/sessions/session_N.jsonl`（**一次会话一个文件**）。search 侧：语料是
       `inputs/sessions/` 目录，两种检索策略（keyword 直达 / 通读相关 session）集成在一个
       agent loop 里、运行中自行切换；`evidence.jsonl` 同时是**笔记**（相关即可写，不必只写答案）
+- [x] **S14** **三层记忆 + add agent 逐消息抽取**（2026-10-04，见 §1）：把"改写消息本身"
+      升级为**分层**——`msgmem.jsonl`（`type=msg`，原话 + 会话时间锚点，纯 CPU 转换）/
+      `summem.jsonl`（`type=summary`，逐 session 一次 LLM 总结）/ `atommem.jsonl`
+      （`type=atom`，**add agent 逐 message 处理**：复用 search 的 `run_agent_round` /
+      `build_tools` / `ToolCatalog`，默认 `max_step=6`，agent 只填 `memory` + `metadata.{time,
+      role, tag}`，`id`/`source`/`type`/`changelog` 由 `finalize_atoms` 系统补）。记录格式对齐
+      `memory_template.jsonl`。同目录逐 message **串行**（后面的 message 能 grep 到前面已生成的
+      atommem，消解跨 session 指代）、不同目录并行；按 `source` 增量覆盖 = 幂等。search 语料换成
+      硬链的三个记忆文件；api 的 `store.append` 在返回前重建该会话的 summem + atommem。
+      删掉 `add/resolve.py` 与 `add/session.py`
 
 待办：
 
@@ -1343,5 +1366,7 @@ python scripts/test_api.py          # 封装 API 自测（37 项）
       终局奖励 = judge 答案），可直接在其上做 oracle 轨迹采样 + GRPO
 - [ ] **N5** 三个 baseline 脚本（`eval_baseline/rag/atommem`）与新链路的指标口径统一，
       使"msgmem / atommem / evidence / 全上下文"四者可横向对比
+- [ ] **N6** 三层记忆的端到端效果评估（S14 尚未跑真实模型）：对比"三层（atommem 检索）"与
+      "单层（消解后消息）"的 evidence recall 与 judge 准确率，验证 atommem 的拆分/消解质量
 
-（注：`data/*/atommem.jsonl` 的 10 个目录均已生成完毕，属旧原子记忆体系的遗留数据。）
+（注：`data/*/atommem.jsonl` 的 10 个目录为旧原子记忆体系的遗留数据，格式与 S14 不同。）

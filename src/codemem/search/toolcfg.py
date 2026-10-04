@@ -36,9 +36,15 @@ from ..io import PROJECT_ROOT
 DEFAULT_TOOL_CONFIG = PROJECT_ROOT / "configs" / "tool.json"
 
 # system prompt 里的槽位名 -> catalog 属性。渲染时逐一替换。
-# 新增槽位时记得同时加进 ``validate`` 的检查，否则拼错槽位会静默留一个 {{XXX}} 在 prompt 里。
+#
+# ``validate`` 只检查**模板里实际出现的**槽位（见下）—— 所以 search 的 tool.json 与
+# add agent 的 add_tool.json 可以只声明各自用到的槽位（add 没有 SCHEMA/EVIDENCE_STANDARD，
+# search 没有 ATOM_STANDARD），而共用同一套渲染机制。这里保留这个元组供参考/向后兼容。
 PROMPT_SLOTS = ("TOOLS", "COMMANDS", "WORKSPACE", "SCHEMA", "PROTOCOL", "WRITING_POLICY",
-                "TIME_POLICY", "EVIDENCE_STANDARD", "STRATEGY")
+                "TIME_POLICY", "EVIDENCE_STANDARD", "ATOM_STANDARD", "STRATEGY")
+
+#: 模板里 ``{{SLOT}}`` 的通用模式（用于动态发现模板声明的槽位）。
+_SLOT_RE = re.compile(r"\{\{([A-Z_]+)\}\}")
 
 
 class ToolConfigError(ValueError):
@@ -159,16 +165,40 @@ class ToolCatalog:
     writing_policy: dict[str, Any] = field(default_factory=dict)
     time_policy: dict[str, Any] = field(default_factory=dict)
     evidence_standard: str = ""
+    atom_standard: str = ""
     strategy: str = ""
     source_path: Path | None = None
 
     # -- 校验 ---------------------------------------------------------------
+
+    def _known_slots(self) -> set[str]:
+        """本 catalog 的 prompt 模板里声明的 catalog 槽位（排除用户侧占位符 ``{{QUESTION}}``）。"""
+        return set(_SLOT_RE.findall(self.prompt.get("system", ""))) - {"QUESTION"}
+
+    def render_slot(self, slot: str) -> str:
+        """按名字渲染一个槽位；未知槽位返回空串（调用方 validate 时已挡过）。"""
+        return {
+            "TOOLS": self.render_tools,
+            "COMMANDS": self.render_commands,
+            "WORKSPACE": self.render_workspace,
+            "SCHEMA": self.render_schema,
+            "PROTOCOL": self.render_protocol,
+            "WRITING_POLICY": self.render_writing_policy,
+            "TIME_POLICY": self.render_time_policy,
+            "EVIDENCE_STANDARD": self.render_evidence_standard,
+            "ATOM_STANDARD": self.render_atom_standard,
+            "STRATEGY": self.render_strategy,
+        }.get(slot, lambda: "")()
 
     def validate(self, available: list[str]) -> None:
         """与执行层注册的工具名对齐。缺描述 / 多描述都在启动时就报出来。
 
         ``available`` 是执行层注册的工具（read / edit / bash）。tool.json 的描述必须与它
         完全一致 —— 没有"控制工具"例外了（``next`` 已删除，流程回到朴素 loop）。
+
+        槽位校验是**动态的**：只检查模板里**实际出现**的槽位能不能渲染出非空值 —— 于是
+        search 的 tool.json 与 add agent 的 add_tool.json 可以只声明各自用到的槽位。拼错
+        槽位名（``{{TOOLZ}}``）会在渲染时留下字面量，这里也要抓出来。
         """
         described = set(self.tools)
         missing = [name for name in available if name not in described]
@@ -181,9 +211,10 @@ class ToolCatalog:
             raise ToolConfigError(
                 f"tool.json 描述了执行层没有的工具：{extra}（可用 {available}）"
             )
-        for slot in PROMPT_SLOTS:
-            if "{{" + slot + "}}" not in self.prompt.get("system", ""):
-                raise ToolConfigError(f"tool.json prompt.system 缺少槽位 {{{{{slot}}}}}")
+        # ``{{QUESTION}}`` 是用户侧占位符（render_prompt 单独替换），不算 catalog 槽位。
+        unknown = sorted(self._known_slots() - set(PROMPT_SLOTS) - {"QUESTION"})
+        if unknown:
+            raise ToolConfigError(f"tool.json prompt.system 含未知槽位：{unknown}")
 
     # -- 注入 ---------------------------------------------------------------
 
@@ -282,6 +313,15 @@ class ToolCatalog:
         """
         return self.evidence_standard.strip()
 
+    def render_atom_standard(self) -> str:
+        """渲染"原子标准"这一段（add agent 专用）。
+
+        它约束的是**一条 atom 的写法**：自足、一事实一 atom、时间解决、指代解决、抽取隐含
+        持久事实。正文来自 ``codemem.prompts.ATOM_AGENT_STANDARD``，由 ``load_catalog``
+        填进 ``self.atom_standard``。
+        """
+        return self.atom_standard.strip()
+
     def render_strategy(self) -> str:
         """渲染"检索策略引导"这一段：什么题该关键词检索、什么题该通篇读。
 
@@ -299,22 +339,20 @@ class ToolCatalog:
         return "\n".join(line for line in lines if line.strip())
 
     def render_prompt(self, question: str) -> str:
-        """渲染完整 system prompt。``{{TOOLS}}`` 等槽位由 catalog 自己填，``{{QUESTION}}`` 用入参。"""
+        """渲染完整 system prompt。``{{TOOLS}}`` 等槽位由 catalog 自己填，``{{QUESTION}}`` 用入参。
+
+        ``{{SLOT}}`` 逐一替换（只替换模板里实际出现的）；``{{QUESTION}}`` 单独替换。渲染完
+        若还残留 ``{{``，说明拼错了槽位名 —— 抛错而不是静默把字面量喂给模型。
+        """
         text = self.prompt.get("system", "")
-        replacements = {
-            "{{TOOLS}}": self.render_tools(),
-            "{{COMMANDS}}": self.render_commands(),
-            "{{WORKSPACE}}": self.render_workspace(),
-            "{{SCHEMA}}": self.render_schema(),
-            "{{PROTOCOL}}": self.render_protocol(),
-            "{{WRITING_POLICY}}": self.render_writing_policy(),
-            "{{TIME_POLICY}}": self.render_time_policy(),
-            "{{EVIDENCE_STANDARD}}": self.render_evidence_standard(),
-            "{{STRATEGY}}": self.render_strategy(),
-            "{{QUESTION}}": question.strip(),
-        }
-        for slot, value in replacements.items():
-            text = text.replace(slot, value)
+        for slot in self._known_slots():
+            text = text.replace("{{" + slot + "}}", self.render_slot(slot))
+        text = text.replace("{{QUESTION}}", question.strip())
+        leftover = _SLOT_RE.search(text)
+        if leftover:
+            raise ToolConfigError(
+                f"prompt 渲染后仍有未替换的槽位 {leftover.group(0)}（检查 tool.json 的槽位名）"
+            )
         return text
 
     def prompt_text(self, key: str, **kwargs: Any) -> str:
@@ -339,7 +377,8 @@ def load_catalog(path: str | Path | None = None) -> ToolCatalog:
     if not isinstance(raw, dict):
         raise ToolConfigError(f"{target} 顶层必须是对象")
 
-    for key in ("protocol", "tools", "commands", "workspace", "schema", "prompt"):
+    # ``schema`` 可选：search 用它说明 evidence 记录字段；add agent 不用它（相应用 atom_standard）。
+    for key in ("protocol", "tools", "commands", "workspace", "prompt"):
         if key not in raw:
             raise ToolConfigError(f"{target} 缺少顶层字段 '{key}'")
     if not raw["tools"]:
@@ -350,12 +389,14 @@ def load_catalog(path: str | Path | None = None) -> ToolCatalog:
         tools=raw["tools"],
         commands=raw["commands"],
         workspace=raw["workspace"],
-        schema=raw["schema"],
+        schema=raw.get("schema") or {},
         prompt=raw["prompt"],
         writing_policy=raw.get("writing_policy") or {},
         time_policy=raw.get("time_policy") or {},
         # 证据标准：优先取 tool.json 里的覆盖，缺省用 prompts.py 的常量（单一事实源）
         evidence_standard=str(raw.get("evidence_standard") or _default_evidence_standard()),
+        # 原子标准（add agent 用）：优先取 add_tool.json 的覆盖，缺省用 prompts.py 的常量
+        atom_standard=str(raw.get("atom_standard") or _default_atom_standard()),
         strategy=str(raw.get("strategy") or ""),
         source_path=target,
     )
@@ -371,3 +412,10 @@ def _default_evidence_standard() -> str:
     from ..prompts import EVIDENCE_STANDARD
 
     return EVIDENCE_STANDARD
+
+
+def _default_atom_standard() -> str:
+    """原子标准的缺省正文 —— ``codemem.prompts.ATOM_AGENT_STANDARD``（add agent 用）。"""
+    from ..prompts import ATOM_AGENT_STANDARD
+
+    return ATOM_AGENT_STANDARD

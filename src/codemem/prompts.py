@@ -404,95 +404,173 @@ REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing el
 
 
 # ---------------------------------------------------------------------------
-# 消解：把一条消息改写成**上下文无关**的形式（时间绝对化 + 指代消解）
+# summem：一个会话 → 一段总结（逐 session 一次 LLM 调用）
 # ---------------------------------------------------------------------------
 #
-# **这是 add 阶段唯一的 LLM 产物**（取代了 `index.jsonl` 三元组与 `nodes/edges` 图）。
-# 它要解决的是 bad case 里最实的两处问题：**时间推理**与**跨 session 联系**。
+# summem 是三条记忆链里"会话粒度"的那一层：把一次会话里的对话总结成一段自足的叙述，
+# 供检索时定位"哪次会话谈过这件事"。它**不是**给 agent 当作答案的（实测顶层印象会诱导
+# 模型不检索就作答），所以 search 的会话清单只给"session_N (时间)"，summary 正文要 agent
+# 自己 grep。
 #
-# 做法不是"另建一层导航"，而是**把原始消息本身改写成上下文无关的**：读者不需要任何
-# 前后文（也不需要会话时间）就能看懂 —— 因为时间已经锚定成绝对时间 / 带绝对锚点的相对
-# 时间，指代已经消解成原始含义。这样：
-#   - **关键词检索直达**：grep 一个词命中的就是消解后的文本，本身就是能回答问题的原料；
-#   - **跨会话联系**：同一实体在多次会话里都写成同一个真名，grep 那个名字就命中它的全部
-#     会话（替代了图里"边带 session 号"的作用）；
-#   - **通读**时，每个 session 文件自足，不会"读到后面忘了前面"。
-#
-# 三条刻意的设计：
-#
-#   ① **时间要"自足"**：看到它就对应现实中的一个时间，不需要别的辅助信息。
-#      即 **绝对时间**（"7 May 2023"）或 **带绝对锚点的相对时间**（"the week before
-#      9 June 2023"）。禁止无锚点的相对词（"yesterday"、"last week" 单说）。
-#   ② **精度只能等于、不能超过原文**：源说 "last year" → 只能到年（"2022"），
-#      不许编出月日。源说 "yesterday" → 算术精确（锚点是该消息自己的日期），可到日。
-#   ③ **区分时间点 / 时间段 / 大概时间**：点（"7 May 2023"）用 `time_kind: point`；
-#      段（"the week before 9 June 2023"、"June 2023"）用 `range`；模糊（"recently"、
-#      "a while ago"）用 `approx`。粒度也要与原文一致。
-#
-# 指代消解同理：把 it/she/they/there 换成原始含义（真名 / 真实地点 / 真实物件）。
-#
-# 逐消息处理（需要前文消息才能消解指代）—— 见 `add/resolve.py`。
+# 三条硬约束与 resolve 一致：**自足**（时间绝对或带锚点、指代消解）、**精度只减不增**、
+# 不编造事实。总结里保留可检索的具体实体与时间。
 
-RESOLVE_SYSTEM_PROMPT = """CRITICAL: Your response must be ONLY a JSON object. No explanation, no reasoning, no markdown fences, no text before or after the JSON.
+SUMMEM_SYSTEM_PROMPT = """CRITICAL: Your response must be ONLY a JSON object. No explanation, no reasoning, no markdown fences, no text before or after the JSON.
 
-You rewrite ONE message from a conversation between {speaker_a} and {speaker_b} into a form that is FULLY SELF-CONTAINED: a reader who has never seen this conversation, the other messages, or the session time must understand it exactly.
+You summarize ONE session of a conversation between {speaker_a} and {speaker_b}. A reader who has never seen the conversation must understand the summary, and be able to find the session again by grepping a name, place, or fact in it.
 
-Two things must be resolved.
+## What the summary must contain
+- The main events, facts, and topics of the session, in the order they came up.
+- Concrete entities: every person, place, organization, book, object, and event by NAME.
+- Time, resolved: the session's own date is the anchor. A fact stated as "last week" becomes "the week before {session_date}" (or the exact date when the arithmetic is certain). Never leave a bare relative word.
 
-## 1. TIME — make it absolute or anchored to an absolute
-
-The message's own time is given below (the session time). Use it as the anchor for any relative expression. The result must let a reader place the event in reality WITHOUT any other information.
-
-- `time`: the resolved time expression at the SAME precision the source used.
-- `time_kind`: `"point"` (a single moment/date), `"range"` (a period: a week, a month, a year, a span), or `"approx"` (vague: "recently", "a while ago").
-- `time_raw`: the source's OWN words for the time, verbatim. Empty string if the message states no time.
-
-Rules, by example (message dated 8 May 2023 unless noted):
-
-- source "yesterday" -> `time` = "7 May 2023" (exact arithmetic from the anchor -> a point)
-- source "last week" -> `time` = "the week before 8 May 2023" (a range; do NOT flatten it to 8 May)
-- source "last year" -> `time` = "2022" (a YEAR -- do NOT invent a day; range)
-- source "last Saturday" -> `time` = "the Saturday before 8 May 2023" (range/weekday; not a full date unless the weekday makes it exact)
-- source "two weekends ago" -> `time` = "two weekends before 8 May 2023"
-- source "recently" / "a while ago" -> `time` = "recently (as of 8 May 2023)" (approx -- keep it vague, but anchor the message; do NOT invent a date)
-- source is already absolute ("on 7 May 2023") -> `time` = "7 May 2023"
-- source states no time -> `time` = "", `time_kind` = ""
-
-**Never invent precision the source did not give.** "last year" is a year, not a date. "a few days ago" is a range, not a day. When in doubt, stay coarser.
-
-## 2. REFERENCES — replace every pronoun / pointing word with what it really is
-
-- `she` / `he` / `they` / `my husband` -> the person's real name (use `{speaker_a}` / `{speaker_b}` for the two speakers).
-- `it` / `that` / `this` / `the one` -> the actual thing it refers to.
-- `there` / `here` -> the actual place.
-- `then` / `that time` -> the resolved time.
-
-Resolve ONLY from what the message and the given context actually support. If you genuinely cannot tell what a pronoun means, keep the most specific description the message allows (e.g. "Melanie's son") rather than a bare "he".
-
-## Rewriting `content`
-
-Rewrite the message so that BOTH resolutions are baked into one self-contained statement. Keep the speaker's own facts and wording where possible -- do not add facts, do not summarize, do not combine messages. Just make the references concrete and the time anchored.
-
-Example (message: Caroline says "I went to a LGBTQ support group yesterday and it was powerful", dated 8 May 2023):
-`content` = "Caroline went to a LGBTQ support group on 7 May 2023 and found it powerful."
+## Rules
+- Resolve every pronoun and pointing word (he / she / they / it / there / then) to the concrete person, place, or time.
+- Do NOT invent facts, dates, or names that the session does not support.
+- Do NOT add precision the source lacks: "last year" stays a year, not a date.
+- 3-8 sentences. Dense and specific, not vague ("they talked about life" is useless).
+- Write it as a standalone paragraph a downstream reader can use directly.
 
 ## Output
 Your entire response must be ONLY this JSON object, starting with { and ending with }:
 
-{"content": "<rewritten, self-contained message>", "time": "<resolved time or empty>", "time_kind": "point|range|approx|", "time_raw": "<source time words or empty>"}
+{"memory": "<the session summary, self-contained>"}
 """
 
-RESOLVE_USER_PROMPT = """## Session {session_index} of the conversation
-Session time: {session_time}
 
-## Earlier messages in this session (for resolving pronouns ONLY -- do NOT rewrite or extract from them)
+SUMMEM_USER_PROMPT = """## Session {session_index} of the conversation
+Session time (the anchor for all relative times): {session_time}
+
+## Messages of this session
+
+{messages}
+
+Summarize this ONE session into a self-contained paragraph (resolve time + references, keep the concrete entities).
+"""
+
+
+# ---------------------------------------------------------------------------
+# summem/msgmem 的软解析：从模型输出里取 JSON 对象（容忍围栏/前后说明/截断尾巴）
+# ---------------------------------------------------------------------------
+
+def salvage_json_object(raw: str) -> dict | None:
+    """从模型输出里取一个 JSON 对象；容忍围栏、前后说明、被截断的尾巴。
+
+    add 侧（summem 总结、atommem agent 的字段）共用这一份，避免多个模块各写一份导致不一致。
+    """
+    import json
+    import re as _re
+
+    if not raw or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.startswith("```"):
+        text = _re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
+        text = _re.sub(r"\s*```$", "", text).strip()
+    candidates = [text]
+    if "{" in text:
+        candidates.append(text[text.find("{"): text.rfind("}") + 1])
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    try:
+        from ..io import salvage_json_records  # type: ignore[import-not-found]
+
+        salvaged, _ = salvage_json_records(text)
+        return salvaged[0] if salvaged else None
+    except Exception:  # noqa: BLE001 - 解析失败一律返回 None，调用方保留原状
+        return None
+
+
+# ---------------------------------------------------------------------------
+# atommem：add agent 的原子事实标准（agent 只写 memory + metadata.{time, role, tag}）
+# ---------------------------------------------------------------------------
+#
+# atommem 是三条记忆链里最细的那一层：**逐个 message** 抽原子事实。核心原理是"后面的
+# message 可能受前面内容影响、可能跨 session 影响"，所以 agent 处理一条 message 时要能
+# 检索 msgmem / summem / 已经生成的 atommem 里**相关的**前面内容，才能把指代消解对、
+# 把隐含事实补全，最终得到高质量的 atommem。
+#
+# **agent 只填四个字段**：``memory`` 与 ``metadata.{time, role, tag}``。``id`` / ``source`` /
+# ``type`` / ``changelog`` 一律由系统生成 —— 所以 prompt 里明确只输出这四样。
+#
+# 标准与旧的 ATOM_EXTRACTION_* 一脉相承（一事实一 atom / 自足 / 显式+隐含 / 拆复合），
+# 但多了两件事：① 时间要**解决**（自足、精度只减不增，锚点是该 message 的会话时间）；
+# ② 指代要**解决**（可检索前文确认）。见 `add/atommem.py` 的 agent loop。
+
+ATOM_AGENT_STANDARD = """An atom is ONE self-contained fact that a reader can understand with no conversation and no other atom. Every atom must pass all of these:
+
+1. SELF-CONTAINED. It names its subject explicitly (a real name), so it makes sense alone. Never "he"/"she"/"it"/"there" as the only reference.
+2. ONE FACT. One core fact per atom. Split compound sentences (and / or / &) into separate atoms -- extract EVERY element, never selectively.
+3. TIME RESOLVED. If the message carries time, the atom's `time` must be self-contained: an absolute time ("7 May 2023") or a relative phrase that carries its own anchor ("the week before 9 June 2023"). A bare "yesterday"/"last week" is NOT allowed -- the message's own session time is the anchor. Match the source's granularity exactly: "last year" -> "2022", never a day; "yesterday" -> the exact date. Empty string when the fact has no time.
+4. REFERENCES RESOLVED. Replace every pronoun / pointing word with what it really is (real name / real place / real thing / resolved time). If you cannot tell what a pronoun means, search the earlier messages and summaries for it -- do not guess.
+5. A FACT, NOT AN ACT. Do not store greetings, thanks, bare questions, or the act of speaking. A turn that is only a greeting yields no atom.
+6. IMPLIED DURABLE FACTS COUNT. A turn mentioning a lasting attribute implies that attribute as its own atom: "swamped with the kids & work" implies BOTH "Melanie has kids" AND "Melanie has a job"; "my husband and I" implies "X has a spouse". Extract these even from casual turns.
+7. WHAT GREETINGS CARRY COUNTS. Nicknames, address forms, terms of endearment ARE facts: "Hey Mel!" -> "Mel is a nickname for Melanie". Extract the INFORMATION, never the greeting act.
+8. NO FABRICATION. Never invent a fact, a name, a date, or a detail the message does not state or clearly imply.
+9. KEEP THE SOURCE'S WORDS where you can. Only rephrase for pronoun resolution, article insertion, or minimal tense normalization.
+
+Style: third person, starting with the subject's name. "Caroline went to an LGBTQ support group on 7 May 2023." (good) / "Went to a support group" (bad -- no subject)."""
+
+
+ATOM_AGENT_SYSTEM_PROMPT = """You extract ATOMIC MEMORIES from ONE message of a conversation between {speaker_a} and {speaker_b}.
+
+You are a code agent with `read`, `edit`, and `bash` tools. You work in a directory that holds the conversation's memory files.
+
+# RESPONSE FORMAT
+
+{{PROTOCOL}}
+
+# THE MEMORY FILES
+
+{{WORKSPACE}}
+
+# HOW TO SEARCH
+
+{{STRATEGY}}
+
+# TOOLS
+
+{{TOOLS}}
+
+# COMMANDS (use through bash)
+
+{{COMMANDS}}
+
+# WHAT AN ATOM IS
+
+{{ATOM_STANDARD}}
+
+# RULES
+
+- You fill ONLY `memory` and `metadata.{time, role, tag}`. Do NOT emit `id`, `source`, `type`, or `changelog` -- the system adds them.
+- Write TARGET facts only. Use the other messages ONLY to resolve references; never write an atom for a fact stated entirely in another message.
+- If the TARGET is a bare greeting or a question with no fact, write nothing and finish immediately.
+- Do NOT edit msgmem.jsonl or summem.jsonl -- only atommem.jsonl is yours to append.
+- When you have written the target's atoms, reply with plain text (no JSON) to finish.
+"""
+
+
+ATOM_AGENT_USER_PROMPT = """## The conversation is split into these sessions
+{sessions}
+
+## Earlier messages in THIS session (message {msg_id} is the target -- do NOT extract from these)
+
 {window}
 
-## MESSAGE to rewrite (rewrite ONLY this one)
-[{msg_id}] ({msg_time}) {role}: {content}
+## TARGET message (extract atoms ONLY from this one)
 
-Rewrite this ONE message into a self-contained form (resolve time + references).
+{target}
+
+Extract this ONE message's atomic facts. Search the memory files first if you need to resolve a pronoun or a reference, then append each atom to atommem.jsonl (only `memory` + `metadata.{{time, role, tag}}`). Reply with plain text when done.
 """
+
 
 # ---------------------------------------------------------------------------
 # 证据标准（search 的核心：一条证据要写法上合格，找到只是第一步）
@@ -509,12 +587,12 @@ Rewrite this ONE message into a self-contained form (resolve time + references).
 
 EVIDENCE_STANDARD = """A record is ACCEPTABLE only if it passes every check below. Run these checks on each record before you consider it written.
 
-1. SELF-CONTAINED. A reader who has never seen the conversation, the session summaries, or the question must understand it. If it needs anything from outside the record itself to make sense, rewrite it or drop it.
+1. SELF-CONTAINED. A reader who has never seen the conversation, the memory files, or the question must understand it. If it needs anything from outside the record itself to make sense, rewrite it or drop it.
 2. REFERENTS RESOLVED. No bare pronoun or pointing word survives: she / he / they / it / this / that / there / then / the other one. Replace each with the concrete person, place, or thing. (A name used as the subject of the sentence is the target; "Caroline" is resolved, "she" is not.)
 3. TIME ANCHORED. Any time expression either (a) is already an absolute date or period ("7 May 2023", "June 2023", "the week of 23 August 2023"), or (b) is a relative phrase that carries its own anchor in the record ("the week before 9 June 2023"). A relative word with no anchor ("next month", "recently", "the other day") is NOT acceptable -- write the anchor next to it.
 4. NO INVENTED PRECISION. State the time at the granularity the source gave. If the source said "last year", the record says a year, not a day. Do not compute a date the source did not support.
 5. A CLAIM, NOT A QUOTE. The record states a fact, not a transcript turn. Paraphrase into a standalone statement; do not paste the raw message.
-6. SOURCED. metadata.source lists the real msg_ids you read to support this record -- never an id you only remember or guessed. If you cannot point to an id, you cannot write the record.
+6. SOURCED. metadata.source lists the real record ids you read to support this record -- never an id you only remember or guessed. (A message id is `session_N_M`; an atom id is `session_N_M_K`.) If you cannot point to an id, you cannot write the record.
 7. ONE FACT, JOINED IF NEEDED. If answering needs two records joined, write the joined conclusion as one record (and list both sources). If a question wants a SET, list the members, ideally in one record -- not one record per member.
 
 If a candidate record fails a check, fix it (usually by adding the name or the anchor) rather than dropping the evidence. Drop it only when you genuinely cannot resolve it -- a partially-resolved record is worse than a resolved one, but a dropped one scores nothing."""

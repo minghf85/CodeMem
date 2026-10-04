@@ -1,0 +1,142 @@
+{
+  "_comment": [
+    "add agent（atommem 逐 message 抽取）的统一配置：agent 能看到的一切（工具描述、命令行用法、",
+    "目录布局、响应协议、原子标准、system prompt）都在这里，单一事实源。",
+    "src/codemem/search/toolcfg.py 渲染注入；src/codemem/search/tools.py 执行语义。",
+    "结构与 configs/tool.json 完全一致（复用同一套 ToolCatalog），只是 prompt/策略不同。",
+    "",
+    "与 search 的关键差别：agent 不再产出 evidence，而是把**原子事实**追加进 atommem.jsonl；",
+    "它只填 memory + metadata.{time, role, tag} 四个字段，id/source/type/changelog 由系统补。",
+    "system prompt 的正文在 src/codemem/prompts.py 的 ATOM_AGENT_SYSTEM_PROMPT（这里只放槽位壳）。"
+  ],
+  "protocol": {
+    "response_format": "Reply with exactly ONE JSON object per turn, nothing else -- no prose, no markdown fence.",
+    "call_schema": {
+      "tool": "<read|edit|bash>",
+      "args": {
+        "<arg>": "<value>"
+      }
+    },
+    "done_signal": "When you have written the target message's atoms into atommem.jsonl, reply with plain text (not JSON). That is how you finish. If the target yields no atom, finish immediately.",
+    "quote_arg_safety": "Always wrap command strings in double quotes in the JSON; escape inner double quotes as \\\"."
+  },
+  "tools": {
+    "read": {
+      "description": "Read a file, or a slice of one (`offset`/`limit` are 1-based line numbers). Truncated to 2000 lines / 50KB. Use it to read earlier messages (msgmem.jsonl) or the session summaries (summem.jsonl).",
+      "guidelines": [
+        "`grep -n` first to find the line number, then `read` with offset/limit around it."
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "Path to the file to read" },
+          "offset": { "type": "integer", "description": "Line to start from (1-based)" },
+          "limit": { "type": "integer", "description": "Max lines" }
+        },
+        "required": ["path"]
+      }
+    },
+    "edit": {
+      "description": "The ONLY way to write files. Two modes -- pass exactly one. APPEND (`append=\"<text>\"`) adds text to the end of the file, creating it if missing -- this is how you write every atom. REPLACE (`edits=[{\"oldText\",\"newText\"}]`) rewrites text that already exists; use it to fix an atom you already wrote.",
+      "guidelines": [
+        "Write an atom with APPEND (path defaults to atommem.jsonl): {\"tool\":\"edit\",\"args\":{\"append\":\"<one JSON atom>\\n\"}}",
+        "Never pass both `append` and `edits` in one call.",
+        "There is NO `write` tool: you cannot overwrite the whole file, so you can never erase earlier atoms by accident."
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "Path to edit. Defaults to atommem.jsonl if omitted." },
+          "append": { "type": "string", "description": "Text to add to the end of the file (created if missing). Use this for new atoms." },
+          "edits": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "oldText": { "type": "string" },
+                "newText": { "type": "string" }
+              },
+              "required": ["oldText", "newText"]
+            },
+            "description": "Exact replacements. Use only to fix an existing atom."
+          }
+        },
+        "required": []
+      }
+    },
+    "bash": {
+      "description": "Run a bash command in the working directory. stdout+stderr combined; truncated to the last 2000 lines / 50KB. `grep`, `sed`, `awk`, `head`, `wc`, `sort`, `uniq` are all available -- this is your retrieval toolbox.",
+      "guidelines": [],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "command": { "type": "string", "description": "Command to run" },
+          "description": { "type": "string", "description": "Short present-participle summary, e.g. 'Grepping earlier messages'" },
+          "timeout": { "type": "number", "description": "Timeout in seconds (optional)" }
+        },
+        "required": ["command"]
+      }
+    }
+  },
+  "commands": {
+    "grep": {
+      "summary": "Your search tool. One JSON object per line, so `-n` gives you line numbers you can hand to `read`.",
+      "recipes": [
+        {
+          "why": "Find a name or a word across all three memory files at once (recursive).",
+          "cmd": "grep -rin \"husband\" ."
+        },
+        {
+          "why": "Find every atom already written about an entity (cross-session hop). Because references are resolved, the same name means the same thing everywhere.",
+          "cmd": "grep -rin \"Caroline\" atommem.jsonl | head -20"
+        },
+        {
+          "why": "See what happened in a specific session (its raw messages).",
+          "cmd": "grep -rin \"session_3\" msgmem.jsonl | head -20"
+        },
+        {
+          "why": "See which session a topic came up in (the summaries).",
+          "cmd": "grep -rin \"pottery\" summem.jsonl | head"
+        },
+        {
+          "why": "Read one memory file in full.",
+          "cmd": "read msgmem.jsonl"
+        }
+      ]
+    },
+    "time": {
+      "summary": "Compute a date in bash when you need one (`date -d`). Do NOT do the arithmetic in your head -- you will get it wrong. Anchor on the message's own session time. The environment is pinned to LC_ALL=C so month and weekday names always come out in English.",
+      "recipes": [
+        {
+          "why": "Relative -> absolute. The raw form ('1:56 pm on 8 May, 2023') is accepted as-is.",
+          "cmd": "date -d \"8 May 2023 -1 day\" +\"%d %b %Y\""
+        },
+        {
+          "why": "Which weekday a date is -- needed when the source says 'the Friday before X'.",
+          "cmd": "date -d \"15 Jul 2023 -2 day\" +\"%A %d %b %Y\""
+        }
+      ]
+    }
+  },
+  "workspace": {
+    "layout": [
+      "msgmem.jsonl    -- every raw message, one per line (id = session_N_M, type 'msg'). Wording is raw; each line carries its session time. Use it to resolve who/what a pronoun refers to.",
+      "summem.jsonl    -- one summary per session (id = session_N_summary, type 'summary'). Use it to see which session a topic came up in.",
+      "atommem.jsonl   -- the atoms produced so far (id = session_N_M_K, type 'atom'). THIS IS YOUR OUTPUT -- append to it."
+    ],
+    "rules": [
+      "Never write msgmem.jsonl or summem.jsonl -- they are read-only; your writes there are rejected.",
+      "All files are JSONL: one record per line, so grep works on them directly and line numbers are stable.",
+      "Use `grep -rin \"word\" .` to search all three files at once (recursive).",
+      "Only atommem.jsonl is yours to append. Write the TARGET message's atoms there."
+    ]
+  },
+  "strategy": "Your goal: for the ONE target message, write its atomic facts into atommem.jsonl -- each a self-contained fact a reader can understand alone.\n\nThe target may use a pronoun, a nickname, or a reference ('the same lake as last time') that you cannot resolve from the message alone. When that happens, SEARCH the earlier memory first:\n\n- `grep -rin \"<a word from the target>\" .` across all three files.\n- `read msgmem.jsonl` to read the earlier raw messages.\n- `read summem.jsonl` to see the per-session summaries.\n- `grep -rin \"session_3\" .` to see what happened around a session.\n\nResolve the reference, THEN write the atom with the resolved form. Do not guess an entity you could have looked up -- but do not go reading forever either: a fact that needs three searches is worth three searches, a greeting is worth zero.",
+  "prompt": {
+    "system": "You extract ATOMIC MEMORIES from ONE message of a conversation between {speaker_a} and {speaker_b}.\n\nYou are a code agent with `read`, `edit`, and `bash` tools. You work in a directory that holds the conversation's memory files.\n\n# RESPONSE FORMAT\n\n{{PROTOCOL}}\n\n# THE MEMORY FILES\n\n{{WORKSPACE}}\n\n# HOW TO SEARCH\n\n{{STRATEGY}}\n\n# TOOLS\n\n{{TOOLS}}\n\n# COMMANDS (use through bash)\n\n{{COMMANDS}}\n\n# WHAT AN ATOM IS\n\n{{ATOM_STANDARD}}\n\n# RULES\n\n- You fill ONLY `memory` and `metadata.{time, role, tag}`. Do NOT emit `id`, `source`, `type`, or `changelog` -- the system adds them.\n- Write TARGET facts only. Use the other messages ONLY to resolve references; never write an atom for a fact stated entirely in another message.\n- If the TARGET is a bare greeting or a question with no fact, write nothing and finish immediately.\n- Do NOT edit msgmem.jsonl or summem.jsonl -- only atommem.jsonl is yours to append.\n- When you have written the target's atoms, reply with plain text (no JSON) to finish.",
+    "user_begin": "Extract the atomic facts of the target message into atommem.jsonl.",
+    "user_gaps": "Continue.",
+    "user_no_progress": "Several turns have passed without atommem.jsonl changing. If the target message yields no atom, reply with plain text (no JSON) now. Otherwise write the atom.",
+    "user_steps_exhausted": "You have used your last turn. Reply with plain text (no JSON) now."
+  }
+}

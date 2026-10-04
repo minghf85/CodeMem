@@ -1,25 +1,25 @@
-"""add 步骤：原始对话 → session 文件 → 消解后的、上下文无关的记忆。
+"""add 步骤：原始对话 → msgmem → summem → atommem（三层记忆）。
 
 入口：``python -m codemem.add``（见 ``__main__.py``）。
 
-    session.py   原始对话 → sessions/session_{n}.jsonl（原始措辞，纯 CPU）
-    resolve.py   逐消息消解 时间 + 指代 → 就地改写 sessions/*.jsonl（上下文无关）
+    msgmem.py    原始对话 → msgmem.jsonl（type=msg 的原始消息，纯 CPU，会话时间戳是锚点）
+    summem.py    逐 session 一次 LLM → summem.jsonl（type=summary 的会话总结）
+    atommem.py   逐 message 的 add agent（read/edit/bash）→ atommem.jsonl（type=atom 的原子事实）
+    memory.py    三个文件的公共读/写/分组工具
 
-**为什么是"消解"而不是"摘要"或"索引/图"**。摘要是一段浓缩成品，实测会诱导 search agent
-不检索直接凭印象作答（152 条 QA 里 150 条一次 grep 都没做）。而 `index.jsonl`（三元组）/
-`nodes+edges`（图）都是为"跨会话定位"额外造的一层结构。这一版换个更直接的做法：**把原始
-消息本身改写成自足的** —— 时间锚定成绝对时间或带绝对锚点的相对时间，指代消解成原始含义。
-于是关键词检索命中的就是能回答问题的原料，同一实体跨会话都写成同一个真名（grep 即跨会话），
-通读时每个 session 文件自足、不会"读到后面忘了前面"。
+**为什么是"三层记忆 + agent 逐消息抽取"**。原子记忆（atommem）是检索的主语料：一条 atom
+就是一个自足、指代消解、时间锚定的事实，grep 命中的就是能回答问题的原料，同一实体跨会话
+都写成同一个真名（grep 即跨会话）。msgmem 保留原话（补具体答案与溯源），summem 提供会话
+粒度的路标。三条记忆链格式统一（``memory_template.jsonl``），search 用同一套 grep/read 检索。
 
-时间的三条硬约束：**自足**（禁止无锚点相对词）、**精度只减不增**（源说"去年"就只到年）、
-**区分点/段/大概**（``time_kind`` = point / range / approx）。原话保留在 ``source_content`` /
-``source_time``（溯源 + re-resolve 幂等的底）。
+**atommem 的核心原理**：逐个 message 处理。后面的 message 的信息可能受前面内容影响、可能
+跨 session 影响，所以处理一条 message 时，agent 需要看到前面**相关的**信息才能把指代消解对、
+把隐含事实补全 —— 于是它是一个 agent loop（默认 ``max_step=6``），而不是单次调用。
 
-（旧的 ``atommem``、``dpo``、``session summary``、顶层 ``speakers summary``、``index.jsonl``、
-``nodes.jsonl``/``edges.jsonl`` 均已删除 —— 前两者见 commit b1b5283 可取回。）
+时间的三条硬约束（贯穿三层）：**自足**（绝对时间或带绝对锚点的相对时间，禁止无锚点相对词）、
+**精度只减不增**（源说"去年"就只到年）、**指代消解成真名/真实地点**。
 """
 
-from . import resolve, session
+from . import atommem, memory, msgmem, summem
 
-__all__ = ["resolve", "session"]
+__all__ = ["atommem", "memory", "msgmem", "summem"]

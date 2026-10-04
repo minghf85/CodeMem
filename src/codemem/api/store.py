@@ -1,14 +1,16 @@
-"""按 ``user_id`` 隔离的持久化存储：追加消息、request_id 去重、物化语料、消解。
+"""按 ``user_id`` 隔离的持久化存储：追加消息、request_id 去重、生成三层记忆。
 
-**一个 user 一个目录**，结构对齐既有管线：
+**一个 user 一个目录**，结构对齐离线管线（add 的三层记忆文件）：
 
     data/api_store/{slug(user_id)}/
       meta.json                 session_id -> 会话号、每会话消息数、已应用的 request_id
-      sessions/session_{n}.jsonl  一次会话一个文件（消解后上下文无关；原话在 source_*）
+      msgmem.jsonl              原始消息（type=msg；会话时间戳是锚点）
+      summem.jsonl              每个会话一份总结（type=summary）
+      atommem.jsonl             逐 message 抽出的原子事实（type=atom）
 
-**为什么沿用 ``session_1_3`` 这套约定**：search agent 的 system prompt、evidence 的
-``source`` 校验（只认 ``msg_id``）、`date -d` 时间锚点示例全部建立在这套约定上。
-存储层照抄它，整条 search 管线就**一行都不用改**。
+**为什么沿用 ``session_1_3`` 这套 id 约定**：search agent 的 system prompt、evidence 的
+``source`` 校验、`date -d` 时间锚点示例全部建立在这套约定上。存储层照抄它，整条 search
+管线就**一行都不用改**。
 
 **幂等**是协议硬要求：Add 重试时 ``request_id`` 不变，同一条不能写入两次。所以每次 Add 先查
 ``meta.applied_request_ids`` —— 命中就直接返回成功，连语料都不碰。
@@ -27,16 +29,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..add import resolve as resolve_mod
-from ..add.resolve import list_session_files
-from ..add.session import SESSIONS_DIR, session_filename
-from ..io import (
-    DATA_DIR,
-    make_session_record,
-    msg_time,
-    read_jsonl,
-    write_jsonl,
+from ..add import atommem as atommem_mod
+from ..add import summem as summem_mod
+from ..add.memory import (
+    ATOMMEM_NAME,
+    MSGMEM_NAME,
+    SUMMEM_NAME,
+    group_by_session,
+    write_memories,
 )
+from ..io import DATA_DIR, make_memory, now_iso, read_jsonl
+from ..search import toolcfg
 from .models import normalize_content
 
 META_NAME = "meta.json"
@@ -88,6 +91,8 @@ def _iso_from_ms(milliseconds: Any) -> str:
 
 def _atomic_write_json(path: Path, payload: Any) -> None:
     """原子写一个 JSON 对象（meta.json 用）。走与 jsonl 相同的临时文件 + os.replace。"""
+    from ..io import write_jsonl
+
     write_jsonl(path, [payload])
 
 
@@ -125,15 +130,20 @@ class UserStore:
         return self.root / META_NAME
 
     @property
-    def sessions_dir(self) -> Path:
-        return self.root / SESSIONS_DIR
+    def msgmem_path(self) -> Path:
+        return self.root / MSGMEM_NAME
 
-    def session_path(self, session_index: int) -> Path:
-        return self.sessions_dir / session_filename(session_index)
+    @property
+    def summem_path(self) -> Path:
+        return self.root / SUMMEM_NAME
+
+    @property
+    def atommem_path(self) -> Path:
+        return self.root / ATOMMEM_NAME
 
     def exists(self) -> bool:
         """该 user 是否已经有落盘语料（Search 据此决定是"没记忆"还是"去检索"）。"""
-        return self.sessions_dir.is_dir() and any(self.sessions_dir.glob("session_*.jsonl"))
+        return self.msgmem_path.exists() and self.msgmem_path.stat().st_size > 0
 
     # -- 读 -----------------------------------------------------------------
 
@@ -141,11 +151,16 @@ class UserStore:
         return _read_meta(self.meta_path, self.user_id)
 
     def sessions(self) -> list[dict[str, Any]]:
-        """全部消息（合并 sessions/ 下的全部会话文件，按会话号、消息序号排序）。"""
-        records: list[dict[str, Any]] = []
-        for _, path in list_session_files(self.root):
-            records.extend(read_jsonl(path))
-        return records
+        """全部 msg 记忆（按会话号、消息序号排序）。"""
+        return read_jsonl(self.msgmem_path)
+
+    def session_records(self, session_index: int) -> list[dict[str, Any]]:
+        """某个会话的全部 msg 记忆。"""
+        return [
+            r for r in self.sessions()
+            if atommem_mod.msg_session_number((r.get("metadata") or {}).get("id") or "")
+            == session_index
+        ]
 
     # -- 写 -----------------------------------------------------------------
 
@@ -159,19 +174,18 @@ class UserStore:
         client: Any,
         log: Any | None = None,
     ) -> dict[str, Any]:
-        """把一个 Add 请求写进语料，返回小结 dict。
+        """把一个 Add 请求写成三层记忆，返回小结 dict。
 
         ``messages`` 是已归一化的 ``[{"role", "content", "timestamp"}]``。步骤：
 
         1. 取该 user 的写锁；
         2. **幂等**：``request_id`` 已应用 → 直接返回（不碰语料）；
-        3. 分配 ``msg_id``、转时间，把新消息**以原始措辞**追加到该 session 文件；
-        4. **在返回前**消解该 session 文件（时间锚定 + 指代消解，LLM）——
-           兑现"持久化后立即可检索"；
+        3. 分配 ``id`` / 转时间，把新消息**以原始措辞**追加到 ``msgmem.jsonl``；
+        4. **在返回前**重算该会话的 ``summem``（一次 LLM 总结）与该会话的 ``atommem``
+           （逐 message 的 add agent，只处理本会话）—— 兑现"持久化后立即可检索"；
         5. 原子写回语料 + meta。
 
-        消解读取每条记录的**原始视图**（``source_content``/``source_time`` 优先），所以
-        "已消解的旧消息 + 新追加的原始消息"能一起重新消解，幂等。
+        只重算**本会话**：其它会话的记忆原样保留（增量），所以重复 Add 不会重跑其它会话的抽取。
         """
         lock = _lock_for(self.user_id)
         async with lock:
@@ -192,32 +206,27 @@ class UserStore:
                 meta["next_index"] = int(entry["index"]) + 1
             session_index = int(entry["index"])
 
-            # ---- 追加消息（沿用同一个会话号，序号接在已有条数之后）----
-            # 新消息写成**原始格式**（content=原话、time=会话时间戳）；该文件的既有记录
-            # 可能已消解（带 source_content/source_time），resolve 会各取各的原始视图。
-            self.sessions_dir.mkdir(parents=True, exist_ok=True)
-            path = self.session_path(session_index)
-            records = read_jsonl(path)
+            # ---- 追加消息到 msgmem.jsonl（序号接在已有条数之后）----
+            records = read_jsonl(self.msgmem_path)
             start = int(entry.get("count", 0))
             for offset, message in enumerate(messages, start=1):
                 content = normalize_content(message.get("content"))
-                records.append(
-                    make_session_record(
-                        msg_id_value=f"session_{session_index}_{start + offset}",
-                        role=str(message.get("role") or ""),
-                        content=content,
-                        time=_iso_from_ms(message.get("timestamp")),
-                    )
-                )
+                records.append(make_memory(
+                    memory=content,
+                    memory_type="msg",
+                    mem_id=f"session_{session_index}_{start + offset}",
+                    time=_iso_from_ms(message.get("timestamp")),
+                    role=str(message.get("role") or ""),
+                    tag=[],
+                    source=[],
+                    changelog=[{"time": now_iso(), "content": "created"}],
+                ))
             entry["count"] = start + len(messages)
-            write_jsonl(path, records)
+            write_memories(self.msgmem_path, records)
 
-            # ---- 消解该 session（其余 session 原样保留）----
-            refreshed = await self._resolve_session(
-                session_index=session_index,
-                config=config,
-                client=client,
-                log=log,
+            # ---- 重算本会话的 summem 与 atommem ----
+            refreshed = await self._refresh_memories(
+                session_index=session_index, config=config, client=client, log=log,
             )
 
             # ---- meta：记下这个 request_id（幂等键）----
@@ -227,11 +236,11 @@ class UserStore:
             if log is not None:
                 log.info(
                     f"Add 写入 {len(messages)} 条 -> session {session_index}"
-                    f"（共 {entry['count']} 条）resolve={'成功' if refreshed else '未变'}"
+                    f"（共 {entry['count']} 条）记忆刷新={'成功' if refreshed else '未变'}"
                 )
             return {"written": len(messages), "duplicate": False, "session_index": session_index}
 
-    async def _resolve_session(
+    async def _refresh_memories(
         self,
         *,
         session_index: int,
@@ -239,42 +248,102 @@ class UserStore:
         client: Any,
         log: Any | None,
     ) -> bool:
-        """消解 ``session_index`` 的会话文件（就地覆盖）。失败不抛 —— 消解不出来不该让 Add 失败。
+        """重算该会话的 summem（一次 LLM）与 atommem（逐 message agent）。失败不抛。
 
-        见 ``add.resolve.refresh_session``。输入取原始视图，所以旧消息不会被重复消解。
+        见 offline 的 ``add/summem.py`` 与 ``add/atommem.py``。
         """
+        speaker_a, speaker_b = "user", "assistant"
         try:
-            return await resolve_mod.refresh_session(
-                self.root,
-                session_index,
-                _index_call_config(config),
-                client,
-                speaker_a="user",
-                speaker_b="assistant",
+            # --- summem：替换该会话那一条 ---
+            sess_records = self.session_records(session_index)
+            if sess_records:
+                summary = await summem_mod.summarize_session(
+                    session_index=session_index,
+                    session_time=str((sess_records[0].get("metadata") or {}).get("time") or ""),
+                    records=sess_records,
+                    client=client,
+                    config=config,
+                    speaker_a=speaker_a,
+                    speaker_b=speaker_b,
+                )
+                existing = read_jsonl(self.summem_path)
+                summary_id = f"session_{session_index}_summary"
+                existing = [
+                    r for r in existing if (r.get("metadata") or {}).get("id") != summary_id
+                ]
+                write_memories(self.summem_path, existing + [summary])
+            # --- atommem：只跑本会话的 message（agent）---
+            await self._refresh_atoms(
+                session_index=session_index, config=config, client=client, log=log,
             )
-        except Exception as exc:  # noqa: BLE001 - 消解失败不该让 Add 整体失败
+        except Exception as exc:  # noqa: BLE001 - 记忆刷新失败不该让 Add 失败
             if log is not None:
-                log.warn(f"session {session_index} 消解失败：{type(exc).__name__}: {exc}")
+                log.warn(f"session {session_index} 记忆刷新失败：{type(exc).__name__}: {exc}")
             return False
+        return True
+
+    async def _refresh_atoms(
+        self, *, session_index: int, config: dict[str, Any], client: Any, log: Any | None,
+    ) -> None:
+        """对本会话的每条 message 跑 add agent，重建本会话的 atom（就地写 atommem.jsonl）。"""
+        from .. import llm
+        from ..search import agent as agent_mod  # noqa: F401  (供 monkeypatch 的完整性)
+        from ..search.runner import ModelRunner
+
+        # Add 侧**必须**用 add_tool.json（search 的 ``tool_config`` 是给检索 agent 的，别混用）。
+        catalog = toolcfg.load_catalog(
+            config.get("add_tool_config") or "configs/add_tool.json"
+        )
+        catalog.validate(["read", "edit", "bash"])
+
+        msg_records = self.session_records(session_index)
+        summaries_by_session = group_by_session(read_jsonl(self.summem_path))
+        summaries = {n: rs[0] for n, rs in summaries_by_session.items() if rs}
+
+        atom_cfg = dict(config)
+        # api.yaml 用 ``add_max_steps`` 表达 add agent 的步数；离线 add 用 ``max_steps``。
+        if "add_max_steps" in atom_cfg and "max_steps" not in atom_cfg:
+            atom_cfg["max_steps"] = atom_cfg["add_max_steps"]
+        # 工具配置：Add 侧**必须**用 add_tool.json（与 search 的 tool.json 不同）。
+        atom_cfg["tool_config"] = config.get("add_tool_config") or "configs/add_tool.json"
+        # 模型参数：api.yaml 的 ``index`` 段给 add 侧（summem / atommem）用 → 映射成 ``atommem`` 段。
+        if "index" in config and "atommem" not in atom_cfg:
+            atom_cfg["atommem"] = config["index"]
+        runner = atommem_mod._Runner(
+            client, atom_cfg, log or llm_quiet_logger(), self.root / ".atommem.model_calls.jsonl"
+        )
+        # 本会话的 atom 先清掉，再逐条重建（增量：只动本会话）。
+        existing = read_jsonl(self.atommem_path)
+        my_ids = {(r.get("metadata") or {}).get("id") for r in msg_records}
+        kept = [r for r in existing if not (
+            set((r.get("metadata") or {}).get("source") or []) & my_ids
+        )]
+        # 关键：先把"保留的其它会话 atom"落盘，agent 才能看到一个干净的基线，
+        # 且 run_message 用 before_lines 能正确隔离出它**本会话**新增的行。
+        write_memories(self.atommem_path, kept)
+        for position, target in enumerate(msg_records):
+            prior = [
+                r for r in msg_records[:position]
+                if atommem_mod.msg_session_number((r.get("metadata") or {}).get("id") or "")
+                == session_index
+            ]
+            try:
+                await atommem_mod.run_message(
+                    target=target, prior=prior, summaries=summaries, workspace=self.root,
+                    atommem_path=self.atommem_path, config=atom_cfg, catalog=catalog,
+                    runner=runner, log=log or llm_quiet_logger(),
+                    speaker_a="user", speaker_b="assistant",
+                )
+            except Exception as exc:  # noqa: BLE001
+                if log is not None:
+                    log.warn(f"atom 抽取失败 {target.get('metadata', {}).get('id')}：{exc}")
+        runner.model.close()
 
 
-def _index_call_config(config: dict[str, Any]) -> dict[str, Any]:
-    """从 api 配置里取出 index 抽取调用参数（``index`` 段 + 顶层重试参数）。
+def llm_quiet_logger():
+    from ..log import Logger
 
-    与 ``search.runner.gen_call_config`` 同一套做法：模型参数在子段里，重试参数在顶层，
-    ``llm.chat_completion`` 需要的是合起来的一份。
-    """
-    merged: dict[str, Any] = {}
-    section = config.get("index") or config.get("summary") or {}
-    if isinstance(section, dict):
-        merged.update(section)
-    for key in ("timeout", "max_retries", "backoff_base", "rate_limit_backoff",
-                "max_backoff", "backoff_jitter"):
-        if key in config:
-            merged[key] = config[key]
-    merged.setdefault("temperature", 0.2)
-    merged.setdefault("max_tokens", 4096)
-    return merged
+    return Logger(level="warn")
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +355,6 @@ def debug_dump(store: UserStore, stream: Any | None = None) -> None:
     stream = stream or sys.stderr
     print(
         f"[store] user={store.user_id} root={store.root} "
-        f"sessions={len(store.sessions())}",
+        f"msg={len(store.sessions())}",
         file=stream,
     )

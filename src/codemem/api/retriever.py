@@ -46,14 +46,13 @@ def _new_run_dir(store: UserStore) -> Path:
 
 
 def _link_inputs(store: UserStore, run_dir: Path) -> Path:
-    """把该 user 的语料（``sessions/`` 目录）硬链进 ``run_dir/inputs/``（只读输入，不改源文件）。"""
+    """把该 user 的三个记忆文件硬链进 ``run_dir/inputs/``（只读输入，不改源文件）。"""
     inputs_dir = run_dir / "inputs"
-    sessions_target = inputs_dir / runner_mod.CORPUS_DIR
-    sessions_target.mkdir(parents=True, exist_ok=True)
-    source_dir = store.sessions_dir
-    if source_dir.is_dir():
-        for path in sorted(source_dir.glob("session_*.jsonl")):
-            runner_mod.link_or_copy(path, sessions_target / path.name)
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    for name in runner_mod.CORPUS_FILES:
+        source = store.root / name
+        if source.exists():
+            runner_mod.link_or_copy(source, inputs_dir / name)
     return inputs_dir
 
 

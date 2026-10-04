@@ -88,12 +88,12 @@ def repeat_notice(call: ToolCall, count: int) -> str:
         f"ERROR: you already ran this exact {call.tool} call {count} times "
         f"({call.describe()}). Running it again cannot change the result.\n"
         f"Do something DIFFERENT. Common reasons you are stuck:\n"
-        f"- That word may simply not be in that file. Try another word, or another session file.\n"
+        f"- That word may simply not be in that file. Try another word, or another memory file.\n"
         f"- To hop: grep a NEW name or number you just read, e.g. "
-        f"grep -rin \"Melanie husband\" inputs/sessions/ | head\n"
+        f"grep -rin \"Melanie husband\" inputs/ | head\n"
         f"- To see what you already have: grep -c . evidence.jsonl\n"
         f"- If the question wants a SET, or the same topic keeps turning up in different "
-        f"sessions, grep -rin the name across inputs/sessions/ to see every session it appears in.\n"
+        f"sessions, grep -rin the name across inputs/ to see every place it appears.\n"
         f"When the evidence already answers the question, reply with plain text (no JSON) to finish."
     )
 
@@ -155,9 +155,9 @@ def grep_no_match_notice() -> str:
     return (
         "\n\n[grep exited 1: that means NO MATCH, not a failure -- grep returns 1 when a pattern "
         "is not found. The word is either absent from that file or spelled differently there. "
-        "Next: try a shorter/other word, fewer terms at once, or another session file "
-        "(inputs/sessions/session_N.jsonl). See what is actually there with: "
-        "grep -rc . inputs/sessions/]"
+        "Next: try a shorter/other word, fewer terms at once, or another memory file "
+        "(inputs/atommem.jsonl, msgmem.jsonl). See what is actually there with: "
+        "grep -rc . inputs/*.jsonl]"
     )
 
 
@@ -176,8 +176,8 @@ def no_output_notice(call: ToolCall) -> str:
     return (
         "\n\n[(no output). grep found NO match for that pattern -- that is not a crash "
         "(grep exits 1 when nothing matches). Either the word is not in that file, or it is "
-        "spelled differently there. Try another word, or another session file. "
-        "Check what is actually there with: grep -rc . inputs/sessions/]"
+        "spelled differently there. Try another word, or another memory file. "
+        "Check what is actually there with: grep -rc . inputs/*.jsonl]"
     )
 
 
@@ -390,7 +390,7 @@ def compact_messages(
                 continue
             tools_used.append(call.tool)
             command = str(call.args.get("command") or call.args.get("path") or "")
-            for name in ("sessions/", "evidence.jsonl"):
+            for name in ("inputs/", "evidence.jsonl"):
                 if name in command:
                     notes.append(name)
             # 抓出命令里提到的 id（形如 "session_1_3"），它们是最该记住的东西 ——

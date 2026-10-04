@@ -100,7 +100,8 @@ def test_toolcfg(tmp: Path) -> None:
     check("渲染含问题原文", "Who is Caroline?" in rendered)
     # 检索就是 grep：语料是 JSONL，行号稳定，可以 grep -n 再 read offset
     check("渲染含 grep 用法", "grep -rin" in rendered)
-    check("渲染给出递归 grep + read 精读的组合", "inputs/sessions/" in rendered and "read inputs/sessions/session_" in rendered)
+    check("渲染给出递归 grep + read 精读的组合", "grep -rin \"word\" inputs/" in rendered
+          and "inputs/atommem.jsonl" in rendered)
     check("渲染含 date -d 做时间算术", "date -d" in rendered)
     check("不再有已删除的检索 CLI", "search \"" not in rendered and "timecalc" not in rendered)
     check("不再有 jq", "jq " not in rendered)
@@ -128,7 +129,7 @@ def test_toolcfg(tmp: Path) -> None:
     check("证据标准：不编造精度", "NO INVENTED PRECISION" in rendered)
     check("证据标准：source 必须真实", "SOURCED" in rendered)
     check("schema 说明可以改写 content", "Rewrite freely" in rendered)
-    check("schema 要求 source 非空", "NON-EMPTY array of msg_ids" in rendered)
+    check("schema 要求 source 非空", "NON-EMPTY array of record ids" in rendered)
     # 输出 schema 的字段顺序：自回归模型按顺序生成，reasoning 在前 = 先推理再作答。
     # 这条不是审美 —— 放在后面就成了"先给答案再补理由"，退化成事后编解释。
     import re as _re
@@ -184,13 +185,13 @@ def test_toolcfg(tmp: Path) -> None:
     check("有 worked example（相对时间）", "date -d \"8 May 2023 -1 day\"" in rendered)
     check("有 worked example（keyword 检索）", "WORKED EXAMPLE (keyword search" in rendered)
     check("有 worked example（通读相关 session，集合型）", "WORKED EXAMPLE (Strategy 2" in rendered)
-    # 语料是消解后的会话目录：没有顶层印象/概览层（实测它诱导不检索直接答）
+    # 语料是三个记忆文件：没有顶层印象/概览层（实测它诱导不检索直接答）
     check("提示里没有顶层印象 speakers summary", "speakers_summary" not in rendered)
-    check("提示里不再有 atommem/msgmem", "atommem" not in rendered and "msgmem" not in rendered)
-    check("提示里没有 session summary 层", "session_summaries" not in rendered
-          and "session_N_summary" not in rendered)
-    check("提示暴露消解后的会话目录", "inputs/sessions/" in rendered)
-    check("提示不再提 index/nodes/edges/graph", "index.jsonl" not in rendered
+    check("提示暴露三个记忆文件", "inputs/atommem.jsonl" in rendered
+          and "inputs/msgmem.jsonl" in rendered and "inputs/summem.jsonl" in rendered)
+    check("提示把 atommem 列为首选语料", "START HERE" in rendered)
+    check("提示里没有已废弃的 sessions/ 目录", "inputs/sessions/" not in rendered)
+    check("提示不提 index/nodes/edges/graph", "index.jsonl" not in rendered
           and "nodes.jsonl" not in rendered and "edges.jsonl" not in rendered)
     # 上下文预算：system prompt 每个 round 都整体注入一次，涨回去就等于白做这次简化
     check("system prompt 控制在 18000 字符内", len(rendered) < 18000, str(len(rendered)))
@@ -408,12 +409,12 @@ async def test_tools(tmp: Path) -> None:
 
     # --- 重复拒绝消息要给出脱困方向 ---
     repeat = agent_mod.repeat_notice(ToolCall(tool="bash", args={"command": "x"}), 2)
-    check("重复拒绝消息提到真实语料文件", "inputs/sessions/" in repeat)
+    check("重复拒绝消息提到真实语料文件", "inputs/" in repeat)
     check("重复拒绝消息给出继续检索的方向", "grep" in repeat.lower())
     check("重复拒绝消息给出集合型问题的出路", "SET" in repeat)
     # 已删除的语料名不该再出现在给模型的文案里（会诱使它去搜不存在的文件）
-    for stale in ("atommem", "msgmem", "timecalc", "jq"):
-        check(f"重复拒绝消息不含已删除的 {stale}", stale not in repeat)
+    for stale in ("timecalc", "jq", "inputs/sessions/"):
+        check(f"重复拒绝消息不含已废弃的 {stale}", stale not in repeat)
         check(f"grep 提示不含已删除的 {stale}", stale not in notice)
 
 
@@ -933,7 +934,7 @@ async def test_compaction_units(tmp: Path) -> None:
     for index in range(12):
         messages.append({"role": "assistant", "content": json.dumps(
             {"tool": "bash", "args": {"command": f"jq 'select(.msg_id==\"session_{index}_1\")' "
-                                                 f"inputs/sessions/session_1.jsonl >> evidence.jsonl",
+                                                 f"inputs/msgmem.jsonl >> evidence.jsonl",
                                       "description": "x"}})})
         messages.append({"role": "user", "content": "X" * 400})
     result = agent_mod.compact_messages(messages, max_chars=1000, keep_recent=4)
@@ -1385,118 +1386,138 @@ def test_eval_metrics() -> None:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# 7b. add.resolve：消解（时间锚定 + 指代消解 + 原话保留）
+# 7b. add：三层记忆（msgmem 转换 / summem 解析 / atommem 补全 + agent）
 # ---------------------------------------------------------------------------
 
-def test_resolve_module(tmp: Path) -> None:
-    section("7b. add.resolve：解析 / 原话视图 / 记录生成")
-    from codemem.add import resolve as resolve_mod
+def test_add_memory_module(tmp: Path) -> None:
+    section("7b. add：msgmem 转换 / summem 解析 / atommem 系统字段补全")
+    from codemem.add import memory as mem_mod
+    from codemem.add import msgmem as msgmem_mod
+    from codemem.add import summem as summem_mod
+    from codemem.add import atommem as atommem_mod
+    from codemem import dataset
 
-    # --- parse_resolution：围栏、别名字段、坏 kind ---
-    parsed = resolve_mod.parse_resolution(
-        '```json\n{"content":"Caroline went to a LGBTQ support group on 7 May 2023.",'
-        '"time":"7 May 2023","time_kind":"point","time_raw":"yesterday"}\n```'
+    # --- msgmem：session → type=msg 记录 ---
+    message = dataset.RawMessage(id="session_1_3", session=1, message_index=3,
+                                 speaker="Caroline", text="I went out yesterday",
+                                 session_time="1:56 pm on 8 May, 2023")
+    item = msgmem_mod.build_msg_item(message)
+    check("msgmem：id 沿用 session_N_M", item["metadata"]["id"] == "session_1_3")
+    check("msgmem：type=msg", item["metadata"]["type"] == "msg")
+    check("msgmem：memory 是原话", item["memory"] == "I went out yesterday")
+    check("msgmem：role 是真名", item["metadata"]["role"] == "Caroline")
+    check("msgmem：time 是原始会话时间戳（锚点）",
+          item["metadata"]["time"] == "1:56 pm on 8 May, 2023")
+    check("msgmem：tag/source 为空", item["metadata"]["tag"] == [] and item["metadata"]["source"] == [])
+
+    # --- 会话号解析（memory 公共工具）---
+    check("会话号：session_3_14 -> 3", mem_mod.session_number("session_3_14") == 3)
+    check("会话号：session_3_summary -> 3", mem_mod.session_number("session_3_summary") == 3)
+    check("msg 会话号：session_3_14 -> 3", mem_mod.msg_session_number("session_3_14") == 3)
+    check("msg 会话号：summary 不算 msg", mem_mod.msg_session_number("session_3_summary") is None)
+    grouped = mem_mod.group_by_session([
+        {"metadata": {"id": "session_2_1"}}, {"metadata": {"id": "session_1_1"}},
+        {"metadata": {"id": "session_2_2"}},
+    ])
+    check("group_by_session 分组且有序", sorted(grouped) == [1, 2] and len(grouped[2]) == 2)
+
+    # --- summem：解析模型输出 ---
+    check("summem 解析：取 memory 字段",
+          summem_mod.parse_summary('{"memory": "Caroline went swimming."}') == "Caroline went swimming.")
+    check("summem 解析：围栏包裹",
+          summem_mod.parse_summary('```json\n{"summary": "x y"}\n```') == "x y")
+    check("summem 解析：纯文本兜底", summem_mod.parse_summary("just a summary") == "just a summary")
+    check("summem 解析：空输入 -> 空", summem_mod.parse_summary("") == "")
+
+    # --- atommem：finalize_atoms 补系统字段（模型只填 4 个字段）---
+    raw_atoms = [
+        {"memory": "Caroline went to a group on 7 May 2023",
+         "metadata": {"time": "7 May 2023", "role": "Caroline", "tag": ["activity:group"]}},
+        {"memory": "Melanie has kids", "metadata": {}},                 # 缺 time/role -> 回落
+        {"memory": "", "metadata": {}},                                 # 空 -> 丢弃
+        {"memory": "Caroline went to a group on 7 May 2023", "metadata": {}},
+    ]
+    atoms = atommem_mod.finalize_atoms(
+        raw_atoms, source_id="session_1_3",
+        default_time="1:56 pm on 8 May, 2023", default_role="Caroline",
     )
-    check("parse：围栏包裹能解析", parsed.get("time") == "7 May 2023", str(parsed))
-    check("parse：time_kind 保留", parsed["time_kind"] == "point")
-    check("parse：time_raw 保留原话", parsed["time_raw"] == "yesterday")
-    check("parse：content 保留", "LGBTQ support group" in parsed["content"])
-    check("parse：非法 time_kind 归空",
-          resolve_mod.parse_resolution('{"content":"x","time":"2022","time_kind":"weird"}')["time_kind"] == "")
-    check("parse：空输入返回空", resolve_mod.parse_resolution("") == {})
-    check("parse：坏 JSON 返回空（调用方据此保留原话）",
-          resolve_mod.parse_resolution("not json") == {})
-
-    # --- 原话视图：source_* 优先（就地覆盖是幂等的）---
-    resolved = {"msg_id": "session_1_3", "role": "Caroline", "content": "Caroline went ... 7 May 2023",
-                "time": "7 May 2023", "time_kind": "point",
-                "source_content": "I went to a LGBTQ support group yesterday",
-                "source_time": "1:56 pm on 8 May, 2023"}
-    check("原话视图：content 取 source_content",
-          resolve_mod.raw_content(resolved) == "I went to a LGBTQ support group yesterday")
-    check("原话视图：time 取 source_time",
-          resolve_mod.raw_time(resolved) == "1:56 pm on 8 May, 2023")
-    # 未消解过的记录：content/time 本身就是原话
-    raw = {"msg_id": "session_2_1", "role": "Melanie", "content": "hi", "time": "9 May 2023"}
-    check("原话视图：未消解记录回落到 content", resolve_mod.raw_content(raw) == "hi")
-    check("原话视图：未消解记录回落到 time", resolve_mod.raw_time(raw) == "9 May 2023")
-
-    # --- to_resolved_record：消解结果 + 原话落进 source_* ---
-    target = {"msg_id": "session_1_3", "role": "Caroline",
-              "content": "she said hi yesterday", "time": "8 May 2023"}
-    out = resolve_mod.to_resolved_record(
-        target, {"content": "Caroline said hi on 7 May 2023.",
-                 "time": "7 May 2023", "time_kind": "point", "time_raw": "yesterday"},
-        session_time="8 May 2023")
-    check("record：content 是消解结果", out["content"] == "Caroline said hi on 7 May 2023.")
-    check("record：time 是锚定后的", out["time"] == "7 May 2023")
-    check("record：time_kind 落盘", out["time_kind"] == "point")
-    check("record：source_content 保留原话", out["source_content"] == "she said hi yesterday")
-    check("record：source_time 保留原始时间戳", out["source_time"] == "8 May 2023")
-    check("record：msg_id / role 不变", out["msg_id"] == "session_1_3" and out["role"] == "Caroline")
-
-    # --- 消解失败：保留原话、time 留空（绝不写坏记录）---
-    failed = resolve_mod.to_resolved_record(target, {}, session_time="8 May 2023")
-    check("记录：消解失败时 content 保留原话", failed["content"] == "she said hi yesterday")
-    check("记录：消解失败时 time 留空", failed["time"] == "" and failed["time_kind"] == "")
-    check("记录：消解失败时 source_content 仍有原话",
-          failed["source_content"] == "she said hi yesterday")
+    check("finalize：空 memory 与重复被丢弃", len(atoms) == 2, str(len(atoms)))
+    check("finalize：id 顺序编号 session_1_3_K",
+          [a["metadata"]["id"] for a in atoms] == ["session_1_3_1", "session_1_3_2"],
+          str([a["metadata"]["id"] for a in atoms]))
+    check("finalize：type 恒为 atom", all(a["metadata"]["type"] == "atom" for a in atoms))
+    check("finalize：source 恒为本 message 的 id",
+          all(a["metadata"]["source"] == ["session_1_3"] for a in atoms))
+    check("finalize：changelog 被补", all(a["metadata"]["changelog"] for a in atoms))
+    check("finalize：缺 time 时回落到会话时间",
+          atoms[1]["metadata"]["time"] == "1:56 pm on 8 May, 2023")
+    check("finalize：缺 role 时回落到说话人", atoms[1]["metadata"]["role"] == "Caroline")
+    # 模型若违规带了 id/source/type，一律被覆盖
+    overridden = atommem_mod.finalize_atoms(
+        [{"memory": "x", "metadata": {"id": "hack", "type": "inner", "source": ["bad"]}}],
+        source_id="session_9_9", default_time="", default_role="R",
+    )
+    check("finalize：覆盖模型带的 id/type/source",
+          overridden[0]["metadata"]["id"] == "session_9_9_1"
+          and overridden[0]["metadata"]["type"] == "atom"
+          and overridden[0]["metadata"]["source"] == ["session_9_9"])
 
 
-async def test_resolve_pipeline(tmp: Path) -> None:
-    section("7c. add.resolve：run_dir 端到端（就地覆盖、幂等、原话保留）")
+async def test_atommem_agent(tmp: Path) -> None:
+    section("7c. add.atommem：agent 逐 message 抽 atom（假模型 + 真工具）")
     import re
 
-    from codemem.add import resolve as resolve_mod
+    from codemem.add import atommem as atommem_mod
     from codemem import llm as llm_mod
 
-    calls = []
+    sample = tmp / "AtomPair"
+    sample.mkdir(parents=True, exist_ok=True)
+    # msgmem：一个会话两条消息
+    msgs = [
+        {"memory": "Hey Mel! I'm swamped with the kids & work.",
+         "metadata": {"id": "session_1_1", "type": "msg", "time": "1:56 pm on 8 May, 2023",
+                      "role": "Melanie", "tag": [], "source": [], "changelog": []}},
+        {"memory": "I went to a LGBTQ support group yesterday.",
+         "metadata": {"id": "session_1_2", "type": "msg", "time": "1:56 pm on 8 May, 2023",
+                      "role": "Caroline", "tag": [], "source": [], "changelog": []}},
+    ]
+    (sample / "msgmem.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in msgs), encoding="utf-8")
+    (sample / "summem.jsonl").write_text(
+        json.dumps({"memory": "Melanie and Caroline catch up.",
+                    "metadata": {"id": "session_1_summary", "type": "summary",
+                                 "time": "1:56 pm on 8 May, 2023", "role": "summary",
+                                 "tag": [], "source": [], "changelog": []}}) + "\n",
+        encoding="utf-8")
 
     async def fake_chat_completion(client, config, messages):  # noqa: ANN001
-        user = messages[1]["content"]
-        mid = re.search(r"\[(session_\d+_\d+)\]", user).group(1)
-        calls.append(mid)
-        return json.dumps({
-            "content": f"RESOLVED {mid}",
-            "time": "7 May 2023", "time_kind": "point", "time_raw": "yesterday",
-        })
+        """假 agent：第一次 append 一条 atom，之后回纯文本表示完成。"""
+        has_assistant = any(m.get("role") == "assistant" for m in messages)
+        if not has_assistant:
+            body = json.dumps({"memory": "Melanie has kids and a job",
+                               "metadata": {"time": "1:56 pm on 8 May, 2023",
+                                            "role": "Melanie", "tag": ["entity:family"]}}) + "\n"
+            return json.dumps({"tool": "edit", "args": {"append": body}})
+        return "Done."
 
     saved = llm_mod.chat_completion
     llm_mod.chat_completion = fake_chat_completion  # type: ignore[assignment]
     try:
-        sample = tmp / "ResolvePair"
-        sessions = sample / "sessions"
-        sessions.mkdir(parents=True, exist_ok=True)
-        for s in (1, 2):
-            records = [
-                {"msg_id": f"session_{s}_{i}", "role": "user", "time": "8 May 2023",
-                 "content": f"raw message {s}-{i}"}
-                for i in (1, 2)
-            ]
-            (sessions / f"session_{s}.jsonl").write_text(
-                "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
-
-        result = await resolve_mod.run_dir(sample, {}, None)
-        check("run_dir：状态 OK", result["status"] == "OK", str(result))
-        check("run_dir：2 个 session / 4 条消息", result["sessions"] == 2 and result["messages"] == 4,
-              str(result))
-        content = (sessions / "session_1.jsonl").read_text(encoding="utf-8")
-        check("run_dir：就地覆盖为消解结果", "RESOLVED session_1_1" in content, content[:200])
-        check("run_dir：原话保留在 source_content", "raw message 1-1" in content)
-        check("run_dir：会话时间锚点保留在 source_time", "8 May 2023" in content)
-
-        # --- 幂等：再跑一遍，输入仍是原话（source_content），不会把消解结果当原话 ---
-        calls.clear()
-        await resolve_mod.run_dir(sample, {}, None)
-        second = (sessions / "session_1.jsonl").read_text(encoding="utf-8")
-        check("幂等：再跑一遍结果不变", "RESOLVED session_1_1" in second)
-        check("幂等：原话没有被消解结果污染", "raw message 1-1" in second)
-
-        # --- limit_sessions：只跑第 1 个会话 ---
-        before_2 = (sessions / "session_2.jsonl").read_text(encoding="utf-8")
-        await resolve_mod.run_dir(sample, {}, None, limit_sessions=1)
-        check("limit_sessions：只跑前 1 个会话（session_2 未被再处理）",
-              (sessions / "session_2.jsonl").read_text(encoding="utf-8") == before_2)
+        import codemem.search.toolcfg as tc
+        catalog = tc.load_catalog(PROJECT_ROOT / "configs" / "add_tool.json")
+        result = await atommem_mod.run_dir(
+            sample, {"max_steps": 4, "context_window": 4, "concurrency": 1},
+            None, catalog, Logger(level="error"),
+        )
+        check("atommem：状态 OK", result["status"] == "OK", str(result))
+        check("atommem：处理了 2 条 message", result["messages"] == 2, str(result))
+        check("atommem：写出了 atom", result["atoms"] >= 1, str(result))
+        content = (sample / "atommem.jsonl").read_text(encoding="utf-8")
+        check("atommem：atom 带系统补的 id/source/type",
+              '"id": "session_1_1_1"' in content and '"source": ["session_1_1"]' in content
+              and '"type": "atom"' in content, content[:300])
+        check("atommem：memory 是 agent 写的 fact",
+              "Melanie has kids" in content, content[:300])
     finally:
         llm_mod.chat_completion = saved
 
@@ -1512,22 +1533,30 @@ async def test_end_to_end(tmp: Path) -> None:
     data_dir = tmp / "data"
     sample_dir = data_dir / "Test_Pair"
     sample_dir.mkdir(parents=True, exist_ok=True)
-    corpus = [
-        make_memory("a1", "Caroline joined an LGBTQ support group"),
-        make_memory("a2", "Caroline has been going for about a month"),
-    ]
-    # 新语料：sessions/ 目录，每个会话一个文件（消解后的、上下文无关的记录）
-    def sess(mid, role, content, time=""):
-        return {"msg_id": mid, "role": role, "time": time, "content": content,
-                "time_kind": "point", "source_content": content, "source_time": time}
 
-    sessions_dir = sample_dir / "sessions"
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    (sessions_dir / "session_1.jsonl").write_text(
-        "".join(json.dumps(sess(f"session_1_{i}", "Caroline" if i % 2 else "Melanie",
-                                f"raw message {i}", "1:56 pm on 8 May, 2023")) + "\n"
+    # 新语料：三个记忆文件（msgmem / summem / atommem），msgmem 是原始消息。
+    def msg(mid, role, content, time=""):
+        return {"memory": content,
+                "metadata": {"id": mid, "type": "msg", "time": time, "role": role,
+                             "tag": [], "source": [], "changelog": []}}
+
+    (sample_dir / "msgmem.jsonl").write_text(
+        "".join(json.dumps(msg(f"session_1_{i}", "Caroline" if i % 2 else "Melanie",
+                               f"raw message {i}", "1:56 pm on 8 May, 2023")) + "\n"
                 for i in range(1, 4)), encoding="utf-8"
     )
+    (sample_dir / "summem.jsonl").write_text(
+        json.dumps({"memory": "Caroline and Melanie catch up.",
+                    "metadata": {"id": "session_1_summary", "type": "summary",
+                                 "time": "1:56 pm on 8 May, 2023", "role": "summary",
+                                 "tag": [], "source": [], "changelog": []}}) + "\n",
+        encoding="utf-8")
+    (sample_dir / "atommem.jsonl").write_text(
+        json.dumps({"memory": "Caroline joined an LGBTQ support group.",
+                    "metadata": {"id": "session_1_3_1", "type": "atom",
+                                 "time": "1:56 pm on 8 May, 2023", "role": "Caroline",
+                                 "tag": [], "source": ["session_1_3"], "changelog": []}}) + "\n",
+        encoding="utf-8")
 
     run_dir = tmp / "runs"
     config = evomem_v3.load_config(None)
@@ -1539,15 +1568,16 @@ async def test_end_to_end(tmp: Path) -> None:
     log = Logger(level="error")
 
     inputs_dir = await evomem_v3.build_inputs(sample_dir, run_dir, config, log=log)
-    check("inputs 已建立", (inputs_dir / "sessions").is_dir())
-    check("会话语料硬链进 inputs/sessions/",
-          (inputs_dir / "sessions" / "session_1.jsonl").exists())
+    check("输入已建立", (inputs_dir / "msgmem.jsonl").exists())
+    check("三个记忆文件都硬链进 inputs/",
+          all((inputs_dir / name).exists()
+              for name in ("msgmem.jsonl", "summem.jsonl", "atommem.jsonl")))
     check("inputs 是硬链（同一 inode）",
-          (inputs_dir / "sessions" / "session_1.jsonl").stat().st_ino
-          == (sessions_dir / "session_1.jsonl").stat().st_ino)
-    # Windows 上 stat 的权限位不反映可执行性（一律 0o666），所以只断言文件存在 + 内容对。
-    check("inputs 里只有 sessions/（检索靠系统 grep）",
-          sorted(p.name for p in inputs_dir.iterdir()) == ["sessions"],
+          (inputs_dir / "msgmem.jsonl").stat().st_ino
+          == (sample_dir / "msgmem.jsonl").stat().st_ino)
+    check("inputs 里只有三个记忆文件",
+          sorted(p.name for p in inputs_dir.iterdir())
+          == ["atommem.jsonl", "msgmem.jsonl", "summem.jsonl"],
           str(sorted(p.name for p in inputs_dir.iterdir())))
     # 会话清单：只列会话号与时间，不含任何事实内容（从会话文件推）
     _roster = evomem_v3.load_session_roster(inputs_dir)
@@ -1571,7 +1601,7 @@ async def test_end_to_end(tmp: Path) -> None:
             # 朴素 loop：grep 原文 → date 算 → edit append 写证据
             if self.agent_turns == 1:
                 return json.dumps({"tool": "bash", "args": {
-                    "command": 'grep -rin "support group" inputs/sessions/',
+                    "command": 'grep -rin "support group" inputs/',
                     "description": "Grepping messages"}})
             if self.agent_turns == 2:
                 return json.dumps({"tool": "bash", "args": {
@@ -1620,9 +1650,9 @@ async def test_end_to_end(tmp: Path) -> None:
                 return '{"sufficient": true, "answer": "x", "missing": []}'
             self.turn += 1
             if self.turn == 1:
-                # 软链逃逸：写 inputs/sessions/session_1.jsonl（resolve 后在外，应被拒）
+                # 软链逃逸：写 inputs/msgmem.jsonl（硬链/软链逃逸应被拒）
                 return json.dumps({"tool": "edit", "args": {
-                    "path": "inputs/sessions/session_1.jsonl", "append": "{}"}})
+                    "path": "inputs/msgmem.jsonl", "append": "{}"}})
             return "done"
 
     record2 = await evomem_v3.run_qa(
@@ -1633,7 +1663,7 @@ async def test_end_to_end(tmp: Path) -> None:
     )
     check("写只读输入被拒（未篡改）", record2.tampered is False)
     check("原会话语料未被改动",
-          "raw message" in (inputs_dir / "sessions" / "session_1.jsonl").read_text())
+          "raw message" in (inputs_dir / "msgmem.jsonl").read_text())
     check("工具错误被记账", record2.rounds[0]["steps"][0]["ok"] is False
           or not record2.rounds[0]["steps"][0]["result_text"] == "")
 
@@ -1663,7 +1693,7 @@ def main() -> int:
         test_toolcfg(tmp)
         test_evidence(tmp)
         test_qa_selection()
-        test_resolve_module(tmp)
+        test_add_memory_module(tmp)
         test_verifier_rendering()
         test_agent_guards()
         test_judge_temporal()
@@ -1675,7 +1705,7 @@ def main() -> int:
             loop.run_until_complete(test_tools(tmp))
             loop.run_until_complete(test_agent(tmp))
             loop.run_until_complete(test_compaction_units(tmp))
-            loop.run_until_complete(test_resolve_pipeline(tmp))
+            loop.run_until_complete(test_atommem_agent(tmp))
             loop.run_until_complete(test_end_to_end(tmp))
         finally:
             loop.close()

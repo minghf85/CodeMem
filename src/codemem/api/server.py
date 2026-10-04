@@ -42,9 +42,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
               "temperature": 0.2, "max_tokens": 4096, "enable_thinking": False},
     "store_dir": "data/api_store",
     "tool_config": "configs/tool.json",
+    "add_tool_config": "configs/add_tool.json",
     "concurrency": 8,
     "add_concurrency": 8,
     "top_k": 100,
+    # Add 侧：summem / atommem 的预算（atommem 是逐 message 的 add agent，默认 6 步）
+    "add_max_steps": 6,
     "timeout": 300,
     "max_retries": 3,
     "backoff_base": 2.0,

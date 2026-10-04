@@ -33,10 +33,10 @@ CodeMem 的答案是让一个 **code agent 自己检索与推导**：给它一�
 四个步骤，依赖方向严格单向，步骤之间**只通过数据文件耦合**（不互相 import）：
 
 ```
-add ──► sessions/session_N.jsonl   （原始措辞 → 消解后上下文无关）
+add ──► msgmem.jsonl / summem.jsonl / atommem.jsonl   （原始话 + 会话总结 + 原子事实）
                              │
                              ▼
-search ──────────────► evidence.jsonl      （question + 记忆库 → 能回答该问题的记忆列表）
+search ──────────────► evidence.jsonl      （question + 三层记忆 → 能回答该问题的记忆列表）
                              │
                              ▼
 answer ──────────────► answers.jsonl       （question + evidence → 答案）
@@ -47,8 +47,8 @@ eval ────────────────► eval.jsonl          （
 
 | 步骤 | 做什么 | 入口 |
 |---|---|---|
-| **add** | 一段对话记忆 → 消解后的会话文件（时间锚定 + 指代消解，上下文无关） | `python -m codemem.add` |
-| **search** | question + `sessions/` 语料 → `evidence.jsonl`（朴素 agent loop：检索 → 取证 → 验证） | `python -m codemem.search` |
+| **add** | 一段对话记忆 → 三层记忆文件（`msg` / `summary` / `atom`） | `python -m codemem.add` |
+| **search** | question + 三层记忆 → `evidence.jsonl`（朴素 agent loop：检索 → 取证 → 验证） | `python -m codemem.search` |
 | **answer** | question + `evidence.jsonl` → 答案（只用证据，不检索） | `python -m codemem.answer` |
 | **eval** | 答案正确性 + 指标（judge / token F1 / evidence recall / 失败归类） | `python -m codemem.eval` |
 | **api** | Add / Search 的 HTTP 封装（多用户隔离、request_id 幂等） | `python -m codemem.api` |
@@ -64,16 +64,25 @@ pip install openai pyyaml tqdm fastapi uvicorn      # Python 3.12+（grep / date
 ### 1. 构建记忆（add）
 
 ```bash
-python -m codemem.add                       # 全部目录
+python -m codemem.add                       # 全部目录（msgmem → summem → atommem）
 python -m codemem.add Caroline_Melanie      # 指定目录
+python -m codemem.add --stage atommem       # 只跑某一层
 ```
 
-产出 `data/{speaker_a}_{speaker_b}/sessions/session_N.jsonl`（**一次会话一个文件**）。add 的
-第二步 `resolve` 把每条消息改写成**上下文无关**的形式：**时间**锚定成绝对时间（`7 May 2023`）
-或带绝对锚点的相对时间（`the week before 9 June 2023`），**指代**消解成真名 —— 粒度严格照源话，
-绝不擅自加精度；原话保留在 `source_content` / `source_time`。于是 grep 命中的**就是能回答问题的
-原料**，同一实体跨会话都写成同一个真名。**没有摘要层，也没有额外的索引/图层** —— 消解后的消息
-本身就是导航。
+产出 `data/{speaker_a}_{speaker_b}/` 下的**三层记忆文件**（都是 JSONL，一行一条）：
+
+| 文件 | `type` | 内容 | 生成方式 |
+|---|---|---|---|
+| `msgmem.jsonl` | `msg` | 每条原始消息（原话），`time` 是会话时间戳（锚点） | 纯 CPU，由 dataset 直接转换 |
+| `summem.jsonl` | `summary` | 每个会话一份总结 | LLM，逐 session 一次 |
+| `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **add agent 逐 message 处理**，默认 `max_step=6` |
+
+`msgmem` 保留原始措辞与原始时间，是时间/指代的锚点；`atommem` 才是消解后的产物 —— 指代消解成
+真名、时间折算成绝对日期或带绝对锚点的相对时间（`the week before 9 June 2023`），精度严格照源话。
+add agent 只写 `{"memory", "metadata": {time, role, tag}}` 四个字段，`id` / `source` / `type` /
+`changelog` 由系统补齐。**核心原理**：处理第 N 条 message 时，agent 能在已生成的 `msgmem` /
+`summem` / `atommem` 里 grep 前面相关信息（可能跨 session）来消解指代、补全隐含事实 —— 所以目录内
+**逐 message 串行**、不同目录并行，重跑一条 message 会按 `source` 替换它那组 atom（幂等）。
 
 ### 2. 检索证据（search）
 
@@ -84,7 +93,8 @@ python -m codemem.search --experiment search                        # 全部
 ```
 
 每条 QA 的产物是 `evidence.jsonl` —— 一份**能直接回答问题**的记忆列表。search 走三步：
-agent 自己选检索方式（关键词 grep / 通篇读会话），把结论逐条追加进 `evidence.jsonl`，
+agent 自己选检索方式（关键词 grep / 通篇读），在 `inputs/` 下的三层记忆里（`atommem` 提炼过的
+原子优先、`msgmem` 原话补细节、`summem` 定位会话）把结论逐条追加进 `evidence.jsonl`，
 最后交给独立 verifier 判一次。
 
 ### 3. 作答与评测（answer / eval）
@@ -112,13 +122,13 @@ python -m codemem.api                       # 默认 0.0.0.0:8000
 ## 目录结构
 
 ```
-configs/            add / search / answer / eval / api 的配置 + tool.json（agent 上下文的单一事实源）
-data/               原始数据 + 各步骤的产物（语料、证据、运行轨迹）
+configs/            add / search / answer / eval / api 的配置 + tool.json / add_tool.json（agent 上下文的事实源）
+data/               原始数据 + 各步骤的产物（三层记忆、证据、运行轨迹）
 docs/core.md        技术报告（完整设计依据与实测结论）
 src/codemem/
   io.py llm.py log.py dataset.py    共享层
-  prompts.py                        所有 prompt 常量（含 search 的证据标准 EVIDENCE_STANDARD）
-  add/ search/ answer/ eval/        四个步骤（add 含 session / resolve 两步）
+  prompts.py                        所有 prompt 常量（含 search 的证据标准 EVIDENCE_STANDARD、add 的 ATOM_AGENT_STANDARD）
+  add/ search/ answer/ eval/        四个步骤（add 含 msgmem / summem / atommem 三层）
   api/                              Add / Search 的 HTTP 封装
 scripts/            run_eval.py（端到端）、test_search.py / test_api.py（纯 CPU 自测）
 ```
@@ -165,6 +175,6 @@ python -m codemem.api --host 0.0.0.0 --port 8000 --config configs/api.yaml
 ```
 
 三条契约保证：**Add 幂等**（同一 `request_id` 重试不重复写入）；**Add 返回即"立即可检索"**
-（返回前已同步消解该会话：时间锚定 + 指代消解）；
+（返回前已同步重建该会话的 `summem` 与 `atommem`：会话总结 + 逐消息原子事实）；
 **Search 的 `data` 永不为缺失**（无记忆或无证据一律返回 `{"data": []}`）。详细设计与存储
 布局见 [`docs/core.md` §4](docs/core.md)。

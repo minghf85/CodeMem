@@ -1,19 +1,19 @@
-"""search 步骤：question + 会话语料 → evidence.jsonl。
+"""search 步骤：question + 三层记忆 → evidence.jsonl。
 
 对每条 QA，一个 agent 在私有工作目录里用 ``read``/``edit``/``bash`` 自主探索，
 把**能回答该问题**的记忆列表写进 ``evidence.jsonl``。写完由 verifier 独立判定够不够，
 不够就把缺口喂回去再跑一轮。
 
-**检索就是 grep** —— 没有向量索引、没有 embedding 服务、没有检索 CLI，语料是 JSONL
+**检索就是 grep** —— 没有向量索引、没有 embedding 服务、没有检索 CLI，记忆是 JSONL
 文件，一行一条记录。时间算术用 bash 的 ``date -d``。
 
-语料是一个 ``sessions/`` 目录：**每个会话一个文件**，内容已**消解**成上下文无关的形式
-（时间是绝对时间或带绝对锚点的相对时间，指代已换回原始含义；原话保留在 ``source_content`` /
-``source_time``）。于是 grep 命中的就是能回答问题的原料，同一实体跨会话都写成同一个真名。
+语料是 add 阶段产出的**三个记忆文件**（同一格式、不同 ``type``）：``atommem.jsonl``
+（提炼过的原子事实，自足、指代消解、时间锚定 —— 首选）、``msgmem.jsonl``（原话，补具体
+答案与溯源）、``summem.jsonl``（会话总结，定位"哪次会话谈过这件事"）。三者都可 grep。
 
 产物（``data/search_runs/{experiment}_{ts}/``）::
 
-    {dir}/inputs/sessions/   只读输入（硬链的会话语料，每会话一个文件）
+    {dir}/inputs/{msgmem,summem,atommem}.jsonl   只读输入（硬链的三个记忆文件）
     {dir}/qa_{idx}/evidence.jsonl   ← 唯一产物
     {dir}/{dir}.qa_trajectories.jsonl
     {dir}/{dir}.model_calls.jsonl

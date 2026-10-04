@@ -13,18 +13,17 @@
 产物：
 
     data/search_runs/{experiment}_{ts}/{dir}/
-        inputs/sessions/session_N.jsonl 只读输入（硬链，每会话一个文件）
+        inputs/{msgmem,summem,atommem}.jsonl 只读输入（硬链的三个记忆文件）
         qa_{idx}/evidence.jsonl         **唯一产物**
         {dir}.qa_trajectories.jsonl     每 QA 一行（含完整步记录）
         {dir}.model_calls.jsonl         每次模型调用的原始输出（排错用）
         summary.json
 
-**语料是一个 ``sessions/`` 目录**：每个会话一个 ``session_N.jsonl``，内容已**消解**成
-上下文无关的形式（时间是绝对时间或带绝对锚点的相对时间，指代已换回原始含义；原话保留在
-``source_content`` / ``source_time``）。**没有摘要层，也没有额外的索引/图层** —— 两种"浓缩
-成品"都被实测淘汰：顶层 speakers summary 诱导 agent 不检索直接凑答案（152 条 QA 里 150 条
-一次 grep 都没做）；session summary 则 119/152 条 QA 压根不读。消解后的消息本身就是导航：
-grep 一个词命中的就是能回答问题的原料，同一实体跨会话都写成同一个真名（grep 即跨会话）。
+**语料是三个记忆文件**（``inputs/msgmem.jsonl`` / ``summem.jsonl`` / ``atommem.jsonl``，由
+add 阶段产出，同一格式不同 ``type``）：``atommem`` 是提炼过的原子（一条即一个自足事实，
+指代消解、时间锚定），``msgmem`` 是原话（补具体答案与溯源），``summem`` 是会话总结（定位
+"哪次会话谈过这件事"）。**三者都是可 grep 的 JSONL**，agent 用同一套 `grep`/`read` 检索。
+**不注入摘要正文** —— 会话清单只给"session_N (时间)"（克制，防跳过检索）。
 
 **检索靠 grep**：agent 的检索工具就是 `grep` 一条 bash 命令；写证据用 `edit` 的 append
 模式（**没有 write**，所以不存在"整份覆盖冲掉前面证据"这种事）。
@@ -69,8 +68,8 @@ DATA_DIR = PROJECT_ROOT / "data"
 CONFIG_FILE = PROJECT_ROOT / "configs" / "search.yaml"
 TOOL_CONFIG_FILE = PROJECT_ROOT / "configs" / "tool.json"
 
-#: 语料：一个 ``sessions/`` 目录（每个会话一个 ``session_N.jsonl``，消解后上下文无关）。
-CORPUS_DIR = "sessions"
+#: 语料：一个目录下的三个记忆文件（见 ``add/memory.py``）。search 用同一套 grep 检索它们。
+CORPUS_FILES = ("msgmem.jsonl", "summem.jsonl", "atommem.jsonl")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "generator": {"base_url": "http://127.0.0.1:30000/v1", "api_key": "sglang", "model": "local",
@@ -416,8 +415,8 @@ def sha256_of(path: Path) -> str:
 def sha256_of_tree(root: Path) -> dict[str, str]:
     """目录（或单文件）下每个文件的 ``{相对路径: sha256}``。
 
-    语料是一个 ``sessions/`` 目录（每个会话一个文件），所以篡改校验要按**树**算 ——
-    ``inputs/sessions/session_3.jsonl`` 这样的相对路径是键。
+    语料是一个 ``inputs/`` 目录（是三个记忆文件），所以篡改校验要按**树**算 ——
+    ``atommem.jsonl`` 这样的相对路径是键。
     """
     result: dict[str, str] = {}
     if root.is_file():
@@ -598,49 +597,43 @@ def _id_of(memory: dict[str, Any]) -> str:
 # 两层语料的装载（阶段驱动的输入）
 # ---------------------------------------------------------------------------
 
-#: ``session_3`` / ``session_3_14`` -> 3。解析不出返回 None。
-#: 结尾用 ``($|_)``：会话号后面可以是文件结束（整次会话块 ``session_3``）或下划线
-#: （summary / 单条消息）。早先写死 ``_`` 会让整次会话块 ``session_3`` 解析失败 ——
-#: 实测模型频繁加载它，却被当成"无法加载的 id"忽略。
-_SESSION_NUM_RE = re.compile(r"^session_(\d+)($|_)")
+# ---------------------------------------------------------------------------
+# 语料：三个记忆文件（msgmem / summem / atommem）
+# ---------------------------------------------------------------------------
+#
+# 语料不再是"每个会话一个文件"，而是 **add 阶段产出的三个记忆文件**（同一格式、
+# 不同 ``type``，见 ``memory_template.jsonl``）：``msgmem``（原话）/ ``summem``（会话总结）/
+# ``atommem``（原子事实）。search 用同一套 grep/read 检索它们 —— atommem 是提炼过的原子
+# （首选），msgmem 补具体答案与原话，summem 定位"哪次会话谈过这件事"。
+
+def corpus_files(inputs_dir: Path) -> list[Path]:
+    """``inputs/`` 下存在的记忆文件（按 msgmem → summem → atommem 顺序）。"""
+    return [inputs_dir / name for name in CORPUS_FILES if (inputs_dir / name).exists()]
 
 
-def session_number(record: dict[str, Any]) -> int | None:
-    """从 ``msg_id`` 里取会话号（``session_3`` -> 3）。"""
-    match = _SESSION_NUM_RE.match(str(record.get("msg_id") or ""))
-    return int(match.group(1)) if match else None
-
-
-def iter_session_files(inputs_dir: Path) -> list[tuple[int, Path]]:
-    """``inputs/sessions/`` 下全部 ``session_N.jsonl``，按会话号排序。
-
-    会话清单从**文件**推（每个会话一个文件），不从内容推 —— 文件就是会话的真相。
-    """
-    base = inputs_dir / CORPUS_DIR
-    if not base.is_dir():
-        return []
-    found: list[tuple[int, Path]] = []
-    for path in base.glob("session_*.jsonl"):
-        match = re.match(r"^session_(\d+)$", path.stem)
-        if match:
-            found.append((int(match.group(1)), path))
-    return sorted(found, key=lambda pair: pair[0])
+def has_corpus(directory: Path) -> bool:
+    """该目录是否有可检索的语料（至少一个记忆文件存在）。"""
+    return any((directory / name).exists() for name in CORPUS_FILES)
 
 
 def load_session_roster(inputs_dir: Path) -> dict[int, str]:
     """返回 ``{会话号: 该会话第一条消息的时间}``（按会话号排序）。
 
-    时间取第一条记录的 ``source_time``（原始会话时间戳）优先 —— 那是会话发生的真实时间；
-    其次 ``time``（消解后的表述，也可能是锚点日期）。
+    从 **msgmem.jsonl** 推：每条 msg 的 id 是 ``session_N_M``、``metadata.time`` 是会话时间戳。
+    只用来渲染一份"有哪几次会话、各在什么时候"的路标 —— **不含任何事实内容**。
     """
+    path = inputs_dir / "msgmem.jsonl"
     result: dict[int, str] = {}
-    for number, path in iter_session_files(inputs_dir):
-        records = read_jsonl(path)
-        if not records:
+    if not path.exists():
+        return result
+    for record in read_jsonl(path):
+        match = re.match(r"^session_(\d+)_\d+$", str((record.get("metadata") or {}).get("id") or ""))
+        if not match:
             continue
-        first = records[0]
-        result[number] = str(first.get("source_time") or first.get("time") or "")
-    return result
+        number = int(match.group(1))
+        if number not in result:
+            result[number] = str((record.get("metadata") or {}).get("time") or "")
+    return dict(sorted(result.items()))
 
 
 # ---------------------------------------------------------------------------
@@ -660,8 +653,8 @@ def render_session_index(roster: dict[int, str]) -> str:
     那正是旧 speakers summary 干的事，而它诱导了"不检索直接答"。
     """
     if not roster:
-        return "(no sessions found -- check inputs/sessions/)"
-    lines = ["The conversation is split into these sessions (each is a file):"]
+        return "(no sessions found -- check inputs/msgmem.jsonl)"
+    lines = ["The conversation is split into these sessions (each has a summary in summem.jsonl):"]
     for number in sorted(roster):
         when = roster[number]
         lines.append(f"  session_{number}" + (f"  ({when})" if when else ""))
@@ -967,11 +960,11 @@ async def run_dir(
 
     label = directory.name
     log = log.bind(label)
-    # 需要的输入：``sessions/`` 目录（每个会话一个文件，消解后上下文无关的语料）。
-    if not iter_session_files(directory):
-        log.warn(f"跳过：缺少 {CORPUS_DIR}/session_*.jsonl"
-                 f"（先跑 `python -m codemem.add --stage session`）")
-        return {"dir": label, "status": "SKIPPED", "reason": f"missing {CORPUS_DIR}/"}
+    # 需要的输入：三个记忆文件（msgmem / summem / atommem，见 add 阶段）。
+    if not has_corpus(directory):
+        log.warn(f"跳过：缺少记忆文件 {list(CORPUS_FILES)}"
+                 f"（先跑 `python -m codemem.add`）")
+        return {"dir": label, "status": "SKIPPED", "reason": "missing memory files"}
 
     out_dir = run_dir / label
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1114,7 +1107,7 @@ async def build_inputs(
     config: dict[str, Any],
     log: Logger,
 ) -> Path:
-    """建 ``<run>/{dir}/inputs/``：把两层语料硬链进去。返回 ``inputs_dir``。
+    """建 ``<run>/{dir}/inputs/``：把三个记忆文件硬链进去。返回 ``inputs_dir``。
 
     没有别的东西了 —— 没有索引、没有命令包装、没有环境文件。语料是 JSONL，agent 用
     ``grep`` 检索、用 ``read`` 精读，这两样都在系统里。于是：
@@ -1125,13 +1118,12 @@ async def build_inputs(
     """
     inputs_dir = run_dir / directory.name / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
-    # 语料：``sessions/`` 目录（每个会话一个 ``session_N.jsonl``，消解后上下文无关）。
-    # 硬链**每个文件**（而不是整目录软链）：语料本身就是一个目录，agent 要 `grep -rin
-    # inputs/sessions/` 递归检索、也要 `read inputs/sessions/session_5.jsonl` 精读。
-    target_dir = inputs_dir / CORPUS_DIR
-    target_dir.mkdir(parents=True, exist_ok=True)
-    for _, path in iter_session_files(directory):
-        link_or_copy(path, target_dir / path.name)
+    # 语料：三个记忆文件（msgmem / summem / atommem）。硬链**每个文件**（而不是整目录软链）：
+    # agent 要 `grep -rin "词" inputs/` 递归检索、也要 `read inputs/atommem.jsonl` 精读。
+    for name in CORPUS_FILES:
+        source = directory / name
+        if source.exists():
+            link_or_copy(source, inputs_dir / name)
     return inputs_dir
 
 
@@ -1251,7 +1243,7 @@ def resolve_dirs(config: dict[str, Any], args: argparse.Namespace) -> list[Path]
         return [DATA_DIR / args.sample]
     return sorted(
         path for path in DATA_DIR.iterdir()
-        if path.is_dir() and (path / CORPUS_DIR).is_dir()
+        if path.is_dir() and has_corpus(path)
     )
 
 
@@ -1307,8 +1299,8 @@ async def async_main(args: argparse.Namespace) -> None:
 
     directories = resolve_dirs(config, args)
     if not directories:
-        log.error(f"没有找到任何含 {CORPUS_DIR}/ 的目录"
-                  "（先跑 `python -m codemem.add --stage session`）")
+        log.error(f"没有找到任何含记忆文件（{', '.join(CORPUS_FILES)}）的目录"
+                  "（先跑 `python -m codemem.add`）")
         return
 
     # --list-qa：只列下标就退出（run 之前先看下标，比让人自己数靠谱）

@@ -359,8 +359,23 @@ def make_session_record(
 
 
 # ---------------------------------------------------------------------------
-# memory item（旧格式，仅为读历史产物保留）
+# memory item（三层记忆的通用格式：msgmem / summem / atommem）
 # ---------------------------------------------------------------------------
+#
+# 三条链路的语料统一成同一种记录（见 memory_template.jsonl）::
+#
+#     {"memory": "...", "metadata": {"id", "type", "time", "role", "tag", "source",
+#                                    "changelog"}}
+#
+# ``type`` ∈ {msg, summary, atom}：原始消息 / 会话总结 / 原子事实。三个文件只是同一格式的
+# 不同层的切片，于是 search 用同一套 grep/read 就能检索它们。
+
+#: 记忆类型（``metadata.type``）
+MEMORY_TYPES = ("msg", "summary", "atom")
+
+#: 系统自有字段（缺了由系统补，不算模型的错）
+_SYSTEM_META_FIELDS = ("id", "source", "changelog")
+
 
 def memory_id(item: dict[str, Any]) -> str:
     """取 ``metadata.id``；缺失或非字符串返回空串（绝不返回 None，调用方少一层判断）。"""
@@ -368,9 +383,59 @@ def memory_id(item: dict[str, Any]) -> str:
     return value if isinstance(value, str) else ""
 
 
+def memory_type(item: dict[str, Any]) -> str:
+    """``metadata.type``：msg / summary / atom（缺失或非法返回空串）。"""
+    value = (item.get("metadata") or {}).get("type")
+    return value if isinstance(value, str) and value in MEMORY_TYPES else ""
+
+
+def memory_role(item: dict[str, Any]) -> str:
+    """``metadata.role``：说话人真名 / ``summary``。"""
+    value = (item.get("metadata") or {}).get("role")
+    return value if isinstance(value, str) else ""
+
+
+def memory_tags(item: dict[str, Any]) -> list[str]:
+    """``metadata.tag``：字符串标签数组（非法的项丢掉）。"""
+    raw = (item.get("metadata") or {}).get("tag")
+    if not isinstance(raw, list):
+        return []
+    return [tag for tag in raw if isinstance(tag, str) and tag.strip()]
+
+
+def make_memory(
+    *,
+    memory: str,
+    memory_type: str,
+    mem_id: str,
+    time: str = "",
+    role: str = "",
+    tag: list[str] | None = None,
+    source: list[str] | None = None,
+    changelog: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """建一条三层记忆记录。字段顺序固定（id/type/time/role/tag/source/changelog），便于 diff。
+
+    ``changelog`` 缺省由调用方补（用 ``now_iso``）—— 但这里给一个合理默认，避免各处重复。
+    """
+    return {
+        "memory": memory,
+        "metadata": {
+            "id": mem_id,
+            "type": memory_type,
+            "time": time,
+            "role": role,
+            "tag": list(tag or []),
+            "source": list(source or []),
+            "changelog": changelog if changelog is not None
+            else [{"time": now_iso(), "content": "created"}],
+        },
+    }
+
+
 def memory_text(item: dict[str, Any]) -> str:
     """取用于嵌入/展示的正文，兼容 memory item 与 message dict 两种形态。"""
-    for key in ("memory", "text"):
+    for key in ("memory", "text", "content"):
         value = item.get(key)
         if isinstance(value, str):
             return value

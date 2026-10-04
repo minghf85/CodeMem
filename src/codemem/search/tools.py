@@ -535,13 +535,17 @@ def apply_edits(normalized: str, edits: list[dict[str, str]], path: str) -> tupl
     return normalized, new_content
 
 
-def create_edit_tool(*, cwd: Path, confine: bool = True) -> ToolDefinition:
+def create_edit_tool(*, cwd: Path, confine: bool = True,
+                     default_write_file: str = "evidence.jsonl") -> ToolDefinition:
     """``edit`` —— **唯一的写文件工具**（覆盖写已删除）。
 
     两种模式，靠参数二选一：
 
     - **replace**：``edits=[{oldText, newText}, ...]``，精确替换。用于修正已有记录。
     - **append**：``append="<新记录>"``，把文本追加到文件末尾（**文件不存在则创建**）。
+
+    ``default_write_file`` 是缺 ``path`` 时的默认写目标：search 是 ``evidence.jsonl``，
+    add agent 是 ``atommem.jsonl``（它唯一的产物）。
 
     **为什么要有 append 模式**：这套流程是"每看完一个 session 就记一条"，也就是**逐条追加**。
     早先让模型用替换模式自己造 ``oldText``（拿已有的最后一行当锚点），实测 8B 经常复不出那
@@ -554,12 +558,12 @@ def create_edit_tool(*, cwd: Path, confine: bool = True) -> ToolDefinition:
     最后一条**逐字重复** → 拒绝（模型有时会把刚刚写过的又追加一遍）。
     """
     async def execute(arguments: Mapping[str, Any]) -> ToolResult:
-        # 缺 `path` 时默认 evidence.jsonl：这是本流程**唯一**要写的文件，而 8B 实测会忘记
-        # 填 path（只给 append），旧行为是报 "path must be a string, got NoneType" —— 然后
+        # 缺 `path` 时默认 ``default_write_file``：这是本流程**唯一**要写的文件，而 8B 实测会
+        # 忘记填 path（只给 append），旧行为是报 "path must be a string, got NoneType" —— 然后
         # 它把整条一模一样的调用重复 10 次（每次都被重复检测拒掉），12 步全烧光、0 条证据。
         # 与其为一个显然的默认值判错，不如替它补上。
         if arguments.get("path") is None and arguments.get("append") is not None:
-            arguments = {**arguments, "path": "evidence.jsonl"}
+            arguments = {**arguments, "path": default_write_file}
         path = _path_arg(arguments, "path", cwd=cwd)
         if confine:
             _ensure_inside(path, cwd)
@@ -854,6 +858,7 @@ def build_tools(
     shell_command_prefix: str | None = None,
     bash_timeout: float | None = None,
     confine: bool = True,
+    default_write_file: str = "evidence.jsonl",
     max_lines: int = DEFAULT_MAX_OUTPUT_LINES,
     max_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
 ) -> dict[str, ToolDefinition]:
@@ -862,13 +867,16 @@ def build_tools(
     描述与 schema 是**空壳**，由 ``toolcfg.apply_catalog`` 从 ``tool.json`` 填 ——
     元信息统一管理，执行器在此注册。
 
+    ``default_write_file``：``edit`` 缺 ``path`` 时的默认写目标 —— search 用
+    ``evidence.jsonl``，add agent 用 ``atommem.jsonl``。
+
     **只有三个工具**：``read`` / ``edit`` / ``bash``。**``write`` 已删除** —— 这套流程是逐条
     追加证据，``edit`` 的 append 模式覆盖了全部写入需求，保留一个"整份覆盖"入口反而是把
     "一个会话写错就冲掉前面全部证据"的风险摆在那里。
     """
     tools = [
         create_read_tool(cwd=cwd, max_lines=max_lines, max_bytes=max_bytes),
-        create_edit_tool(cwd=cwd, confine=confine),
+        create_edit_tool(cwd=cwd, confine=confine, default_write_file=default_write_file),
         create_bash_tool(
             cwd=cwd,
             shell_command_prefix=shell_command_prefix,
