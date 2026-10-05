@@ -75,14 +75,16 @@ python -m codemem.add --stage atommem       # 只跑某一层
 |---|---|---|---|
 | `msgmem.jsonl` | `msg` | 每条原始消息（原话），`time` 是会话时间戳（锚点） | 纯 CPU，由 dataset 直接转换 |
 | `summem.jsonl` | `summary` | 每个会话一份总结 | LLM，逐 session 一次 |
-| `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **add agent 逐 message 处理**，默认 `max_step=8` |
+| `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **三阶段 pipeline 逐 message 处理**（召回 → 单次 LLM → 后处理） |
 
 `msgmem` 保留原始措辞与原始时间，是时间/指代的锚点；`atommem` 才是消解后的产物 —— 指代消解成
 真名、时间折算成绝对日期或带绝对锚点的相对时间（`the week before 9 June 2023`），精度严格照源话。
-add agent 只写 `{"memory", "metadata": {time, role, tag}}` 四个字段，`id` / `source` / `type` /
-`changelog` 由系统补齐。**核心原理**：处理第 N 条 message 时，agent 能在已生成的 `msgmem` /
-`summem` / `atommem` 里 grep 前面相关信息（可能跨 session）来消解指代、补全隐含事实 —— 所以目录内
-**逐 message 串行**、不同目录并行，重跑一条 message 会按 `source` 替换它那组 atom（幂等）。
+三阶段 pipeline（`atommem_pipeline.py`）：① 召回前 N 条同会话消息；② 单次 LLM → JSON array
+（memory **完全不含时间词**，时间表达提取到 `time_expr`）；③ 代码用 `date -d` 解析时间 + 去重 + 
+补字段。模型只填 `{memory, time_expr, role, tag}` 四个字段，`id/source/type/time/changelog` 由系统补齐。
+**核心原理**：处理第 N 条 message 时，能在已生成的 `msgmem` / `summem` / `atommem` 里召回前面相关
+信息（可能跨 session）来消解指代、补全隐含事实 —— 所以目录内**逐 message 串行**、不同目录并行，
+重跑一条 message 会按 `source` 替换它那组 atom（幂等）。
 
 ### 2. 检索证据（search）
 

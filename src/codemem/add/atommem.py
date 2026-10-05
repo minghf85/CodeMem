@@ -65,6 +65,34 @@ from .memory import (
 CONFIG_FILE = PROJECT_ROOT / "configs" / "add.yaml"
 TOOL_CONFIG_FILE = PROJECT_ROOT / "configs" / "add_tool.json"
 
+# atom 的 tag key 固定集合（与 prompts.ATOM_AGENT_STANDARD 规则 15 一致）。校验/收敛在
+# _normalize_tags；8B 实测会自造 100+ 个自由 key，故由 harness 兜底，而非只靠 prompt。
+TAG_KEYS: frozenset[str] = frozenset({
+    "speaker", "topic", "activity", "action", "event", "state",
+    "sentiment", "relation", "entity", "possession", "time", "other",
+})
+# 常见近义词 → 规范 key（值保留，只收敛 key）；其余未知 key 一律落 other。
+# 覆盖两类：通用近义词 + 实测里 8B 最爱自造的 key（见 docs 变更记录）。
+_TAG_ALIASES: dict[str, str] = {
+    "hobby": "activity", "hobbies": "activity", "interest": "topic", "interests": "topic",
+    "emotion": "sentiment", "feeling": "sentiment", "feelings": "sentiment", "mood": "sentiment",
+    "art": "activity", "music": "activity", "sport": "activity", "sports": "activity",
+    "person": "entity", "people": "entity", "place": "entity", "object": "entity",
+    "item": "possession", "items": "possession", "owner": "possession",
+    "plan": "action", "goal": "action", "opinion": "state", "belief": "state", "value": "state",
+    "values": "state", "relationhip": "relation", "relationship": "relation", "family": "relation",
+    "friend": "relation", "friendship": "relation", "date": "time", "when": "time",
+    # —— 实测 8B 高频自造 key ——
+    "support": "relation", "adoption": "topic", "appreciation": "sentiment",
+    "gratitude": "sentiment", "pride": "sentiment", "excitement": "sentiment",
+    "curiosity": "sentiment", "motivation": "state", "determination": "state",
+    "commitment": "state", "resilience": "state", "career": "topic", "job": "topic",
+    "activism": "activity", "volunteering": "activity", "self-care": "activity",
+    "experience": "state", "memory": "event", "growth": "state", "identity": "topic",
+    "greeting": "other", "question": "other", "apology": "action", "agreement": "action",
+    "transition": "event", "books": "entity", "book": "entity", "pet": "entity",
+}
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "local",
     "base_url": "http://127.0.0.1:30000/v1",
@@ -81,12 +109,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "enable_thinking": False,
     # agent loop
     "max_steps": 8,
-    "no_progress_patience": 4,
+    # 读/grep 不改动 atommem.jsonl → 在 add 阶段永远 no-progress；patience 太紧会把
+    # "还在读上下文"误判成"卡住了"而提前收尾。给足步数让模型读完再写，同时配合
+    # 靠前的 write_nudge_after（2）把它推向落笔。
+    "no_progress_patience": 8,
+    "write_nudge_after": 2,
     "observation_max_chars": 8000,
     "max_parse_retries": 2,
     "repeat_limit": 1,
     "context_max_chars": 120000,
     "context_keep_recent": 6,
+    # 遗忘：超长工具观测在这么多回合后被替换成一行占位符（0 = 关闭）。
+    # add 阶段一条 message 的 agent 步数本就少（默认 8），僵硬的遗忘收益有限，故默认关闭；
+    # 需要时在 add.yaml 里配 forget_after_turns / long_observation_chars 打开。
+    "forget_after_turns": 0,
+    "long_observation_chars": 0,
+    "forget_keep_recent_turns": 2,
     "bash_timeout": 60,
     # 同一条 message 的 prompt 里附上前 N 条同会话消息作为消解指代的上下文窗口（原始措辞）。
     "context_window": 12,
@@ -270,18 +308,27 @@ async def run_message(
         evidence_path=atommem_path,
         cwd=workspace,
         max_steps=int(config.get("max_steps", 8)),
-        no_progress_patience=int(config.get("no_progress_patience", 4)),
+        no_progress_patience=int(config.get("no_progress_patience", 8)),
         step_offset=0,
         round_index=1,
         log=log,
         observation_max_chars=int(config.get("observation_max_chars", 8000)),
-        write_nudge_after=max(2, int(config.get("max_steps", 8)) // 2),
+        # 动笔提醒必须**早于** no_progress 收尾：读/grep 不改动 atommem.jsonl，
+        # 在 add 阶段永远 `progressed=False`，所以连续 N 步读之后整轮会被
+        # `no_progress_patience` 砍掉。若两者相等（max_steps//2==patience），提醒
+        # 会和收尾撞在同一步上，模型根本没机会写 —— 表现为"扫完 msgmem 一条 atom 都不出"。
+        # 故提醒固定在很靠前的 step（默认 2），patience 留足空间。
+        write_nudge_after=int(config.get("write_nudge_after", 2)),
+        nudge_filename=ATOMMEM_NAME,
         evidence_soft_limit=0,          # 不提醒"太多"：一条 message 的 atom 数由内容决定
         max_parse_retries=int(config.get("max_parse_retries", 2)),
         repeat_limit=int(config.get("repeat_limit", 1)),
         duplicate_warn_at=10,
         context_max_chars=int(config.get("context_max_chars", 120000)),
         context_keep_recent=int(config.get("context_keep_recent", 6)),
+        forget_after_turns=int(config.get("forget_after_turns", 0)),
+        long_observation_chars=int(config.get("long_observation_chars", 0)),
+        forget_keep_recent_turns=int(config.get("forget_keep_recent_turns", 2)),
     )
 
     # 读取 agent 处理后的整份文件，与快照对比，做归并 + 补系统字段，原子写回。
@@ -328,11 +375,16 @@ def _shell_prefix(workspace: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def _normalize_tags(value: Any) -> list[str]:
-    """把 agent 写的 ``tag`` 归一成 ``list[str]``。
+    """把 agent 写的 ``tag`` 归一成 ``list[str]``，并**强制 key 落在固定集合内**。
 
     模型常把 ``tag`` 写成**字符串**（``"activity:swimming"``）而不是数组 —— 直接迭代字符串
     会把每个字符拆成一个 tag（``["a","c","t",...]``）。所以：字符串按整体当一个 tag（逗号
     分隔时再拆），列表逐项保留，非字符串一律丢弃。空白 tag 丢掉。
+
+    **key 纪律由 harness 兜底**：8B 实测会自造 100+ 个自由 key（``art:`` / ``emotion:`` /
+    ``support:`` ……），prompt 里的"key 必须从固定集合里选"这条软约束靠不住。所以这里把
+    key 不在允许集合内的 tag **改写成 ``other:<原 value>``**（值保留、只收敛 key），
+    常用近义词顺带映射到规范 key。这样落盘的 tag key 永远 ≤ 固定集合大小。
     """
     if isinstance(value, str):
         raw_items = value.replace("，", ",").split(",")
@@ -343,8 +395,27 @@ def _normalize_tags(value: Any) -> list[str]:
     tags: list[str] = []
     for item in raw_items:
         text = item.strip() if isinstance(item, str) else ""
-        if text and text not in tags:
-            tags.append(text)
+        if not text:
+            continue
+        key, sep, val = text.partition(":")
+        key = key.strip().lower()
+        val = val.strip()
+        if not sep or not val:
+            # 没有 ``key:value`` 形状 —— 模型只给了一个裸词（实测常见：直接写 "art" / "emotion"
+            # / "support"）。若是已知 key 或别名，收敛成 ``<norm_key>:<原词>``；否则落 other。
+            bare = key or text.strip().lower()
+            norm_key = _TAG_ALIASES.get(bare, bare)
+            if norm_key in TAG_KEYS:
+                norm = f"{norm_key}:{bare}"
+            else:
+                norm = f"other:{text}"
+        else:
+            norm_key = _TAG_ALIASES.get(key, key)
+            if norm_key not in TAG_KEYS:
+                norm_key = "other"
+            norm = f"{norm_key}:{val}"
+        if norm not in tags:
+            tags.append(norm)
     return tags
 
 
@@ -410,7 +481,9 @@ def finalize_file(
                 # 内容没变 = agent 没碰这一行，只是它一直在文件里 —— **原样保留**，
                 # 绝不能把本 message 的 id 塞进它的 source（否则每处理一条 message，
                 # 整份文里所有旧 atom 的 source 都会多一个 id，几步就炸成几十个）。
-                finalized.append(prev)
+                # 但 tag key 纪律要**全库**成立：历史文件里可能有规范化前的自由 key，
+                # 这里顺手把 prev 的 tag 也收敛一遍（纯函数、幂等，不算"演化"）。
+                finalized.append(_renormalized(prev))
                 continue
             # 内容变了 = 真正的改写/合并：保留 id、累加 source、changelog 记下改动前的值。
             sources = _merge_ids(meta.get("source"), prev.get("metadata", {}).get("source"))
@@ -436,6 +509,19 @@ def _atom(
         "id": mem_id, "type": "atom", "time": time_value, "role": role_value,
         "tag": tags, "source": sources, "changelog": changelog,
     }}
+
+
+def _renormalized(rec: dict[str, Any]) -> dict[str, Any]:
+    """返回一条 atom 的副本，只把 ``tag`` 重新按固定 key 集合收敛（其余字段原样）。
+    用于"agent 没碰这一行"的旧记录 —— 保证全库的 tag key 纪律成立，同时不动 id/source/changelog。"""
+    meta = dict(rec.get("metadata") or {})
+    new_tags = _normalize_tags(meta.get("tag"))
+    if new_tags == meta.get("tag"):
+        return rec
+    meta["tag"] = new_tags
+    copy = dict(rec)
+    copy["metadata"] = meta
+    return copy
 
 
 def _max_suffix(ids: set[str], source_id: str) -> int:
@@ -472,9 +558,23 @@ def _dedup_key(text: str) -> str:
 
 
 # 近义去重的相似度阈值：token 集合 Jaccard ≥ 此值即视为"同一事实的换说法"。
-# 0.6 是精挑的：真换说法（"values X" / "appreciates X"）通常 ≥0.6，而不同事实即便共享
-# 主语也多在 0.3 以下。调低会误杀，调高会漏并。
+# 0.6 是精挑的：真换说法（"values X" / "appreciates X"）**有时**能到 0.6，但 8B 更常见的
+# 是同一条事实换一串**情绪动词**（praises / supports / values / appreciates / recognizes /
+# highlights + 同一宾语），这类两两 Jaccard 只有 0.2~0.5，纯 Jaccard 抓不住。所以补一条
+# **去动词核心**规则：剥掉情绪动词后，若两句话共享 ≥3 个实词且共享率 ≥0.25，判为同一事实。
+# 实测（session_2_2 七连）：本规则并 20/21，且不误并"A 去支持小组" vs "A 感到被支持小组接纳"。
 NEAR_DUP_JACCARD = 0.6
+_SHARED_CORE_MIN = 3      # 去动词后至少要共享几个实词
+_SHARED_CORE_RATIO = 0.25  # 且共享率（交集/并集）不低于这个数
+# 情绪/态度动词：只表达"对同一件事的态度"，本身不构成"不同事实"的区分度。合并比较前剥掉。
+_SENTIMENT_VERBS = frozenset(
+    "praise praises praised support supports supported value values valued appreciate appreciates "
+    "appreciated recognize recognizes recognized highlight highlights highlighted acknowledge "
+    "acknowledges acknowledged believe believes believed think thinks thought find finds found "
+    "consider considers considered regard regards regarded encourage encourages encouraged admire "
+    "admires admired approve approves approved endorse endorses endorsed celebrate celebrates "
+    "celebrated feel feels felt".split()
+)
 # 参与相似度比较的实词长度下限：太短的 token（a / is / in）不承载"是不是同一事实"的信息。
 _TOKEN_MIN_LEN = 3
 # 常见虚词，比较前先丢掉，避免它们把 Jaccard 抬到 0.6 以上误判。
@@ -494,6 +594,11 @@ def _tokens(text: str) -> set[str]:
     }
 
 
+def _core_tokens(text: str) -> set[str]:
+    """剥掉情绪/态度动词后的实词集合 —— 用来识别"同一事实换了个态度动词"的重复。"""
+    return {tok for tok in _tokens(text) if tok not in _SENTIMENT_VERBS}
+
+
 def _subject(text: str) -> str:
     """取 memory 的**主语**（句首第一个专有名词 / 实词），用于挡住"A 欣赏 B" vs "B 欣赏 A"
     这类**主客体颠倒**的假合并 —— 它们的 token 集合几乎一样，但主语不同，是两条不同事实。"""
@@ -506,18 +611,27 @@ def _subject(text: str) -> str:
 def _is_same_fact(a: str, b: str) -> bool:
     """两条 memory 是否描述**同一事实**。
 
-    三个都满足才算 —— 单看 token 集合会把主客体颠倒的句子（"Caroline 欣赏 Melanie" /
-    "Melanie 欣赏 Caroline"）误判成同一事实。
+    主语必须一致 —— 单看 token 集合会把主客体颠倒的句子（"Caroline 欣赏 Melanie" /
+    "Melanie 欣赏 Caroline"）误判成同一事实。主语一致后再看两条路径任一命中：
+
+    1. **整体 Jaccard ≥ 0.6**：措辞几乎一致（大小写/冠词差异）。
+    2. **去动词核心 ≥ 3 个实词且共享率 ≥ 0.25**：8B 反复犯的"同一事实换情绪动词"
+       （praises/supports/values/appreciates/recognizes/highlights + 同一宾语）。
     """
     ta, tb = _tokens(a), _tokens(b)
     if not ta or not tb:
         return False
     if _subject(a) and _subject(b) and _subject(a) != _subject(b):
         return False
-    # 长度差太远（一方是另一方两倍以上）多半不是换说法，而是长句里捎带提了一下。
-    if max(len(ta), len(tb)) > 2 * min(len(ta), len(tb)):
+    # 路径 1：措辞近乎一致。
+    if len(ta & tb) / len(ta | tb) >= NEAR_DUP_JACCARD:
+        return True
+    # 路径 2：剥掉情绪动词后仍有共同的实词核心（换动词 != 换事实）。
+    ca, cb = _core_tokens(a), _core_tokens(b)
+    if not ca or not cb:
         return False
-    return len(ta & tb) / len(ta | tb) >= NEAR_DUP_JACCARD
+    shared = ca & cb
+    return len(shared) >= _SHARED_CORE_MIN and len(shared) / len(ca | cb) >= _SHARED_CORE_RATIO
 
 
 def _dedup_atoms(atoms: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -581,11 +695,15 @@ async def run_dir(
     log: Logger,
     *,
     limit_messages: int = 0,
+    use_pipeline: bool = True,
 ) -> dict[str, Any]:
     """对一个目录的 msgmem **逐 message 串行**跑 atom 抽取，就地写 atommem.jsonl。
 
     串行的意义：处理第 N 条 message 时，`atommem.jsonl` 里已经有前 N-1 条产出的 atom，
-    agent 能 grep 到它们（"跨 session 影响"就靠这个）。所以每处理一条就**增量落盘**一次。
+    能召回它们（"跨 session 影响"就靠这个）。所以每处理一条就**增量落盘**一次。
+
+    use_pipeline=True（默认）：用三阶段 pipeline（召回 → 单次 LLM → 后处理），稳定快速。
+    use_pipeline=False：用 agent loop（兼容旧行为，但不稳定）。
     """
     label = directory.name
     files = directory_files(directory)
@@ -598,49 +716,87 @@ async def run_dir(
     summaries = {number: records[0] for number, records in summaries_by_session.items() if records}
 
     atommem_path = files["atommem"]
-    # 单一有序的"当前语料"列表。合并会让一条 atom 带多个 source id，所以**不能**再按
-    # source 分桶（那会把合并后的 atom 复制到多个桶里）；这里直接维护整份列表，
-    # 每处理一条 message 就把它交给 agent、再取回处理后的完整列表。
     known = {memory_id(m) for m in messages}
     current: list[dict[str, Any]] = read_jsonl(atommem_path)
 
     speaker_a, speaker_b = parse_dir_label(label)
-    workspace = directory
-    runner = _Runner(client, config, log, directory / ".atommem.model_calls.jsonl")
-
     targets = messages if not limit_messages else messages[:limit_messages]
-    for position, target in enumerate(targets):
-        session = msg_session_number(memory_id(target))
-        prior = _session_prior(messages, position, session)
-        node_log = log.bind(f"{label}:{memory_id(target)}")
 
-        # 幂等：重跑一条 message 时，先移除它**最初产出**的 atom（primary source = 本 message），
-        # 再让 agent 重新生成/合并。历史里 source 不在 msgmem 的 atom（手动标的）原样保留。
-        current = [
-            a for a in current
-            if _primary_source(a) != memory_id(target)
-            or not (set((a.get("metadata") or {}).get("source") or []) & known)
-        ]
-        # 处理前把当前视图落盘（增量：第 N 条看见前 N-1 条产出的 atom）。
-        write_memories(atommem_path, current)
-        try:
-            current = await run_message(
-                target=target, prior=prior, summaries=summaries, workspace=workspace,
-                atommem_path=atommem_path, config=config, catalog=catalog, runner=runner,
-                log=node_log, speaker_a=speaker_a, speaker_b=speaker_b,
-            )
-        except Exception as exc:  # noqa: BLE001 - 单条 message 失败不该让整目录没有输出
-            node_log.warn(f"处理失败：{type(exc).__name__}: {exc}")
-        # 处理后再落一次盘（run_message 内部已写过，这里保证 current 与磁盘一致）。
-        write_memories(atommem_path, current)
+    if use_pipeline:
+        # ============ Pipeline 模式 ============
+        from .atommem_pipeline import run_message_pipeline
 
-    runner.model.close()
+        for target in targets:
+            node_log = log.bind(f"{label}:{memory_id(target)}")
+            # 幂等：移除本 message 最初产出的 atom
+            current = [
+                a for a in current
+                if _primary_source(a) != memory_id(target)
+                or not (set((a.get("metadata") or {}).get("source") or []) & known)
+            ]
+            try:
+                new_atoms = await run_message_pipeline(
+                    target=target,
+                    msgmem=messages,
+                    existing_atoms=current,
+                    client=client,
+                    config=config,
+                    log=node_log,
+                    speaker_a=speaker_a,
+                    speaker_b=speaker_b,
+                )
+                # 合并到当前语料
+                current.extend(new_atoms)
+                # 去重
+                current = _dedup_atoms(current)
+                # 落盘
+                write_memories(atommem_path, current)
+            except Exception as exc:  # noqa: BLE001
+                node_log.warn(f"处理失败：{type(exc).__name__}: {exc}")
 
-    return {
-        "dir": label, "status": "OK",
-        "messages": len(targets),
-        "atoms": len(current),
-    }
+        return {
+            "dir": label, "status": "OK",
+            "messages": len(targets),
+            "atoms": len(current),
+        }
+
+    else:
+        # ============ Agent Loop 模式（旧行为，保留用于对比）============
+        workspace = directory
+        runner = _Runner(client, config, log, directory / ".atommem.model_calls.jsonl")
+
+        for position, target in enumerate(targets):
+            session = msg_session_number(memory_id(target))
+            prior = _session_prior(messages, position, session)
+            node_log = log.bind(f"{label}:{memory_id(target)}")
+
+            # 幂等：重跑一条 message 时，先移除它**最初产出**的 atom（primary source = 本 message），
+            # 再让 agent 重新生成/合并。历史里 source 不在 msgmem 的 atom（手动标的）原样保留。
+            current = [
+                a for a in current
+                if _primary_source(a) != memory_id(target)
+                or not (set((a.get("metadata") or {}).get("source") or []) & known)
+            ]
+            # 处理前把当前视图落盘（增量：第 N 条看见前 N-1 条产出的 atom）。
+            write_memories(atommem_path, current)
+            try:
+                current = await run_message(
+                    target=target, prior=prior, summaries=summaries, workspace=workspace,
+                    atommem_path=atommem_path, config=config, catalog=catalog, runner=runner,
+                    log=node_log, speaker_a=speaker_a, speaker_b=speaker_b,
+                )
+            except Exception as exc:  # noqa: BLE001 - 单条 message 失败不该让整目录没有输出
+                node_log.warn(f"处理失败：{type(exc).__name__}: {exc}")
+            # 处理后再落一次盘（run_message 内部已写过，这里保证 current 与磁盘一致）。
+            write_memories(atommem_path, current)
+
+        runner.model.close()
+
+        return {
+            "dir": label, "status": "OK",
+            "messages": len(targets),
+            "atoms": len(current),
+        }
 
 
 def _primary_source(record: dict[str, Any]) -> str:
@@ -669,7 +825,7 @@ def _session_prior(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m codemem.add.atommem",
-        description="逐 message 用 agent 抽原子事实，写 atommem.jsonl",
+        description="逐 message 抽原子事实，写 atommem.jsonl",
     )
     parser.add_argument("dirs", nargs="*", help="speaker 目录名；缺省处理全部")
     parser.add_argument("--config", default=str(CONFIG_FILE), help="配置（默认 configs/add.yaml）")
@@ -679,6 +835,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="每个目录只处理前 N 条 message（调试用）")
     parser.add_argument("--concurrency", type=int, default=None, help="覆盖目录级并发数")
     parser.add_argument("--max-steps", type=int, default=None, help="覆盖 agent 步数上限")
+    parser.add_argument("--use-agent", action="store_true",
+                        help="使用 agent loop 模式（默认用 pipeline）")
     return parser.parse_args(argv)
 
 
@@ -704,7 +862,9 @@ async def async_main(args: argparse.Namespace) -> None:
     async def one(directory: Path) -> dict[str, Any]:
         async with semaphore:
             return await run_dir(
-                directory, config, client, catalog, log, limit_messages=args.limit_messages,
+                directory, config, client, catalog, log,
+                limit_messages=args.limit_messages,
+                use_pipeline=not args.use_agent,
             )
 
     try:

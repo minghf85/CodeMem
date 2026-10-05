@@ -102,6 +102,7 @@ python -m codemem.add                      # msgmem → summem → atommem，全
 python -m codemem.add Caroline_Melanie     # 只处理指定目录
 python -m codemem.add --stage msgmem       # 只跑第一层（纯 CPU，不调模型）
 python -m codemem.add --stage atommem --limit-messages 20   # 只跑前 20 条 message（调试）
+python -m codemem.add --stage atommem --use-agent           # 使用 agent loop（旧模式，默认用 pipeline）
 ```
 
 **三层，产出三种记忆文件**（都在 `data/{speaker_a}_{speaker_b}/` 下，JSONL 一行一条）：
@@ -110,7 +111,7 @@ python -m codemem.add --stage atommem --limit-messages 20   # 只跑前 20 条 m
 |---|---|---|---|
 | `msgmem.jsonl` | `msg` | 每条原始消息（**原话**）；`time` 是会话时间戳，`role` 是说话人真名 | 纯 CPU，由 dataset 直接转换 |
 | `summem.jsonl` | `summary` | 每个会话一份总结 | LLM，**逐 session 一次** |
-| `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **add agent 逐 message 处理**，默认 `max_step=8` |
+| `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **三阶段 pipeline 逐 message 处理**（召回 → 单次 LLM → 后处理） |
 
 记录格式对齐 `memory_template.jsonl`：
 
@@ -132,79 +133,126 @@ python -m codemem.add --stage atommem --limit-messages 20   # 只跑前 20 条 m
 - **msgmem 的 `time` 保留原始会话时间戳**（如 `"1:56 pm on 8 May, 2023"`）—— 它是折算相对时间的
   **锚点**；atommem 的 `time` 是消解后的结果。
 
-### 1.1 为什么是"三层记忆 + 逐消息 agent"，而不是"改写消息本身"
+### 1.1 为什么是"三层记忆 + 三阶段 pipeline"，而不是"agent loop"
 
-上一版（S13）把每条消息**改写成上下文无关的形式**，让 grep 命中的就是答案原料（见 §2.18 的历史）。
-那一版有效，但它有两个结构性问题：**① 一条消息被压成一行**，无法拆出多个独立事实（"swamped
-with the kids & work" 里既有"有孩子"又有"有工作"）；**② 会话内的相对时间只能靠"该消息自己的
-时间戳"这一条锚点**，遇到需要看更早消息才能定的指代（"the same lake as last time"）就消解不了。
+上一版（agent loop）虽然灵活，但 8B 模型在 agent loop 里把控不住质量：16% 的 atom 仍是多句、
+时间表达不稳定（"5 years ago" 会直接写进 memory）、tag key 会自造 100+ 个。这些都是"软约束在
+8B 上靠不住"的证据 —— prompt 能说清楚规则，但模型在多步交互中会逐渐偏离。
 
-这一版换成**分层**：
+这一版换成**三阶段 pipeline**，把软约束下沉到**代码级强制**：
 
-| 层 | 给检索什么 | 为什么保留 |
+```
+Stage 1: 召回相关上下文（grep msgmem/atommem，纯 CPU）
+         ↓
+Stage 2: 单次 LLM 调用 → 产出 [{memory, time_expr, role, tag}, ...]
+         - memory: 纯事实陈述，**完全不含时间词**（yesterday/ago/last/next 等）
+         - time_expr: 源消息的原始时间表达（如 "yesterday"），留给后处理
+         ↓
+Stage 3: 后处理（纯 CPU）
+         - 时间解析：time_expr + 源 msg 的锚点 → metadata.time（代码折算，date -d）
+         - 去重合并：按 memory 归一化，同事实只留一条
+         - 补全字段：id/source/type/changelog
+```
+
+**核心约束（代码级强制，不可违反）**：
+
+- `memory` 字段：**禁止任何时间词**（yesterday/ago/last/next/recently/soon/future/now/
+  currently/before/after/since/until/during/N days/weeks/months/years）
+- `metadata.time`：承载全部时间信息（绝对日期 / 带锚点区间 / 空字符串）
+- 一次 LLM 调用返回完整 JSON array，不做 agent loop
+
+**为什么值得砍掉 agent loop**（三条，都是"少一层不确定性"的收益）：
+
+1. **单一调用点。** 一次 LLM → 一组 atom，失败重试是整组、不是逐步，调试/监控都简单。
+2. **时间质量可控。** memory 禁止时间词由**正则验证**，time 由 `date -d` 代码折算 —— 
+   8B 心算"13 Sep 是周几"不可靠，代码算永远对。
+3. **tag key 纪律由 harness 兜底。** `_normalize_tags` 把落盘 tag 的 key 收敛进固定集合
+   （裸词/近义词按 `_TAG_ALIASES` 映射，其余未知 key 写成 `other:<原值>`），落盘后 key 恒 ≤ 12 个。
+
+代价说清楚：召回是启发式的（同会话前 N 条消息），不如 agent 自己 grep 灵活 —— 但实测绝大多数
+指代都在窗口内能解决，跨会话指代占比极低。收益是**稳定性 + 可预测性**：每条 message 一次调用、
+一组 atom、一次落盘，行为恒定、成本可算。
+
+**实测（前 20 条 message）**：产出 28 条 atom，**0 条**违规（memory 无时间词），时间解析
+全部正确（"yesterday" + 锚点 "8 May 2023" → "2023-05-07"）。旧 agent loop 版本同样的语料
+16% 多句、时间表达不稳定。
+
+#### 消解的两件事（写进 pipeline 的原子标准）
+
+**① 时间：memory 完全不含时间词，时间信息全部在 metadata.time。**
+
+pipeline 把时间处理分成两个阶段：
+
+- **Stage 2（LLM）**：模型只需识别并提取 `time_expr`（原始表达如 "yesterday"），
+  **禁止在 memory 里写任何时间词**。
+- **Stage 3（后处理）**：代码用 `date -d` 把 `time_expr` + 锚点 → 绝对时间或带锚点的相对时间。
+
+| 源话（消息 dated <anchor date>） | time_expr（模型提取） | metadata.time（代码解析） |
 |---|---|---|
-| `msgmem`（原话） | 逐条原始消息 | 锚点与溯源；agent 消解指代时要读它 |
-| `summem`（会话总结） | "哪次会话谈过这件事" | 跨会话定位的路标（但**只给 agent grep，不注入 prompt** —— §2.2） |
-| `atommem`（原子事实） | 拆开、消解、自足的单条事实 | **检索的首选原料** —— grep 命中的就是能直接用的原子 |
+| "yesterday" | `"yesterday"` | `2023-05-07` （anchor: 8 May 2023） |
+| "last week" | `"last week"` | `the week before 2023-05-08` |
+| "last year" | `"last year"` | `2022` （精度只减不增） |
+| "on <a date>"（本身绝对） | `"on 7 May 2023"` | `2023-05-07` |
+| 无时间 | `""` | `""` |
 
-**atommem 才是 search 检索的首选**：一条消息可以拆成若干原子（复合句拆开、隐含的持久事实补出来），
-每条自足、单一事实、≤20 词。于是集合型问题（"她参加过哪些活动"）能收到干净、可数的成员，而不必
-读一整条含多个话题的消息。
+**memory 字段的禁止词列表**（代码验证）：yesterday, today, tomorrow, ago, last, next, past, 
+recent, recently, soon, future, now, currently, presently, before, after, since, until, during, 
+N days/weeks/months/years。
 
-#### 消解的两件事（写进 add agent 的原子标准）
+**② 指代：换成原始含义。** `she`/`he`/`it`/`there`/`this`/`that` → 真名 / 真实地点 / 真实物件。
+召回窗口（默认前 5 条同会话消息）提供上下文，模型据此消解。
 
-**① 时间：自足 + 精度只减不增。**
+**③ 一事实一 atom。** 一个 atom = **一个句子、一个主张**；**禁止多句 memory**。
+`"<A> does <fact1>. <A> does <fact2>."` 是两条 atom，不是一条。
 
-atom 的 `time` 要么是绝对时间（`7 May 2023`），要么是带绝对锚点的相对时间（`the week before
-9 June 2023`）。**禁止无锚点的相对词**（`yesterday` 单说）。**精度只减不增**：源说 `last year`
-→ 只能是年份（`2022`），不许编月日。
+**④ tag key 纪律（prompt 声明 + harness 兜底）。** `tag` 用 `key:value`，key **只能从固定集合里选**，
+不得自造：`speaker / topic / activity / action / event / state / sentiment / relation / entity /
+possession / time / other`。由 `_normalize_tags` 在后处理时强制收敛：裸词/近义词按 `_TAG_ALIASES`
+映射到规范 key，其余未知 key 一律写成 `other:<原值>`（值保留、只收敛 key）。
 
-| 源话（消息 dated 8 May 2023） | atom 的 time |
-|---|---|
-| "yesterday" | `7 May 2023` |
-| "last week" | `the week before 8 May 2023` |
-| "last year" | `2022` |
-| "on 7 May 2023"（本身绝对） | `7 May 2023` |
+**⑤ 具体内容不得抽象化。** 可枚举的具名/带数字内容本身就是事实（`CAPTURE THE SPECIFICS`）——
+不许换成一句笼统的情感或类别。
 
-**② 指代：换成原始含义。** `she`/`he`/`it`/`there` → 真名 / 真实地点 / 真实物件。单看一条
-`"she went there"` 消解不了 —— agent 要 grep `msgmem` 里前面的相关消息才知道 `she` 是谁。
-
-#### 逐消息 agent 怎么跑（`src/codemem/add/atommem.py`）
+#### 三阶段 pipeline 怎么跑（`src/codemem/add/atommem_pipeline.py`）
 
 ```bash
-# 每处理一条 message：一个 agent loop（read / edit / bash，≤ max_step=8 步）
-#   system prompt：原子标准 + 三层记忆说明 + 检索策略 + 只填 4 个字段的协议
-#   user prompt：目标 message + 同会话前 N 条消息（消解窗口=12）+ 会话清单
-#   agent：先 grep atommem 查重 → 已有则 edit replace 合并演化、没有才 edit append 新原子
-#   收尾：finalize_file 对比处理前后的快照，补 id / source / type / changelog
+# 每处理一条 message：三阶段 pipeline（召回 → 单次 LLM → 后处理）
+#   Stage 1 (召回): grep 同会话前 N 条消息作为上下文（默认 window=5）
+#   Stage 2 (抽取): 单次 LLM 调用 → [{memory, time_expr, role, tag}, ...]
+#       - memory: 纯事实陈述，完全不含时间词
+#       - time_expr: 源消息的原始时间表达，留给后处理
+#   Stage 3 (后处理): 时间解析（date -d）+ 去重 + 补字段（id/source/type/changelog）
 ```
 
 **核心原理（用户原话）**：在已有的 msgmem/summem/atommem 中逐个 message 处理生成 atommem —— 后面的
-message 的信息可能受前面内容影响、可能**跨 session 影响**，所以 agent 需要看到前面**相关的**信息
-才能做出优秀的操作。这就是它不是一个单次 LLM 调用、而是一个朴素 agent loop 的原因。
+message 的信息可能受前面内容影响、可能**跨 session 影响**，所以需要召回前面**相关的**信息
+才能做出优秀的消解。这就是它不是一个孤立抽取、而是逐条**增量**处理的原因。
 
-- **串行**：同一目录内按 message 顺序**串行**（后面的 message 要看到前面已生成的 atommem）；
+- **串行**：同一目录内按 message 顺序**串行**（后面的 message 能召回前面已生成的 atommem）；
   **不同目录并行**。
-- **agent 只填四个字段**（`memory` + `metadata.{time, role, tag}`）；`id` / `source` / `type` /
-  `changelog` 由系统在 `finalize_file` 收尾时补上 —— 省了 agent 的力气，也保证这些字段永远正确。
-- **合并 / 演化（`finalize_file`）**：收尾时对比处理前的快照（`id -> record`）与处理后的整份文件，
-  分成三种情况 ——
-  - **新增行**（没有系统 `id`）：补 `id = {本 message}_k`（续号不撞已有），`source=[本 message]`，
-    `changelog=[created]`。
-  - **改写行**（`id` 在快照里，且内容变了）：**保留原 id**，`source` 收下 agent 写的多来源 id 并
-    补上本 message，`changelog` 追加一条**改动前的 memory**（这就是"演化"）。
-  - **原样行**（`id` 在快照里，内容没变 = agent 没碰）：**原样保留，绝不把本 message 的 id 塞进它的
-    source** —— 否则每处理一条 message，全库旧 atom 的 source 都会多一个 id。
-  - **消失行**：尊重删除（合并时"吸收进另一条"）。
-  - 最后按 memory 归一化做一次 **CPU 去重兜底**：同一事实（大小写/标点差异）只留一条，`source` 取并集。
+- **模型只填四个字段**（`memory` + `time_expr` + `role` + `tag`）；`id` / `source` / `type` /
+  `time` / `changelog` 由系统在后处理时补上 —— 省了模型的力气，也保证这些字段永远正确。
+- **时间解析在后处理**：`parse_time_expression` 用 `date -d` 把 `time_expr` + 锚点 → 绝对时间，
+  精度只减不增（"last year" → 年份，不编月日）。
 - **`time` 承载该事实的**全部**时间信息**：时点 → 绝对日期；时长/年龄/"N ago" → 起点或区间；区间 →
-  `YYYY-MM-DD/YYYY-MM-DD` 或带锚点措辞；无时间 → `""`。精度只减不增。
-- **增量/幂等**：重跑一条 message 时，先把 atommem 里 `source` 指向它的旧 atom 去掉、再重新生成
-  （"就地覆盖是幂等的"的 agent 版）。
+  `YYYY-MM-DD/YYYY-MM-DD` 或带锚点措辞；无时间 → `""`。
+- **增量/幂等**：重跑一条 message 时，先把它**最初产出**的 atom（primary source = 本 message）去掉，
+  再重新生成 —— 重复跑不会累积重复 atom。
 
-> 旧的 `resolve.py`（逐消息一次 LLM 调用改写消息）与 `session.py` 已删除，被本节的
-> `msgmem` / `summem` / `atommem` 三层取代。旧的 `atommem`（抽取模型训练态）与 `dpo` 更早就删了
-> —— 它们训练的是不再使用的抽取模型。需要时从 git history 取回。
+**三阶段的职责边界**：
+
+| 阶段 | 职责 | 实现 |
+|---|---|---|
+| Stage 1 召回 | 提供消解上下文（同会话前 N 条消息） | `recall_context`（纯 CPU，grep） |
+| Stage 2 抽取 | 识别事实 + 提取时间表达 | `extract_atoms_llm`（单次 LLM，返回 JSON array） |
+| Stage 3 后处理 | 时间折算 + 去重 + 补字段 | `postprocess_atoms` + `_dedup_atoms`（纯 CPU） |
+
+后处理的**去重**分两遍：① 精确去重（归一化后完全相同）；② 近义去重（token 集合 Jaccard ≥ 0.6，
+或去情绪动词后共享核心实词 ≥3 个且共享率 ≥0.25）—— 8B 仍会用不同措辞重写同一事实（"values X" /
+"appreciates X" / 同一 turn 里七连 community/inclusivity），prompt 拦不全，所以代码兜底。
+
+> 旧的 `run_message` agent loop 版本仍保留在 `atommem.py`，用 `--use-agent` 可切回去对比。
+> 默认用 pipeline（`use_pipeline=True`）。
 
 ---
 
@@ -514,16 +562,16 @@ judge 同理：`reason` 在前、`label` 在后，等于先做比较再下结论
 ### 2.6 上下文预算：工具描述不能吃掉 agent 的步数
 
 system prompt 是**每条 QA 都完整注入一次**的（agent loop 的每次模型调用都带着它），所以它的
-每一句都在跟检索结果抢上下文。实测现在 **~14200 字符**：
+每一句都在跟检索结果抢上下文。实测现在 **~18770 字符**：
 
 | 段落 | 字符 | 说明 |
 |---|---|---|
 | system body | ~4900 | 检索策略（STRATEGY）+ 三条 worked example（关键词检索 / 相对时间 / 通篇读） |
-| EVIDENCE_STANDARD | 2026 | 一条证据要写法上合格（§2.8）—— 自足 / 指代 / 时间锚点 / 不编造精度 / 溯源 |
+| EVIDENCE_STANDARD | 2035 | 一条证据要写法上合格（§2.8）—— 自足 / 指代 / 时间锚点 / 不编造精度 / 溯源 |
 | TOOLS | ~1700 | 三个工具（read / edit / bash）的 description + schema |
 | COMMANDS | 1485 | grep、date 的用法与示例 |
-| WRITING_POLICY | 1450 | 证据是推导、不是抄的 |
-| TIME_POLICY | 1300 | 时间精度规则（§2.4） |
+| WRITING_POLICY | 1981 | 证据是推导、不是抄的 |
+| TIME_POLICY | 1942 | 时间精度规则（§2.4） |
 | SCHEMA | 650 | evidence 记录字段 |
 | WORKSPACE | 640 | 目录布局与只读规则 |
 | PROTOCOL | 400 | 响应格式 |
@@ -531,7 +579,13 @@ system prompt 是**每条 QA 都完整注入一次**的（agent loop 的每次�
 **比"有块机制"那一版反而小了一点** —— 砍掉了整套上下文块流程描述与 `next` 工具的 schema。
 "证据标准"那一段保留（它换来的是"什么算一条合格的证据"）。
 
-`test_search.py` 里有一条断言把这个上限钉住（`< 18000 字符`）——**涨回去就等于白做这次简化**，
+> **2026-10-05 变更 C 使 prompt 增长。** 两种检索策略从散文改成**标准操作流程（SOP）+ 特例
+> 处理**（§2.9），STRATEGY 从 ~2.6k 涨到 ~3.4k。这是用户明确要求的内容，是有意增长；
+> 上限断言相应从 `< 18000` 抬到 `< 19500`，仍用于防止**非预期**膨胀。同时把 prompt 里
+> 残留的数据集实体（真实人名/日期/书名）全部替换成占位符（`<person>` / `<date>` /
+> `<key word>`），断言里新增一条**负向检查**：渲染后的 prompt 不得出现任何已知数据集实体。
+
+`test_search.py` 里有一条断言把这个上限钉住（`< 19500 字符`）——**涨回去就等于白做这次简化**，
 所以它该在 CI 里红，而不是等到某次跑完发现步数又不够用了。
 
 **Verifier 同理**：它的 prompt 里没有 few-shot 示例，唯一的例外是**时间精度的两条说明**
@@ -602,6 +656,7 @@ source:  ["session_1_9", "session_2_8", "session_1_17"]
 | **60/60 步没有一次完成信号**，12~24 步全烧在重复追加 | **重复检测**：同一工具+参数、**且文件状态未变**时直接拒绝并给出脱困提示（状态感知 —— 文件变了就允许重跑） |
 | 空转被算作"有进展"（往文件里追加重复行） | 进展判据改成**唯一记录集合的指纹**，不是行数、也不是字节数；重复追加不算进展 |
 | prompt 随历史无限涨（3.3k→4.5k tok / 12 步） | **上下文压缩**：超预算即把中段坍缩成摘要，保留 system + 最近 N 条 + **工具用过的 id 集合**（保 id 是关键，否则模型会忘了已收过哪些而重复追加） |
+| **超长工具观测一直堆在上下文里**（一次 `read` 整个 msgmem 就是几千字符，跨轮不再需要却永远占着） | **遗忘**（§2.9.1）：按"轮数 + 长度"双阈值，把够旧且超长的观测定点替换成一行占位符 |
 
 **逐条追加：`edit` 需要专门的 append 模式，不能靠"用最后一行当 oldText"去模拟。** 流程要求
 "每看完一页就把理解**追加**到 `evidence.jsonl`"。最初的做法是让模型用精确替换 `edit` 自己造
@@ -636,6 +691,37 @@ source:  ["session_1_9", "session_2_8", "session_1_17"]
   （它们曾经各写一份，结果 agent 认为文件坏了、validator 认为文件是好的）。并容忍两种
   `jq` 自然产物：**一行一个数组**（`jq -s`）与**整份美化 JSON**（`jq -s` 不加 `-c`）——
   后者以前会让 `write_normalized` 把证据**全部删掉**。
+
+### 2.9.1 遗忘系统：按"轮数 + 长度"双阈值定点清理（变更 D）
+
+**与上下文压缩互补，各管一件事**：压缩是**按总量触发**、把**中段**整体坍缩（兜底）；
+遗忘是**按观测个体**、**按年龄**把**够旧且够长**的单条观测替换成占位（定点）。
+
+一次 QA 只要 `read` 过整个 `msgmem.jsonl`，那条观测就有几千字符；读过之后它**再也不会被用到**，
+却一直躺在上下文里跟后续步骤抢预算。所以规则是：
+
+- **超长**：单条工具观测的字符数 `> long_observation_chars` 才有资格被遗忘（短观测不动）。
+- **够旧**：该观测出现后已经过了 `forget_after_turns` 个**回合**（一个回合 = 一次 assistant
+  工具调用 + 它后面那条观测）。
+- 替换成一行：`[observation forgotten after {N} turns -- it exceeded {M} chars. Re-run the command if you need it again.]`
+  —— 模型知道"这条被忘了、需要就重跑"，不会误以为库里没有。
+- **system、初始 user、最近 `forget_keep_recent_turns` 轮**一律不动（默认 2 轮）。
+
+三个参数都在 `configs/search.yaml`（`search/runner.py` 的 `DEFAULT_CONFIG` 同款）：
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `forget_after_turns` | 4 | 观测超过这么多**回合**后才有资格被遗忘；**0 = 关闭** |
+| `long_observation_chars` | 2000 | 长度超过此值的观测才算"超长"；**0 = 关闭** |
+| `forget_keep_recent_turns` | 2 | 始终保留最近这么多轮 |
+
+**两个阈值都 > 0 才启用**（任一为 0 即整机关闭）。调用点在 `run_agent_round` 主循环里、
+**在 `compact_messages` 之前**（每轮模型调用前）—— 先做定点遗忘、再按总量兜底压缩。
+add 阶段（`add/atommem.py`）也走同一个 `run_agent_round`，但步数少，默认关闭（两个阈值 0）。
+
+实测（2026-10-05 小样本重跑 `--max-qa 3 --max-steps 8`）：qa1 / qa2 各命中一次 ——
+`遗忘 1 条超长观测（>2000 字符、>4 回合），省下 7141 / 6898 字符`，无崩溃、证据正常产出。
+`test_search.py` 里有独立单测覆盖：短观测不忘、新观测不忘、超长且旧的被替换成占位、system 保留。
 
 ### 2.10 存储与运行目录
 
