@@ -92,12 +92,12 @@ def test_toolcfg(tmp: Path) -> None:
     except toolcfg.ToolConfigError:
         check("校验能发现缺描述的工具", True)
 
-    rendered = catalog.render_prompt("Who is Caroline?")
+    rendered = catalog.render_prompt("Who is <person>?")
     for slot in ("{{TOOLS}}", "{{COMMANDS}}", "{{WORKSPACE}}", "{{SCHEMA}}", "{{PROTOCOL}}",
                  "{{WRITING_POLICY}}", "{{TIME_POLICY}}", "{{EVIDENCE_STANDARD}}",
                  "{{STRATEGY}}", "{{QUESTION}}"):
         check(f"渲染后没有残留 {slot}", slot not in rendered)
-    check("渲染含问题原文", "Who is Caroline?" in rendered)
+    check("渲染含问题原文", "Who is <person>?" in rendered)
     # 检索就是 grep：语料是 JSONL，行号稳定，可以 grep -n 再 read offset
     check("渲染含 grep 用法", "grep -rin" in rendered)
     check("渲染给出递归 grep + read 精读的组合", "grep -rin \"word\" inputs/" in rendered
@@ -112,7 +112,8 @@ def test_toolcfg(tmp: Path) -> None:
     check("渲染给出通读相关 session 的策略", "Strategy 2" in rendered or "read through related sessions" in rendered)
     check("渲染说明两种策略可自由混用、不必一开始选定",
           "mix them freely" in rendered or "switch" in rendered)
-    check("渲染给出 keyword 检索的判据（可直接 grep 出词）", "names something concrete" in rendered)
+    check("渲染给出 keyword 检索的判据（可直接 grep 出词）",
+          "greppable words" in rendered or "pull the greppable" in rendered.lower())
     check("渲染给出通读的判据（集合/散布型）", "SET" in rendered and "spread" in rendered.lower())
     check("渲染提醒不要猜、要真读到", "never from what you assume" in rendered
           or "do not write the record" in rendered)
@@ -166,12 +167,37 @@ def test_toolcfg(tmp: Path) -> None:
     check("answer：禁止无锚点的相对词", "next month" in ap and "WRONG" in ap)
     check("answer：不要编造源没有的精度", "do NOT add precision" in ap.lower()
           or "Do NOT add precision" in ap)
+    check("answer：列表题要枚举成员", "ENUMERATE every member" in ap)
+    check("answer：反事实题要从相关事实推理并表态",
+          "COUNTERFACTUAL" in ap and "Do NOT abstain just because" in ap)
+
+    # --- atom 标准：具体细节不许抽象化 + 一事实一原子 + tag key 固定 ---
+    atom_std = _P.ATOM_AGENT_STANDARD
+    check("atom 标准：禁止把具体事实抽象成泛泛情感", "CAPTURE THE SPECIFICS" in atom_std)
+    check("atom 标准：给出具体反例（dog and cat）", "has a dog and a cat" in atom_std)
+    check("atom 标准：列表要枚举成员", "names every member" in atom_std)
+    check("atom 标准：主客体不得颠倒", "ATTRIBUTE CORRECTLY" in atom_std)
+    check("atom 标准：一事实一原子、禁止多句", "ONE FACT, ONE SENTENCE" in atom_std)
+    check("atom 标准：时间字段不得是裸相对词", "must never be a bare relative word" in atom_std)
+    check("atom 标准：正文不留裸相对时间", "must NOT keep a bare relative time word" in atom_std)
+    check("atom 标准：tag 用固定 key 集合",
+          "MUST be ONE OF these twelve" in atom_std or "FIXED KEY SET" in atom_std)
+    check("atom 标准：物主代词同句可留、句外须消解",
+          "antecedent is the named subject of the SAME atom" in atom_std)
+    check("atom 标准：已去数据化（无 Caroline/Melanie/9 June）",
+          "Caroline" not in atom_std and "Melanie" not in atom_std
+          and "9 June 2023" not in atom_std and "Bach" not in atom_std)
 
     # 时间精度：这是这一版的核心规则
     check("时间策略：不得编造更细的精度", "Never invent a day" in rendered
-          or "not finer" in rendered)
-    check("时间策略：按源语料的单位作答", "answer in that unit" in rendered)
-    check("时间策略：保留锚点表述", "the week before 9 June 2023" in rendered)
+          or "not finer" in rendered or "never sharpen" in rendered.lower())
+    check("时间策略：按源语料的单位作答", "answer in that unit" in rendered
+          or "answer at that unit" in rendered)
+    check("时间策略：禁止把会话日期当事件日期写进内容", "NEVER put the session's own date" in rendered)
+    check("时间策略：算不出时只写带锚点的相对表述", "CANNOT compute" in rendered)
+    check("有 worked example（算不出的相对时间）", "CANNOT pin to a day" in rendered)
+    check("时间策略：保留锚点表述", "the week before <date>" in rendered
+          or "the week before <session date>" in rendered)
     check("时间策略：区间是合法答案", "A period is a valid answer" in rendered)
     check("时间策略：记录必须自带锚点", "stands ALONE" in rendered or "stand ALONE" in rendered
           or "TIME ANCHORED" in rendered)
@@ -179,12 +205,26 @@ def test_toolcfg(tmp: Path) -> None:
           or "verbatim" in rendered.lower())
     # 这一版最要紧的一条：会话日期 ≠ 事件日期
     check("时间策略：会话日期不是事件日期", "WHEN IT WAS SAID" in rendered)
-    check("时间策略：给出具体反例（9 June）", "9 June 2023" in rendered and "week before" in rendered)
+    check("时间策略：反例用占位符而非具体日期",
+          "the week before <session date>" in rendered or "NOT <session date>" in rendered
+          or "<session date>" in rendered)
     check("时间策略：禁止无锚点的相对词", "unanchored" in rendered.lower())
-    check("有 worked example（关键词检索）", "WORKED EXAMPLE (keyword search" in rendered)
-    check("有 worked example（相对时间）", "date -d \"8 May 2023 -1 day\"" in rendered)
-    check("有 worked example（keyword 检索）", "WORKED EXAMPLE (keyword search" in rendered)
-    check("有 worked example（通读相关 session，集合型）", "WORKED EXAMPLE (Strategy 2" in rendered)
+    check("有 worked example（关键词检索，Strategy 1）", "WORKED EXAMPLE (Strategy 1" in rendered)
+    check("有 worked example（相对时间，占位符命令）", "date -d \"<session date> -1 day\"" in rendered)
+    check("有 worked example（算不出的相对时间）", "CANNOT pin to a day" in rendered)
+    check("写道具/名单要具体（不许抽象化）",
+          "not \"creative activities\"" in rendered or "List the real members" in rendered
+          or "EVERY member" in rendered or "every member" in rendered)
+    check("有 worked example（通读相关 session，集合型，Strategy 2）",
+          "WORKED EXAMPLE (Strategy 2" in rendered)
+    # 去数据化：渲染后的 prompt 里不得出现任何已知的数据集实体/日期。
+    _leaks = ["Caroline", "Melanie", "LGBTQ", "Bach", "Mozart", "Vivaldi", "pottery",
+              "Nothing is Impossible", "Oliver", "Luna", "Bailey", "figurines",
+              "clarinet", "guinea pig", "9 June 2023", "8 May 2023", "7 May 2023",
+              "15 July 2023", "25 May 2023", "12 July 2023", "Canada", "Sweden",
+              "The Power of Now", "Becoming Nicole", "Hey Mel"]
+    _found = [s for s in _leaks if s in rendered]
+    check("渲染后的 prompt 已去数据化（无任何数据集实体/日期）", not _found, str(_found))
     # 语料是三个记忆文件：没有顶层印象/概览层（实测它诱导不检索直接答）
     check("提示里没有顶层印象 speakers summary", "speakers_summary" not in rendered)
     check("提示暴露三个记忆文件", "inputs/atommem.jsonl" in rendered
@@ -193,8 +233,10 @@ def test_toolcfg(tmp: Path) -> None:
     check("提示里没有已废弃的 sessions/ 目录", "inputs/sessions/" not in rendered)
     check("提示不提 index/nodes/edges/graph", "index.jsonl" not in rendered
           and "nodes.jsonl" not in rendered and "edges.jsonl" not in rendered)
-    # 上下文预算：system prompt 每个 round 都整体注入一次，涨回去就等于白做这次简化
-    check("system prompt 控制在 18000 字符内", len(rendered) < 18000, str(len(rendered)))
+    # 上下文预算：system prompt 每个 round 都整体注入一次，涨回去就等于白做这次简化。
+    # 阈值从 18000 抬到 19500：变更 C 刻意加入了两种策略的标准流程 + 特例处理（约 +0.9k），
+    # 这是用户明确要求的内容，属于有意增长；断言仍用于防止非预期膨胀。
+    check("system prompt 控制在 19500 字符内", len(rendered) < 19500, str(len(rendered)))
 
     # 响应解析
     check("解析裸 JSON", (toolcfg.parse_tool_call('{"tool":"bash","args":{"command":"ls"}}') or
@@ -953,6 +995,64 @@ async def test_compaction_units(tmp: Path) -> None:
     check("max_chars=0 表示不压缩", off.dropped == 0 and len(off.messages) == len(messages))
 
 
+def test_forgetting_units(tmp: Path) -> None:
+    section("6c. 遗忘系统（超长工具观测按轮数 + 长度双阈值）")
+    # 构造对话：system + 初始 user_begin + 若干 (assistant 工具调用, user 观测) 回合。
+    # 让**第一条**观测超长、后面几条短 —— 验证"超长且够旧"才被忘。
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "Answer the question."},
+    ]
+    messages.append({"role": "assistant", "content": '{"tool":"bash","args":{"command":"ls"}}'})
+    messages.append({"role": "user", "content": "L" * 3000})   # 超长（第 1 条观测）
+    for _ in range(6):                                          # 6 个后续短回合
+        messages.append({"role": "assistant", "content": '{"tool":"bash","args":{"command":"ls"}}'})
+        messages.append({"role": "user", "content": "ok"})
+
+    result = agent_mod.forget_long_observations(
+        messages, forget_after_turns=4, long_observation_chars=2000,
+        keep_recent_turns=2,
+    )
+    check("超长且够旧的观测被遗忘", result.forgotten == 1, str(result.forgotten))
+    check("遗忘后条数不变（只是替换成占位）", len(result.messages) == len(messages))
+    check("占位符说明了被遗忘", any("forgotten" in m["content"] and "3000 chars" in m["content"]
+                               for m in result.messages))
+    check("省下的字符数被统计", result.saved_chars > 2000, str(result.saved_chars))
+    check("system 原样保留", result.messages[0]["content"] == "SYS")
+    check("初始 user_begin 不被遗忘（不是工具观测）",
+          result.messages[1]["content"] == "Answer the question.")
+
+    # 短的旧观测：不该被忘（长度不够）。
+    short_msg = [
+        {"role": "system", "content": "S"},
+        {"role": "assistant", "content": "{}"},
+        {"role": "user", "content": "short"},
+        {"role": "assistant", "content": "{}"},
+        {"role": "user", "content": "x"},
+    ]
+    r2 = agent_mod.forget_long_observations(
+        short_msg, forget_after_turns=1, long_observation_chars=2000)
+    check("短观测不被遗忘", r2.forgotten == 0, str(r2.forgotten))
+
+    # 新的超长观测：在 keep_recent 保护区内，不该被忘。
+    fresh_msg = [
+        {"role": "system", "content": "S"},
+        {"role": "assistant", "content": "{}"},
+        {"role": "user", "content": "L" * 3000},
+    ]
+    r3 = agent_mod.forget_long_observations(
+        fresh_msg, forget_after_turns=1, long_observation_chars=2000, keep_recent_turns=2)
+    check("最近回合内的超长观测不遗忘", r3.forgotten == 0, str(r3.forgotten))
+
+    # 关闭开关：任一阈值 <=0 都原样返回。
+    off = agent_mod.forget_long_observations(
+        messages, forget_after_turns=0, long_observation_chars=2000)
+    check("forget_after_turns=0 关闭遗忘", off.forgotten == 0 and off.messages == messages)
+    off2 = agent_mod.forget_long_observations(
+        messages, forget_after_turns=4, long_observation_chars=0)
+    check("long_observation_chars=0 关闭遗忘", off2.forgotten == 0)
+
+
 def test_no_undefined_names() -> None:
     """静态检查：整个 src/codemem 里不能有"调用了但没定义/没导入"的名字。
 
@@ -1561,6 +1661,81 @@ def test_add_memory_module(tmp: Path) -> None:
     check("近义去重：主客体颠倒的不同事实不误合并",
           "c" in nd_by_id and "d" in nd_by_id, str(sorted(nd_by_id)))
 
+    # 场景 7：**情绪动词换说法** —— 8B 从一句反应里连吐 7 条（praises/supports/values/
+    # appreciates/recognizes/highlights + 同一宾语），两两 Jaccard 只有 0.2~0.5，纯 Jaccard
+    # 抓不住。去动词核心规则要能并掉大部分，同时不碰真正不同的事实。
+    sv = atommem_mod._dedup_atoms([
+        {"memory": "Caroline praises Melanie for participating in a charity race for mental health",
+         "metadata": {"id": "s1", "source": ["session_2_2"]}},
+        {"memory": "Caroline supports raising awareness for mental health",
+         "metadata": {"id": "s2", "source": ["session_2_2"]}},
+        {"memory": "Caroline values the impact of charitable actions on mental health awareness",
+         "metadata": {"id": "s3", "source": ["session_2_2"]}},
+        {"memory": "Caroline appreciates Melanie's contribution to mental health awareness through charity",
+         "metadata": {"id": "s4", "source": ["session_2_2"]}},
+        {"memory": "Caroline went to an LGBTQ support group on 7 May 2023",
+         "metadata": {"id": "s5", "source": ["session_1_8"]}},
+        {"memory": "Caroline feels accepted by the support group",
+         "metadata": {"id": "s6", "source": ["session_1_7"]}},
+    ])
+    sv_ids = {a["metadata"]["id"] for a in sv}
+    check("情绪动词换说法：七连并到少数几条",
+          len(sv_ids & {"s1", "s2", "s3", "s4"}) <= 2, str(sorted(sv_ids)))
+    check("情绪动词换说法：不误并真正不同的支持小组事实",
+          "s5" in sv_ids and "s6" in sv_ids, str(sorted(sv_ids)))
+    check("情绪动词换说法：合并后 source 取并集",
+          any(set(a["metadata"]["source"]) >= {"session_2_2"} for a in sv),
+          str([a["metadata"]["source"] for a in sv]))
+
+    # 场景 8：**tag key 纪律由 harness 兜底** —— 8B 实测自造 100+ 个自由 key。落盘时
+    # key 必须收敛进固定集合：近义词映射到规范 key，其余未知 key 落 other（值保留）。
+    t = atommem_mod.finalize_file(
+        before={}, after=[
+            {"memory": "Melanie paints sunrises", "metadata": {
+                "time": "", "role": "Melanie",
+                "tag": ["hobby:painting", "emotion:joy", "zorp:mental health",
+                        "art:landscape", "nonsense", "activity:swimming", "topic:adoption"]}},
+        ],
+        source_id="session_1_1", default_time="", default_role="Melanie",
+    )
+    tags = t[0]["metadata"]["tag"]
+    check("tag 纪律：近义词映射到规范 key",
+          "activity:painting" in tags and "sentiment:joy" in tags, str(tags))
+    check("tag 纪律：未知 key 落 other 且保留值",
+          "other:mental health" in tags, str(tags))
+    check("tag 纪律：art 近义词归到 activity（值保留）",
+          "activity:landscape" in tags, str(tags))
+    check("tag 纪律：规范 key 原样保留",
+          "activity:swimming" in tags and "topic:adoption" in tags, str(tags))
+    check("tag 纪律：无 key:value 形状的落 other",
+          "other:nonsense" in tags, str(tags))
+    check("tag 纪律：裸的已知 key 也收敛（art -> activity:art 值保留）",
+          "activity:art" in tags or "other:art" not in tags, str(tags))
+    check("tag 纪律：落盘后所有 key 都在固定集合内",
+          all(str(x).split(":")[0] in atommem_mod.TAG_KEYS for x in tags), str(tags))
+
+    # 场景 8b：**未被改动的旧 atom 也要收敛 tag** —— 历史文件里可能有规范化前的自由 key，
+    # "原样保留"路径不能把污染带进新文件。
+    leg = atommem_mod.finalize_file(
+        before={"session_1_1_1": {"memory": "Melanie paints", "metadata": {
+            "id": "session_1_1_1", "type": "atom", "time": "", "role": "Melanie",
+            "tag": ["emotion", "art"], "source": ["session_1_1"],
+            "changelog": [{"time": "t0", "content": "created"}]}}},
+        after=[{"memory": "Melanie paints", "metadata": {
+            "id": "session_1_1_1", "type": "atom", "time": "", "role": "Melanie",
+            "tag": ["emotion", "art"], "source": ["session_1_1"],
+            "changelog": [{"time": "t0", "content": "created"}]}}],
+        source_id="session_1_2", default_time="", default_role="Melanie",
+    )
+    leg_tags = leg[0]["metadata"]["tag"]
+    check("tag 纪律：未改动的旧 atom 也被收敛",
+          leg_tags == ["sentiment:emotion", "activity:art"], str(leg_tags))
+    check("tag 纪律：收敛不改 id / source / changelog",
+          leg[0]["metadata"]["id"] == "session_1_1_1"
+          and leg[0]["metadata"]["source"] == ["session_1_1"]
+          and leg[0]["metadata"]["changelog"] == [{"time": "t0", "content": "created"}],
+          str(leg[0]["metadata"]))
+
 
 async def test_atommem_agent(tmp: Path) -> None:
     section("7c. add.atommem：agent 逐 message 抽 atom（假模型 + 真工具）")
@@ -1603,22 +1778,26 @@ async def test_atommem_agent(tmp: Path) -> None:
     llm_mod.chat_completion = fake_chat_completion  # type: ignore[assignment]
     try:
         import codemem.search.toolcfg as tc
+        from codemem.add.atommem_agent_v2 import run_dir_parallel
+
         catalog = tc.load_catalog(PROJECT_ROOT / "configs" / "add_tool.json")
-        result = await atommem_mod.run_dir(
-            sample, {"max_steps": 4, "context_window": 4, "concurrency": 1},
+        result = await run_dir_parallel(
+            sample, {"max_steps": 4, "context_window": 4, "concurrency": 1, "bash_timeout": 30},
             None, catalog, Logger(level="error"),
         )
         check("atommem：状态 OK", result["status"] == "OK", str(result))
         check("atommem：处理了 2 条 message", result["messages"] == 2, str(result))
         check("atommem：写出了 atom", result["atoms"] >= 1, str(result))
         content = (sample / "atommem.jsonl").read_text(encoding="utf-8")
-        # 假模型对两条 message **append 同一句** —— 第二条是"重复追加"，不改变 source
-        # （真正的跨 message 合并要 agent 用 edit replace + 显式写 source，见场景 3）。
+        # 假模型对两条 message **append 同一句** —— 两条产出同一条事实，
+        # 最终按 memory 归一化去重成一条，source 取并集。
         check("atommem：atom 带系统补的 id/source/type",
-              '"id": "session_1_1_1"' in content and '"type": "atom"' in content
-              and '"source": ["session_1_1"]' in content, content[:300])
+              '"type": "atom"' in content
+              and '"source": ["session_1_1"' in content, content[:300])
         check("atommem：memory 是 agent 写的 fact",
               "Melanie has kids" in content, content[:300])
+        check("atommem：相对时间被解析进 time（memory 不含时间词）",
+              "yesterday" not in content.lower(), content[:300])
     finally:
         llm_mod.chat_completion = saved
 
@@ -1797,6 +1976,7 @@ def main() -> int:
         test_add_memory_module(tmp)
         test_verifier_rendering()
         test_agent_guards()
+        test_forgetting_units(tmp)
         test_judge_temporal()
         test_answer_parse()
         test_eval_metrics()

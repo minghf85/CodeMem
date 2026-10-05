@@ -121,19 +121,19 @@
       "recipes": [
         {
           "why": "Find a name or a word across all three memory files at once (recursive).",
-          "cmd": "grep -rin \"husband\" ."
+          "cmd": "grep -rin \"<key word>\" ."
         },
         {
           "why": "Find every atom already written about an entity (cross-session hop). Because references are resolved, the same name means the same thing everywhere.",
-          "cmd": "grep -rin \"Caroline\" atommem.jsonl | head -20"
+          "cmd": "grep -rin \"<person>\" atommem.jsonl | head -20"
         },
         {
           "why": "See what happened in a specific session (its raw messages).",
-          "cmd": "grep -rin \"session_3\" msgmem.jsonl | head -20"
+          "cmd": "grep -rin \"session_N\" msgmem.jsonl | head -20"
         },
         {
           "why": "See which session a topic came up in (the summaries).",
-          "cmd": "grep -rin \"pottery\" summem.jsonl | head"
+          "cmd": "grep -rin \"<topic>\" summem.jsonl | head"
         },
         {
           "why": "Read one memory file in full.",
@@ -145,12 +145,12 @@
       "summary": "Compute a date in bash when you need one (`date -d`). Do NOT do the arithmetic in your head -- you will get it wrong. Anchor on the message's own session time. The environment is pinned to LC_ALL=C so month and weekday names always come out in English.",
       "recipes": [
         {
-          "why": "Relative -> absolute. The raw form ('1:56 pm on 8 May, 2023') is accepted as-is.",
-          "cmd": "date -d \"8 May 2023 -1 day\" +\"%d %b %Y\""
+          "why": "Relative -> absolute. The raw form ('<time> on <anchor date>') is accepted as-is.",
+          "cmd": "date -d \"<anchor date> -1 day\" +\"%d %b %Y\""
         },
         {
-          "why": "Which weekday a date is -- needed when the source says 'the Friday before X'.",
-          "cmd": "date -d \"15 Jul 2023 -2 day\" +\"%A %d %b %Y\""
+          "why": "Which weekday a date is -- needed when the source says 'the <weekday> before X'.",
+          "cmd": "date -d \"<anchor date> -2 day\" +\"%A %d %b %Y\""
         }
       ]
     }
@@ -168,9 +168,9 @@
       "Only atommem.jsonl is yours to append. Write the TARGET message's atoms there."
     ]
   },
-  "strategy": "Your goal: for the ONE target message, make its atomic facts present in atommem.jsonl as self-contained atoms -- each a fact a reader can understand alone, and each fact appearing EXACTLY ONCE.\n\nWrite a fact only after you have resolved its references and TIME, and after you have checked it is not already there:\n\n- Resolve references: `grep -rin \"<a word from the target>\" .` across all three files; `read msgmem.jsonl` for the raw earlier messages; `read summem.jsonl` for the per-session summaries.\n- Put ALL the time into `time` (see the TIME standard): a point is an ISO date; a duration / \"N ago\" / age becomes its START or a SPAN (\"married 5 years\" on 9 June 2023 -> `2018`); if you cannot compute it, keep the anchored phrase (\"5 years before 9 June 2023\").\n- CHECK BEFORE YOU WRITE: `grep -rin \"<the fact's key word>\" atommem.jsonl`. If the fact is already there, do NOT append a reworded copy -- REWRITE that atom with `edit` replace so it stays ONE atom, and add this message's id to its `source`. Only APPEND when the fact is new.\n\nDo not guess an entity you could have looked up -- but do not read forever either: a fact needing three searches is worth three; a greeting is worth zero.",
+  "strategy": "Your goal: for the ONE target message, make its atomic facts present in atommem.jsonl as self-contained atoms -- each a fact a reader can understand alone, and each fact appearing EXACTLY ONCE.\n\nWrite a fact only after you have resolved its references and TIME, and after you have checked it is not already there:\n\n- Resolve references: `grep -rin \"<a word from the target>\" .` across all three files; `read msgmem.jsonl` for the raw earlier messages; `read summem.jsonl` for the per-session summaries.\n- Put ALL the time into `time` (see the TIME standard): a point is an ISO date; a duration / \"N ago\" / age becomes its START or a SPAN (\"married for N years\" said on <anchor date> -> the year N years before <anchor date>); if you cannot compute it, keep the anchored phrase (\"N years before <anchor date>\"). The `time` field must never be a bare relative word like \"next month\".\n- CHECK BEFORE YOU WRITE: `grep -rin \"<the fact's key word>\" atommem.jsonl`. If the fact is already there, do NOT append a reworded copy -- REWRITE that atom with `edit` replace so it stays ONE atom, and add this message's id to its `source`. Only APPEND when the fact is new.\n\nDo not guess an entity you could have looked up -- but do not read forever either: a fact needing three searches is worth three; a greeting is worth zero.",
   "prompt": {
-    "system": "You extract ATOMIC MEMORIES from ONE message of a conversation between {speaker_a} and {speaker_b}.\n\nYou are a code agent with `read`, `edit`, and `bash` tools. You work in a directory that holds the conversation's memory files.\n\n# RESPONSE FORMAT\n\n{{PROTOCOL}}\n\n# THE MEMORY FILES\n\n{{WORKSPACE}}\n\n# HOW TO SEARCH\n\n{{STRATEGY}}\n\n# TOOLS\n\n{{TOOLS}}\n\n# COMMANDS (use through bash)\n\n{{COMMANDS}}\n\n# WHAT AN ATOM IS\n\n{{ATOM_STANDARD}}\n\n# RULES\n\n- You fill ONLY `memory` and `metadata.{time, role, tag}`. Do NOT emit `id`, `source`, `type`, or `changelog` -- the system adds them.\n- Write TARGET facts only. Use the other messages ONLY to resolve references; never write an atom for a fact stated entirely in another message.\n- If the TARGET is a bare greeting or a question with no fact, write nothing and finish immediately.\n- Do NOT edit msgmem.jsonl or summem.jsonl -- only atommem.jsonl is yours to append.\n- When you have written the target's atoms, reply with plain text (no JSON) to finish.",
+    "system": "You extract ATOMIC MEMORIES from ONE message of a conversation between {speaker_a} and {speaker_b}.\n\nYou are a code agent with `read`, `edit`, and `bash` tools. You work in a directory that holds the conversation's memory files.\n\n# RESPONSE FORMAT\n\n{{PROTOCOL}}\n\n# TOOL CALL EXAMPLES\n\nSearch for a keyword:\n{\"tool\": \"bash\", \"args\": {\"command\": \"grep -rin 'children' atommem.jsonl\"}}\n\nRead earlier messages:\n{\"tool\": \"read\", \"args\": {\"path\": \"msgmem.jsonl\", \"offset\": 1, \"limit\": 10}}\n\nAppend a new atom:\n{\"tool\": \"edit\", \"args\": {\"append\": \"{\\\"memory\\\": \\\"Caroline has 2 children.\\\", \\\"metadata\\\": {\\\"time\\\": \\\"\\\", \\\"role\\\": \\\"Caroline\\\", \\\"tag\\\": [\\\"entity:children\\\"]}}\\n\"}}\n\nWhen done (no more atoms to write):\nDone.\n\n# THE MEMORY FILES\n\n{{WORKSPACE}}\n\n# HOW TO SEARCH\n\n{{STRATEGY}}\n\n# TOOLS\n\n{{TOOLS}}\n\n# COMMANDS (use through bash)\n\n{{COMMANDS}}\n\n# WHAT AN ATOM IS\n\n{{ATOM_STANDARD}}\n\n# RULES\n\n- You fill ONLY `memory` and `metadata.{time, role, tag}`. Do NOT emit `id`, `source`, `type`, or `changelog` -- the system adds them.\n- Write TARGET facts only. Use the other messages ONLY to resolve references; never write an atom for a fact stated entirely in another message.\n- If the TARGET is a bare greeting or a question with no fact, write nothing and finish immediately.\n- Do NOT edit msgmem.jsonl or summem.jsonl -- only atommem.jsonl is yours to append.\n- When you have written the target's atoms, reply with plain text (no JSON) to finish.",
     "user_begin": "Extract the atomic facts of the target message into atommem.jsonl.",
     "user_gaps": "Continue.",
     "user_no_progress": "Several turns have passed without atommem.jsonl changing. If the target message yields no atom, reply with plain text (no JSON) now. Otherwise write the atom.",

@@ -99,6 +99,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 上下文压缩：messages 总字符超过这个数就把中段坍缩成摘要（0 = 不压缩）
     "context_max_chars": 160000,
     "context_keep_recent": 8,
+    # 遗忘：超长工具观测在这么多"回合"之后被替换成一行占位符（0 = 关闭）。
+    # 长度阈值 long_observation_chars 决定"多长算超长"；两个都 >0 才启用。
+    "forget_after_turns": 0,
+    "long_observation_chars": 0,
+    "forget_keep_recent_turns": 2,
     "bash_timeout": 60,
     "concurrency": 4,
     "concurrency_dirs": 1,
@@ -716,6 +721,9 @@ async def run_phases(
     duplicate_warn_at = max(1, int(config.get("duplicate_warn_at", 10)))
     context_max_chars = int(config.get("context_max_chars", 0))
     context_keep_recent = max(2, int(config.get("context_keep_recent", 8)))
+    forget_after_turns = max(0, int(config.get("forget_after_turns", 0)))
+    long_observation_chars = max(0, int(config.get("long_observation_chars", 0)))
+    forget_keep_recent_turns = max(0, int(config.get("forget_keep_recent_turns", 2)))
 
     outcome = PhaseOutcome()
     step_offset = 0
@@ -753,6 +761,9 @@ async def run_phases(
             duplicate_warn_at=duplicate_warn_at,
             context_max_chars=context_max_chars,
             context_keep_recent=context_keep_recent,
+            forget_after_turns=forget_after_turns,
+            long_observation_chars=long_observation_chars,
+            forget_keep_recent_turns=forget_keep_recent_turns,
         )
         step_offset += len(result.steps)
         outcome.steps += len(result.steps)
@@ -1340,7 +1351,7 @@ async def async_main(args: argparse.Namespace) -> None:
     if config["repeat"] > 1:
         gen_log.info(f"每条 QA 重复 {config['repeat']} 次（--repeat）")
     if args.dry_run:
-        sample_question = "When did Caroline go to the LGBTQ support group?"
+        sample_question = "<a question from the corpus>"
         rendered = catalog.render_prompt(sample_question)
         gen_log.info(f"[dry-run] system prompt {len(rendered)} 字符，渲染如下：")
         print(rendered)

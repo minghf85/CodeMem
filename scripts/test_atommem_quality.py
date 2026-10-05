@@ -13,20 +13,28 @@ from pathlib import Path
 
 
 def check_time_words(memory: str) -> list[str]:
-    """检查 memory 是否含有禁止的时间词。"""
+    """检查 memory 是否含有**真正**的裸相对时间表达。
+
+    只匹配承载时间的措辞 —— 不把介词（during）、习语（do not last）、泛指形容词
+    （recent painting）当成违规。规则是：时间副词单说（yesterday/tomorrow），
+    或「相对词 + 时间单位」（last week / next month / N days ago）。
+    """
     forbidden = [
-        r'\byesterday\b', r'\btoday\b', r'\btomorrow\b',
-        r'\bago\b', r'\blast\b', r'\bnext\b', r'\bpast\b',
-        r'\brecent\b', r'\brecently\b', r'\bsoon\b',
-        r'\bfuture\b', r'\bnow\b', r'\bcurrently\b', r'\bpresently\b',
-        r'\bbefore\b', r'\bafter\b', r'\bsince\b', r'\buntil\b', r'\bduring\b',
-        r'\d+\s+(day|week|month|year)s?(\s+ago)?',
+        r'\b(?:yesterday|tomorrow|tonight)\b',
+        r'\b(?:recently|currently|presently|soon)\b',
+        r'\b(?:last|next|past|coming|previous)\s+'
+        r'(?:night|week|weekend|month|year|summer|winter|spring|autumn|fall|monday|tuesday'
+        r'|wednesday|thursday|friday|saturday|sunday|time|day)\b',
+        r'\b(?:\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|several|few|couple of)\s+'
+        r'(?:day|week|month|year|weekend)s?\s+ago\b',
+        r'\bfor\s+(?:\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|several|few)\s+'
+        r'(?:day|week|month|year)s?\b',
+        r'\bsince\s+starting\b',
     ]
     found = []
     for pattern in forbidden:
-        matches = re.finditer(pattern, memory, re.IGNORECASE)
-        for match in matches:
-            found.append(match.group(0))
+        for match in re.finditer(pattern, memory, re.IGNORECASE):
+            found.append(match.group(0).strip())
     return found
 
 

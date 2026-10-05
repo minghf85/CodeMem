@@ -58,7 +58,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="summem 阶段每个目录只处理前 N 个 session（调试用）")
     parser.add_argument("--concurrency", type=int, default=None, help="覆盖目录级并发数")
     parser.add_argument("--max-steps", type=int, default=None,
-                        help="覆盖 atommem agent 的步数上限（默认 6）")
+                        help="覆盖 atommem agent 的步数上限（默认 8）")
     return parser.parse_args(argv)
 
 

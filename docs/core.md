@@ -111,7 +111,7 @@ python -m codemem.add --stage atommem --use-agent           # 使用 agent loop�
 |---|---|---|---|
 | `msgmem.jsonl` | `msg` | 每条原始消息（**原话**）；`time` 是会话时间戳，`role` 是说话人真名 | 纯 CPU，由 dataset 直接转换 |
 | `summem.jsonl` | `summary` | 每个会话一份总结 | LLM，**逐 session 一次** |
-| `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **三阶段 pipeline 逐 message 处理**（召回 → 单次 LLM → 后处理） |
+| `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **并行 add agent 逐 message 处理**（每 message 看到此前全部内容） |
 
 记录格式对齐 `memory_template.jsonl`：
 
@@ -133,51 +133,69 @@ python -m codemem.add --stage atommem --use-agent           # 使用 agent loop�
 - **msgmem 的 `time` 保留原始会话时间戳**（如 `"1:56 pm on 8 May, 2023"`）—— 它是折算相对时间的
   **锚点**；atommem 的 `time` 是消解后的结果。
 
-### 1.1 为什么是"三层记忆 + 三阶段 pipeline"，而不是"agent loop"
+### 1.1 为什么是"三层记忆 + 并行 add agent"，而不是"单次抽取"
 
-上一版（agent loop）虽然灵活，但 8B 模型在 agent loop 里把控不住质量：16% 的 atom 仍是多句、
-时间表达不稳定（"5 years ago" 会直接写进 memory）、tag key 会自造 100+ 个。这些都是"软约束在
-8B 上靠不住"的证据 —— prompt 能说清楚规则，但模型在多步交互中会逐渐偏离。
+第一版（S14，串行 agent loop）虽然灵活，但 8B 模型在多步交互里把控不住质量：16% 的 atom 仍是
+多句、时间表达不稳定（"5 years ago" / "last year" 会直接写进 memory）、tag key 会自造 100+ 个。
+中间试过一版**三阶段 pipeline**（召回 → 单次 LLM → 后处理）：稳定、快，但召回是**启发式**的
+（只给同会话前 N 条消息），跨会话指代（"the same lake as last time"）消解不了，集合型问题的
+成员也收不全 —— 实测 judge 从 60.5% 掉下来。
 
-这一版换成**三阶段 pipeline**，把软约束下沉到**代码级强制**：
+现在的做法把两者的优点合起来：**保留 agent（能自己 grep 全部前文），但改成并行 + 代码级兜底**。
 
 ```
-Stage 1: 召回相关上下文（grep msgmem/atommem，纯 CPU）
-         ↓
-Stage 2: 单次 LLM 调用 → 产出 [{memory, time_expr, role, tag}, ...]
-         - memory: 纯事实陈述，**完全不含时间词**（yesterday/ago/last/next 等）
-         - time_expr: 源消息的原始时间表达（如 "yesterday"），留给后处理
-         ↓
-Stage 3: 后处理（纯 CPU）
-         - 时间解析：time_expr + 源 msg 的锚点 → metadata.time（代码折算，date -d）
-         - 去重合并：按 memory 归一化，同事实只留一条
-         - 补全字段：id/source/type/changelog
+每条 message 一个独立 agent（彼此并行，不依赖对方产出）
+  ├─ 上下文：这条 message **之前全部内容**（前面所有 session + 本 session 前面的 message）
+  │          —— 不靠启发式窗口，agent 自己 grep msgmem / summem 决定读什么
+  ├─ 工具：read / edit / bash（与 search 同一套 tools.py，catalog 渲染同一套 prompt）
+  ├─ 产出：写进独立文件 {msg_id}_atoms.jsonl（parallel 无写冲突，最后合并去重）
+  └─ prompt 里 4 条硬规则：memory 不含时间词 / 一事实一 atom / 指代消解 / tag 用固定 key
+
+收尾（harness，纯 CPU）：
+  ├─ 时间解析：agent 写的相对时间 → date -d 折算成绝对日期（毫秒级、永远准）
+  ├─ 时间词剥离：memory 里残留的裸相对词（last year / 4 years ago）剥掉（见 §1.2）
+  ├─ tag 收敛：_normalize_tags 把 key 收进固定 12 个
+  └─ 合并去重：跨 message 同事实只留一条，source 取并集
 ```
 
-**核心约束（代码级强制，不可违反）**：
+**为什么并行比串行好**（这是这一版的关键）：
 
-- `memory` 字段：**禁止任何时间词**（yesterday/ago/last/next/recently/soon/future/now/
-  currently/before/after/since/until/during/N days/weeks/months/years）
-- `metadata.time`：承载全部时间信息（绝对日期 / 带锚点区间 / 空字符串）
-- 一次 LLM 调用返回完整 JSON array，不做 agent loop
+| | 串行 agent（旧） | 并行 agent（现在） |
+|---|---|---|
+| 看到的前文 | 前 N-1 条 message **已产出的 atom** + 原文 | 前文**全部原文**（msgmem/summem） |
+| 依赖 | 第 N 条依赖前 N-1 条跑完（慢、易被前一条的错带偏） | 无依赖，**全部并行**（快、错误不传播） |
+| 幂等 | 要按 source 增量覆盖，重跑一条要重算其后全部 | 每条独立，重跑一条只影响它自己 |
+| agent 的活 | 既要抽取、又要查重合并、又要维护 id | 只管**抽干净的事实**，合并交给收尾 |
 
-**为什么值得砍掉 agent loop**（三条，都是"少一层不确定性"的收益）：
+—— 关键是**并行是可行的**：消解指代所需的全部信息（前文原话）在 msgmem 里本来就齐，不必等
+前一条的 atom 产出。旧版"后面的 message 要 grep 前面**已生成的 atom**"这个前提，其实可以换成
+"grep 前文**原文**"，于是依赖消失、并行成立。
 
-1. **单一调用点。** 一次 LLM → 一组 atom，失败重试是整组、不是逐步，调试/监控都简单。
-2. **时间质量可控。** memory 禁止时间词由**正则验证**，time 由 `date -d` 代码折算 —— 
-   8B 心算"13 Sep 是周几"不可靠，代码算永远对。
-3. **tag key 纪律由 harness 兜底。** `_normalize_tags` 把落盘 tag 的 key 收敛进固定集合
-   （裸词/近义词按 `_TAG_ALIASES` 映射，其余未知 key 写成 `other:<原值>`），落盘后 key 恒 ≤ 12 个。
+**代码级兜底是稳定性的来源**（8B 软约束不可靠，纪律必须下沉，见 §1.2）：
 
-代价说清楚：召回是启发式的（同会话前 N 条消息），不如 agent 自己 grep 灵活 —— 但实测绝大多数
-指代都在窗口内能解决，跨会话指代占比极低。收益是**稳定性 + 可预测性**：每条 message 一次调用、
-一组 atom、一次落盘，行为恒定、成本可算。
+1. **时间**：agent 只负责把"这句话里有没有时间信息"写进 `time`，折算交给 `date -d` —— 
+   8B 心算"13 Sep 是周几"实测不可靠，代码永远准。
+2. **memory 无时间词**：prompt 明确禁止（`time` / `time_expr` 分家也是为此），残留由 §1.2 的
+   剥离器兜底。
+3. **tag key**：`_normalize_tags` 收敛，落盘后 key 恒 ≤ 12 个。
+4. **工具调用顺畅**：`enable_thinking=false`（否则 8B 输出 `<think>` 不走工具）、prompt 里给
+   完整 JSON 调用示例、缺 `path` 默认 `evidence.jsonl`、`grep "a|b"` 自动补 `-E` —— 这些都是
+   实测"8B 会踩"的地方，逐条在 harness 里堵掉（见 §2.16）。
 
-**实测（前 20 条 message）**：产出 28 条 atom，**0 条**违规（memory 无时间词），时间解析
-全部正确（"yesterday" + 锚点 "8 May 2023" → "2023-05-07"）。旧 agent loop 版本同样的语料
-16% 多句、时间表达不稳定。
+**实测（Caroline_Melanie 全量，412 条 atom）**：
 
-#### 消解的两件事（写进 pipeline 的原子标准）
+| 指标 | 结果 |
+|---|---|
+| memory 含时间词 | 剥前后 7.5% → **1.0%**（剥离器兜底后） |
+| time 字段解析成功 | **84%**（"last year"→2022、"last Saturday"→倒推日期全部正确） |
+| 非标准时间格式 | **0 条**（全部 `YYYY-MM-DD` 或 ISO） |
+| 多句 atom | 1 条 |
+| 全量耗时 | ~10 分钟（并行；串行版本要数倍） |
+
+对比中间那版 pipeline（同语料）：judge 60.5% vs pipeline 掉到明显更低 —— **agent 能自己找全
+跨会话上下文**这件事是 pipeline 的启发式召回给不了的。
+
+#### 消解的两件事（写进 add agent 的原子标准）
 
 **① 时间：memory 完全不含时间词，时间信息全部在 metadata.time。**
 
@@ -213,43 +231,56 @@ possession / time / other`。由 `_normalize_tags` 在后处理时强制收敛�
 **⑤ 具体内容不得抽象化。** 可枚举的具名/带数字内容本身就是事实（`CAPTURE THE SPECIFICS`）——
 不许换成一句笼统的情感或类别。
 
-#### 三阶段 pipeline 怎么跑（`src/codemem/add/atommem_pipeline.py`）
+#### 并行 add agent 怎么跑（`src/codemem/add/atommem_agent_v2.py`）
 
 ```bash
-# 每处理一条 message：三阶段 pipeline（召回 → 单次 LLM → 后处理）
-#   Stage 1 (召回): grep 同会话前 N 条消息作为上下文（默认 window=5）
-#   Stage 2 (抽取): 单次 LLM 调用 → [{memory, time_expr, role, tag}, ...]
-#       - memory: 纯事实陈述，完全不含时间词
-#       - time_expr: 源消息的原始时间表达，留给后处理
-#   Stage 3 (后处理): 时间解析（date -d）+ 去重 + 补字段（id/source/type/changelog）
+# 每条 message 一个独立 agent，全部并行（受 concurrency 限流）
+#   system prompt：catalog 渲染的工具描述 + 原子标准 + 4 条硬规则 + JSON 调用示例
+#   user prompt：目标 message + 会话清单（agent 自己 grep 前文消解指代）
+#   工具：read / edit / bash，产出写进独立文件 {msg_id}_atoms.jsonl
+#   收尾（harness）：
+#     1. 时间解析：agent 写的相对时间 → date -d 折算绝对日期
+#     2. 时间词剥离：memory 残留的裸相对词剥掉（见下）
+#     3. tag 收敛 + 补全 id/source/type/changelog
+#     4. 合并去重：跨 message 同事实只留一条，source 取并集
 ```
 
-**核心原理（用户原话）**：在已有的 msgmem/summem/atommem 中逐个 message 处理生成 atommem —— 后面的
-message 的信息可能受前面内容影响、可能**跨 session 影响**，所以需要召回前面**相关的**信息
-才能做出优秀的消解。这就是它不是一个孤立抽取、而是逐条**增量**处理的原因。
+**核心原理（用户原话）**：逐个 message 处理时，后面的 message 的信息可能受前面内容影响、可能
+**跨 session 影响**，所以需要看到前面**相关的**信息才能做出优秀的消解。这一版**并行**成立，是因为
+把"看前面已生成的 atom"换成了"看前面**原文**"（msgmem/summem 本来就齐全）—— 于是每条 message
+互不依赖，全部并行。
 
-- **串行**：同一目录内按 message 顺序**串行**（后面的 message 能召回前面已生成的 atommem）；
-  **不同目录并行**。
-- **模型只填四个字段**（`memory` + `time_expr` + `role` + `tag`）；`id` / `source` / `type` /
-  `time` / `changelog` 由系统在后处理时补上 —— 省了模型的力气，也保证这些字段永远正确。
-- **时间解析在后处理**：`parse_time_expression` 用 `date -d` 把 `time_expr` + 锚点 → 绝对时间，
+- **并行**：每条 message 独立跑，写进各自的 `{msg_id}_atoms.jsonl`（无写冲突），最后合并。
+  **串行 agent**（`--mode agent`）与**三阶段 pipeline**（`--mode pipeline`）保留用于对比。
+- **agent 只填内存里的 `memory` + `metadata.{time, role, tag}`**；`id` / `source` / `type` /
+  `changelog` 由系统在收尾时补上 —— 省了模型的力气，也保证这些字段永远正确。
+- **时间解析在收尾**：`parse_time_expression` 用 `date -d` 把相对时间 + 锚点 → 绝对时间，
   精度只减不增（"last year" → 年份，不编月日）。
 - **`time` 承载该事实的**全部**时间信息**：时点 → 绝对日期；时长/年龄/"N ago" → 起点或区间；区间 →
   `YYYY-MM-DD/YYYY-MM-DD` 或带锚点措辞；无时间 → `""`。
-- **增量/幂等**：重跑一条 message 时，先把它**最初产出**的 atom（primary source = 本 message）去掉，
-  再重新生成 —— 重复跑不会累积重复 atom。
+- **幂等**：重跑一条 message 时，先把它产出的 atom（`source` 指向它）去掉再重新生成 ——
+  重复跑不会累积重复 atom。
 
-**三阶段的职责边界**：
+**时间词剥离（harness 兜底，`_strip_relative_time`）**：8B 即使被 prompt 明确禁止，仍有约 7.5%
+的 atom 把 "last year" / "4 years ago" 留在 `memory` 正文里（而 `time` 已解析好）。这里由代码
+在收尾时把这些**裸相对时间措辞**从句子里删掉 —— 不是改写事实，是删掉已经进了 `time` 的冗余。
+三条护栏保证不制造残句：删完太短（时间即主体）、删掉超过一半、或以悬空分词/虚词结尾
+（"figurines bought"、"a lot happened since"）时一律**保留原文**。实测把违规率从 7.5% 压到 **1.0%**。
 
-| 阶段 | 职责 | 实现 |
-|---|---|---|
-| Stage 1 召回 | 提供消解上下文（同会话前 N 条消息） | `recall_context`（纯 CPU，grep） |
-| Stage 2 抽取 | 识别事实 + 提取时间表达 | `extract_atoms_llm`（单次 LLM，返回 JSON array） |
-| Stage 3 后处理 | 时间折算 + 去重 + 补字段 | `postprocess_atoms` + `_dedup_atoms`（纯 CPU） |
+**工具调用稳定性**（实测"8B 会踩"的地方，逐条在 harness 堵掉）：
 
-后处理的**去重**分两遍：① 精确去重（归一化后完全相同）；② 近义去重（token 集合 Jaccard ≥ 0.6，
+| 现象 | 处理 |
+|---|---|
+| 输出 `<think>` 而不调工具 | `enable_thinking=false`（qwen3 端点发 `chat_template_kwargs`） |
+| 不知道 JSON 调用格式 | prompt 里给**完整调用示例**（bash / read / edit / done 各一） |
+| `edit` 缺 `path` | 默认 `evidence.jsonl`（或 add 的 `{msg_id}_atoms.jsonl`） |
+| `grep "a\|b"` 没加 `-E` | harness 自动补 `-E` 并说明修正 |
+| 重复追加同行 | 重复检测：同工具同参数且文件未变 → 拒绝并给脱困提示 |
+| 一直在读不动笔 | `write_nudge_after` 步后注入"该落笔了"提醒 |
+
+**去重**（收尾）分两遍：① 精确去重（归一化后完全相同）；② 近义去重（token 集合 Jaccard ≥ 0.6，
 或去情绪动词后共享核心实词 ≥3 个且共享率 ≥0.25）—— 8B 仍会用不同措辞重写同一事实（"values X" /
-"appreciates X" / 同一 turn 里七连 community/inclusivity），prompt 拦不全，所以代码兜底。
+"appreciates X"），prompt 拦不全，所以代码兜底。
 
 > 旧的 `run_message` agent loop 版本仍保留在 `atommem.py`，用 `--use-agent` 可切回去对比。
 > 默认用 pipeline（`use_pipeline=True`）。

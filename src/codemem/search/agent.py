@@ -118,7 +118,7 @@ def oversize_notice(records: int, limit: int) -> str:
     )
 
 
-def write_nudge_notice(step_count: int, have: int) -> str:
+def write_nudge_notice(step_count: int, have: int, filename: str = "evidence.jsonl") -> str:
     """"读了很多步却一个字没写"时的强制提醒。
 
     实测（qa15）：12 步里读了 12 次、evidence 始终为空。prompt 里明明写着
@@ -128,14 +128,17 @@ def write_nudge_notice(step_count: int, have: int) -> str:
 
     所以由 harness 主动在观测里插话：把你已经查到的东西**现在**写下来。注意措辞是
     "把已有的写下来"而不是"赶紧写" —— 空写或编造记录都是更坏的结局。
+
+    ``filename`` 是 agent 要写的那个文件：search 阶段是 ``evidence.jsonl``，add 的
+    atommem 阶段是 ``atommem.jsonl`` —— 说错文件名会让 8B 去找一个不存在的文件。
     """
     if have:
         return (
-            f"\n\n[You have gone {step_count} steps and evidence.jsonl still has only "
+            f"\n\n[You have gone {step_count} steps and {filename} still has only "
             f"{have} record(s). Write down what you have ALREADY found before searching more.]"
         )
     return (
-        f"\n\n[You have gone {step_count} steps and evidence.jsonl is still EMPTY. "
+        f"\n\n[You have gone {step_count} steps and {filename} is still EMPTY. "
         f"Stop reading and WRITE what you have already found, now -- one `edit` append per "
         f"record. You can always improve it afterwards -- "
         f"an empty file scores zero no matter how well you searched.\n"
@@ -282,6 +285,7 @@ class AgentOutcome:
     repeated_calls: int = 0
     no_progress_steps: int = 0
     compactions: int = 0
+    forgotten_observations: int = 0
 
     @property
     def tool_calls(self) -> int:
@@ -304,6 +308,7 @@ class AgentOutcome:
             + (f" 重复拒绝 {self.repeated_calls}" if self.repeated_calls else "")
             + (f" 工具错误 {self.tool_errors}" if self.tool_errors else "")
             + (f" 压缩 {self.compactions}" if self.compactions else "")
+            + (f" 遗忘 {self.forgotten_observations}" if self.forgotten_observations else "")
             + f" 结束={self.done_reason}"
         )
 
@@ -418,6 +423,95 @@ def compact_messages(
 
 
 # ---------------------------------------------------------------------------
+# 遗忘：超长工具观测在若干回合后被定点丢弃
+# ---------------------------------------------------------------------------
+#
+# 与上面 ``compact_messages`` 的分工：
+#   - **压缩**是"总额超标时把**中段整体**坍缩成一段摘要"的**兜底**；
+#   - **遗忘**是"**单个**观测太长、又已经够旧"的**定点**清理。
+# 二者互补、可共存：先按观测个体遗忘（本函数），再看总额要不要压缩。
+#
+# 为什么要单独做遗忘：实测一次 ``read inputs/msgmem.jsonl`` 就能吐回几千字符，
+# 而它往往只在那一两步有用 —— 之后再把它整段留在上下文里，既挤占预算、又稀释
+# 模型对最近几步的注意力。它的价值随时间衰减，长度是"值不值得留"的判据。
+
+@dataclass
+class ForgetResult:
+    messages: list[dict[str, str]]
+    forgotten: int = 0
+    saved_chars: int = 0
+
+
+def _observation_placeholder(turns_ago: int, chars: int) -> str:
+    """被遗忘的超长观测留下的占位符 —— 明说"它太长、太旧、需要就重跑"。"""
+    return (
+        f"[an earlier tool observation was forgotten: it was {chars} chars and is now "
+        f"{turns_ago} turns old. Re-run the command if you need that output again.]"
+    )
+
+
+def forget_long_observations(
+    messages: list[dict[str, str]],
+    *,
+    forget_after_turns: int,
+    long_observation_chars: int,
+    keep_recent_turns: int = 0,
+) -> ForgetResult:
+    """把**超长且够旧**的工具观测替换成一行占位符。
+
+    判据（两个都满足才忘）：
+    1. **是工具观测**：一条 ``role=user`` 消息，**紧跟在一条 assistant 消息之后**
+       （即它是对上一次工具调用的观测）；初始 ``user_begin``、system、以及 assistant
+       的工具调用本身都不算。
+    2. **超长**：内容长度 > ``long_observation_chars``。
+    3. **够旧**：距今至少 ``forget_after_turns`` 个"回合"。一个回合 = 一次工具调用 +
+       它的观测（2 条消息），所以年龄用消息索引距离换算：某观测在第 ``i`` 条，
+       后面还有 ``len(messages) - 1 - i`` 条，其中每 2 条算一个回合。
+
+    ``keep_recent_turns > 0`` 时，最近 ``keep_recent_turns`` 个回合内的观测一律不动
+    （即使超长）—— 保留"刚看到的东西"是模型下一步行动的直接依据。
+
+    ``forget_after_turns <= 0`` 或 ``long_observation_chars <= 0`` 时**整个机制关闭**，
+    原样返回（这是默认值：开关式启用）。
+    """
+    if forget_after_turns <= 0 or long_observation_chars <= 0:
+        return ForgetResult(messages=messages)
+
+    # 先标出**哪些**消息是工具观测（避免把初始 user_begin 当成观测）。
+    is_observation: list[bool] = []
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        prev_role = messages[index - 1].get("role") if index else None
+        is_observation.append(role == "user" and prev_role == "assistant")
+
+    total = len(messages)
+    keep_zone = keep_recent_turns * 2  # 最近 N 回合 = 末尾 2N 条消息
+    out: list[dict[str, str]] = []
+    forgotten = 0
+    saved = 0
+    for index, message in enumerate(messages):
+        if not is_observation[index]:
+            out.append(message)
+            continue
+        content = message.get("content", "")
+        chars = len(content)
+        # 距文件末尾还有多少条用户可见消息 —— 用作"年龄"的近似（越靠后越新）。
+        messages_after = total - 1 - index
+        if messages_after < keep_zone:
+            out.append(message)
+            continue
+        turns_ago = (messages_after + 1) // 2  # 每 2 条消息 = 1 个回合
+        if chars > long_observation_chars and turns_ago >= forget_after_turns:
+            placeholder = _observation_placeholder(turns_ago, chars)
+            out.append({"role": "user", "content": placeholder})
+            forgotten += 1
+            saved += chars - len(placeholder)
+        else:
+            out.append(message)
+    return ForgetResult(messages=out, forgotten=forgotten, saved_chars=saved)
+
+
+# ---------------------------------------------------------------------------
 # 观测渲染
 # ---------------------------------------------------------------------------
 
@@ -470,12 +564,16 @@ async def run_agent_round(
     log: Logger,
     observation_max_chars: int = 8000,
     write_nudge_after: int = 5,
+    nudge_filename: str = "evidence.jsonl",
     evidence_soft_limit: int = 40,
     max_parse_retries: int = 2,
     repeat_limit: int = 1,
     duplicate_warn_at: int = 10,
     context_max_chars: int = 0,
     context_keep_recent: int = 8,
+    forget_after_turns: int = 0,
+    long_observation_chars: int = 0,
+    forget_keep_recent_turns: int = 2,
     on_step: Callable[[Step], None] | None = None,
 ) -> tuple[AgentOutcome, list[dict[str, str]]]:
     """跑一个 round：从 ``messages`` 出发，直到模型**明确回复纯文本**或用完步数。
@@ -493,6 +591,23 @@ async def run_agent_round(
     warned_duplicates = False
 
     while steps_used < max_steps:
+        # ---- 遗忘：超长且够旧的工具观测 → 一行占位符（在压缩**之前**做定点清理）----
+        if forget_after_turns > 0 and long_observation_chars > 0:
+            forgotten = forget_long_observations(
+                messages,
+                forget_after_turns=forget_after_turns,
+                long_observation_chars=long_observation_chars,
+                keep_recent_turns=forget_keep_recent_turns,
+            )
+            if forgotten.forgotten:
+                messages = forgotten.messages
+                outcome.forgotten_observations += forgotten.forgotten
+                log.info(
+                    f"遗忘 {forgotten.forgotten} 条超长观测（>{long_observation_chars} 字符、"
+                    f">{forget_after_turns} 回合），省下 {forgotten.saved_chars} 字符"
+                )
+                outcome.messages = messages
+
         # ---- 上下文压缩（在每次模型调用**之前**检查）----
         if context_max_chars > 0:
             compaction = compact_messages(
@@ -622,7 +737,7 @@ async def run_agent_round(
         if (not nudged and write_nudge_after > 0
                 and steps_used >= write_nudge_after and state_after.unique_ids == 0):
             nudged = True
-            observation += write_nudge_notice(steps_used, state_after.unique_ids)
+            observation += write_nudge_notice(steps_used, state_after.unique_ids, nudge_filename)
             log.warn(
                 f"step {global_step} 已 {steps_used} 步、evidence 仍为空，注入动笔提醒"
             )

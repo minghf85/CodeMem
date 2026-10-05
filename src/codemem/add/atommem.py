@@ -835,8 +835,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="每个目录只处理前 N 条 message（调试用）")
     parser.add_argument("--concurrency", type=int, default=None, help="覆盖目录级并发数")
     parser.add_argument("--max-steps", type=int, default=None, help="覆盖 agent 步数上限")
-    parser.add_argument("--use-agent", action="store_true",
-                        help="使用 agent loop 模式（默认用 pipeline）")
+    parser.add_argument("--mode", choices=["pipeline", "agent", "agent-v2"], default="agent-v2",
+                        help="处理模式：pipeline（三阶段）/ agent（串行agent）/ agent-v2（并行agent，默认）")
     return parser.parse_args(argv)
 
 
@@ -861,11 +861,28 @@ async def async_main(args: argparse.Namespace) -> None:
 
     async def one(directory: Path) -> dict[str, Any]:
         async with semaphore:
-            return await run_dir(
-                directory, config, client, catalog, log,
-                limit_messages=args.limit_messages,
-                use_pipeline=not args.use_agent,
-            )
+            mode = args.mode
+            if mode == "agent-v2":
+                # 并行 agent：每个 message 独立运行，看全部先行内容
+                from .atommem_agent_v2 import run_dir_parallel
+                return await run_dir_parallel(
+                    directory, config, client, catalog, log,
+                    limit_messages=args.limit_messages,
+                )
+            elif mode == "pipeline":
+                # pipeline：召回 → 单次 LLM → 后处理
+                return await run_dir(
+                    directory, config, client, catalog, log,
+                    limit_messages=args.limit_messages,
+                    use_pipeline=True,
+                )
+            else:  # agent
+                # 串行 agent：逐 message 处理，后面看到前面的产出
+                return await run_dir(
+                    directory, config, client, catalog, log,
+                    limit_messages=args.limit_messages,
+                    use_pipeline=False,
+                )
 
     try:
         results = list(await asyncio.gather(*(one(d) for d in targets)))
