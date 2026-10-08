@@ -92,8 +92,8 @@ Current Date: {current_date}
 Instructions:
 - Analyze all supplied memories and use direct evidence whenever available.
 - Each memory includes a timestamp (YYYY-MM-DD HH:MM:SS) and speaker information - use these carefully.
-- If the question asks "when" (about time), give a date, year, or time period. An anchored phrase such as "the week before <date>" is acceptable and exact -- it needs no outside context.
-- **The memory timestamp is WHEN THE CONVERSATION HAPPENED, not when the event happened.** A memory dated <session date> saying "last week" refers to the week before <session date>, NOT <session date>. Never return the memory's own timestamp as the event date.
+- If the question asks "when" (about time), give a date, year, or time period. An anchored phrase such as "the week before <date>" or "the Friday before <date>" is acceptable and exact -- it needs no outside context.
+- **The memory timestamp is WHEN THE CONVERSATION HAPPENED, not when the event happened.** A memory dated <session date> saying "last week" refers to the week before <session date>, NOT <session date>. A memory saying "last Friday" refers to the Friday before <session date>, NOT the week before. Never return the memory's own timestamp as the event date.
 - Anchor every relative expression before using it: "next month" is meaningless on its own -- resolve it to the month it denotes from the memory's date. Never answer with an unanchored relative word.
 - If the question asks "who" (about people), you MUST provide the specific person's name from the speaker or memory content.
 - Do not invent facts, infer beyond what is stated, or add extra information not present in the memories.
@@ -139,8 +139,8 @@ Current Date: {current_date}
 Instructions:
 - Treat the retrieved memories below as the only evidence for the answer.
 - Each memory includes a timestamp (YYYY-MM-DD HH:MM:SS) and speaker information - use these carefully.
-- If the question asks "when" (about time), give a date, year, or time period. An anchored phrase such as "the week before <date>" is acceptable and exact -- it needs no outside context.
-- **The memory timestamp is WHEN THE CONVERSATION HAPPENED, not when the event happened.** A memory dated <session date> saying "last week" refers to the week before <session date>, NOT <session date>. Never return the memory's own timestamp as the event date.
+- If the question asks "when" (about time), give a date, year, or time period. An anchored phrase such as "the week before <date>" or "the Friday before <date>" is acceptable and exact -- it needs no outside context.
+- **The memory timestamp is WHEN THE CONVERSATION HAPPENED, not when the event happened.** A memory dated <session date> saying "last week" refers to the week before <session date>, NOT <session date>. A memory saying "last Friday" refers to the Friday before <session date>, NOT the week before. Never return the memory's own timestamp as the event date.
 - Anchor every relative expression before using it: "next month" is meaningless on its own -- resolve it to the month it denotes from the memory's date. Never answer with an unanchored relative word.
 - If the question asks "who" (about people), you MUST provide the specific person's name from the speaker or memory content.
 - Do not invent facts, infer beyond what is stated, or add extra information not present in the memories.
@@ -520,10 +520,13 @@ EVIDENCE_STANDARD = """A record is ACCEPTABLE only if it passes every check belo
 
 1. SELF-CONTAINED. A reader who has never seen the conversation, the memory files, or the question must understand it. If it needs anything from outside the record itself to make sense, rewrite it or drop it.
 2. REFERENTS RESOLVED. No bare pronoun or pointing word survives: she / he / they / it / this / that / there / then / the other one. Replace each with the concrete person, place, or thing. (A name used as the subject of the sentence is resolved; a bare "she" is not.)
-3. TIME ANCHORED. Any time expression either (a) is already an absolute date or period ("<date>", "<month> <year>"), or (b) is a relative phrase that carries its own anchor in the record ("the week before <date>"). A relative word with no anchor ("next month", "recently", "the other day") is NOT acceptable -- write the anchor next to it.
-4. NO INVENTED PRECISION. State the time at the granularity the source gave. If the source said "last year", the record says a year, not a day. Do not compute a date the source did not support.
+3. TIME ANCHORED, KEPT AS WRITTEN. Keep a relative phrase AS WRITTEN and attach its anchor when a reader with no session context would need it: "<person> did X 'last week' -- i.e. the week before <session date>"; "last Friday" -> the Friday before <session date>. Only "yesterday"/"today"/"tomorrow" become the exact calendar date -- do NOT flatten any other relative phrase into a single date, and NEVER write the session date itself as the event date. A relative word with no anchor ("next month", "recently") is NOT acceptable.
+4. NO INVENTED PRECISION. State the time at the granularity the source gave ("last year" -> a year, not a day).
 5. A CLAIM, NOT A QUOTE. The record states a fact, not a transcript turn. Paraphrase into a standalone statement; do not paste the raw message.
 6. SOURCED. metadata.source lists the real record ids you read to support this record -- never an id you only remember or guessed. (A message id is `session_N_M`; an atom id is `session_N_M_K`.) If you cannot point to an id, you cannot write the record.
 7. ONE FACT, JOINED IF NEEDED. If answering needs two records joined, write the joined conclusion as one record (and list both sources). If a question wants a SET, list the members, ideally in one record -- not one record per member.
+8. SPECIFICS PRESERVED. Keep the source's concrete content -- the real name, number, count, object, colour, or list member. Never abstract it into a category: name the actual object (NOT a vague class word like "art"), the actual text (NOT "a sign"), the actual members (NOT "some items"). A paraphrase that loses the specific detail is WRONG.
+9. SUBJECT BINDING. When the question asks about a specific person, the evidence MUST be about that same person. Do NOT merge or substitute facts from different people: "<person A>'s <thing>" is not answered by "<person B>'s <thing>". If you only found records about the wrong person, DO NOT write evidence -- the answer is "no information".
+10. FREQUENCY vs OCCURRENCE. If the question asks "how often" / "how many times", the evidence must state a frequency, rate, or count ("once or twice a year", "every weekend", "3 times"), NOT just "X happened on [date]". A single occurrence does not answer a frequency question.
 
 If a candidate record fails a check, fix it (usually by adding the name or the anchor) rather than dropping the evidence. Drop it only when you genuinely cannot resolve it -- a partially-resolved record is worse than a resolved one, but a dropped one scores nothing."""

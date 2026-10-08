@@ -33,6 +33,7 @@ from .atommem import (
     _max_suffix,
     _merge_ids,
     _normalize_tags,
+    _strip_relative_time,
     gen_call_config,
     parse_dir_label,
 )
@@ -43,51 +44,17 @@ from .memory import ATOMMEM_NAME, MSGMEM_NAME, SUMMEM_NAME, group_by_session, wr
 # ============================================================================
 
 def _build_system_prompt(catalog: toolcfg.ToolCatalog, output_file: str, msg_id: str) -> str:
-    """构建完整的 system prompt（使用 catalog 渲染工具描述）。
+    """构建 system prompt：**直接用 catalog 渲染**（与串行 agent 同一份，含强拆分规则）。
 
-    catalog.render_prompt() 会替换 {{TOOLS}} 等槽位，但它期望 {{QUESTION}} ——
-    这里我们把"提取目标"当作问题来用。
+    只额外加一句"产出写到哪个文件"—— 绝不覆盖/弱化 catalog 里的原子标准
+    （曾经加过一版"One atom = one sentence"前缀，实测把 `ATOM_AGENT_STANDARD` 的
+    "拆分复合句"规则压掉了，导致一条消息只出一个合并原子 → 检索命中率下降）。
     """
-    # 用一个伪问题占位，后面会被 user message 里的实际内容覆盖
-    base = catalog.render_prompt(f"Extract atomic facts from message {msg_id}")
-
-    # 在 base 前面加上我们的特定指令（工具描述已经在 base 里了）
-    prefix = f"""You are extracting atomic facts from ONE conversation message into `{output_file}`.
-
-**CRITICAL RULES**:
-1. `memory` field: Pure factual statement WITHOUT any time words (yesterday, ago, last, next, recently, soon, etc.)
-2. `metadata.time`: Original time expression from source OR empty string
-3. `metadata.role`: speaker name (Caroline or Melanie)
-4. `metadata.tag`: Array of "key:value". Keys MUST be from: {', '.join(TAG_KEYS)}
-5. One atom = one sentence, one fact. NO multiple sentences.
-6. Resolve pronouns (she/he/it/there → real names) using prior context.
-
-**WORKFLOW**:
-1. Use `bash`/`read` to search prior messages/summaries if you need context (to resolve pronouns, references)
-2. Extract facts from the target message
-3. For each fact, `edit {output_file}` with `append`:
-   {{"memory": "Pure fact without time words", "metadata": {{"time": "original time expr or empty", "role": "speaker", "tag": ["key:value", ...]}}}}
-4. When done, reply with plain text "Done" (no JSON)
-
-**EXAMPLES**:
-
-Target: "I got married yesterday!" (speaker: Melanie)
-→ {{"tool":"edit","args":{{"append":'{{"memory":"Melanie got married","metadata":{{"time":"yesterday","role":"Melanie","tag":["event:marriage"]}}}}\\n'}}}}
-
-Target: "She went camping last week." (need to find who "she" is)
-→ First: {{"tool":"bash","args":{{"command":"grep -i 'caroline\\|melanie' inputs/msgmem.jsonl | tail -5"}}}}
-→ Then: {{"tool":"edit","args":{{"append":'{{"memory":"Caroline went camping","metadata":{{"time":"last week","role":"Caroline","tag":["activity:camping"]}}}}\\n'}}}}
-
-**IMPORTANT**:
-- NO time words in `memory` (put them in `metadata.time`)
-- Resolve ALL pronouns using context
-- One sentence per atom
-- When done extracting, reply "Done" in plain text (not JSON)
-
----
-
-"""
-    return prefix + base
+    base = catalog.render_prompt(f"Extract the atomic facts of message {msg_id}")
+    head = (
+        f"Write the target message's atoms into `{output_file}` (default for `edit`).\n\n"
+    )
+    return head + base
 
 AGENT_USER = """**Target message to extract**:
 [{msg_id}] ({msg_time}) {role}: {content}
@@ -161,8 +128,8 @@ async def run_message_agent(
 
     output_path = workspace / output_file
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if not output_path.exists():
-        output_path.write_text("", encoding="utf-8")
+    # **总是清空**：重跑同一条 message 时，残留的旧产出会被当成新原子读入，导致重复。
+    output_path.write_text("", encoding="utf-8")
 
     from ..search.runner import ModelRunner
 
@@ -218,7 +185,7 @@ async def run_message_agent(
         tags = _normalize_tags(meta.get("tag"))
 
         # 解析时间
-        from .atommem_pipeline import parse_time_expression
+        from .atommem_time import parse_time_expression
         import re
         import subprocess
 
@@ -284,58 +251,8 @@ async def run_message_agent(
     return processed
 
 
-# 裸相对时间词/短语：memory 正文里出现即剥离（时间已进 metadata.time）。
-# 顺序重要——先长后短，避免 "last week" 被 "last" 提前吃掉留下残词。
-_RELATIVE_TIME_PATTERNS = (
-    r"\s*\bthe\s+(?:week|month|year|day|weekend|morning|afternoon|evening)\s+before\b[^.,;]*",
-    r"\s*\b\d+\s+(?:day|week|month|year|weekend)s?\s+(?:before|after|ago)\b[^.,;]*",
-    r"\s*\b(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|several|few|couple of)\s+"
-    r"(?:day|week|month|year|weekend)s?\s+ago\b",
-    r"\s*\blast\s+(?:night|week|weekend|month|year|summer|winter|spring|autumn|fall|"
-    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-    r"\s*\bnext\s+(?:week|weekend|month|year|summer|winter|spring|autumn|fall|"
-    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-    r"\s*\b(?:yesterday|today|tomorrow|recently|currently|presently)\b",
-    r"\s*\bsince\s+(?:starting|coming|their|her|his|the|last)\b[^.,;]*",
-    r"\s*\bin\s+the\s+past\s+(?:few|several|\d+)\s+(?:day|week|month|year)s?\b",
-)
-_RELATIVE_TIME_RE = tuple(re.compile(p, re.IGNORECASE) for p in _RELATIVE_TIME_PATTERNS)
-
-
-def _strip_relative_time(memory: str) -> str:
-    """剥掉 memory 正文里的裸相对时间词（时间信息已由 metadata.time 承载）。
-
-    8B 实测约 7.5% 的 atom 会把 "last year" / "4 years ago" 留在正文里，而 prompt 的软约束
-    拦不住（add 阶段的老问题：纪律要下沉到 harness）。这里只在**时间已解析成功**时才调用，
-    所以剥掉这些措辞不丢信息 —— 读者从 ``time`` 就能拿到同一件事的时间。
-
-    只做**删除**，不做改写/替换：删完压一下多余空白与句首标点。三条护栏保证不制造残句 ——
-    太短（时间即主体）、删得太多（>50%）、或删完以虚词/悬空分词结尾（"figurines bought"、
-    "a lot happened since"）时一律**保留原文**：宁可留个时间词，也别留个读不通的句子。
-    """
-    if not memory:
-        return memory
-    cleaned = memory
-    for pattern in _RELATIVE_TIME_RE:
-        cleaned = pattern.sub("", cleaned)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned)
-    cleaned = re.sub(r"\s+([.,;!?])", r"\1", cleaned).strip()
-    if len(cleaned.split()) < 3 or len(cleaned) < len(memory) * 0.5:
-        return memory
-    tail = cleaned.rsplit(" ", 1)[-1].strip(".,;!?").lower()
-    if tail in _DANGLING_TAIL_WORDS:
-        return memory
-    return cleaned
-
-
-# 剥离后若以这些词结尾，句子多半悬空了（"Caroline mentions a lot happened" / "figurines bought"）——
-# 这是"删掉了时间状语，剩下的补语没了宾语"的形态，直接保留原文。
-_DANGLING_TAIL_WORDS: frozenset[str] = frozenset(
-    "of for in at on to the a an and with since after before by from into over under about "
-    "bought bought given made taken done seen gone come known used held told sent kept found "
-    "left set put run cut hurt read meant spent built brought thought caught taught paid "
-    "happened occurred started began ended continued mentioned discussed".split()
-)
+# 裸相对时间剥离：唯一实现已上移到 ``atommem._strip_relative_time``（serial agent 与 v2 共用），
+# 见文件顶部的 import。
 
 
 def _render_sessions(summaries: dict[int, dict[str, Any]]) -> str:

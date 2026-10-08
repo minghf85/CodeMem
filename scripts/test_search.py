@@ -163,7 +163,9 @@ def test_toolcfg(tmp: Path) -> None:
     # --- answer prompt 的时间规则（temporal 27%->50% 的那几条）---
     ap = _P.ANSWER_PROMPT
     check("answer：会话时间不是事件时间", "WHEN THE CONVERSATION HAPPENED" in ap)
-    check("answer：带锚点的相对表述是完整答案", "COMPLETE answer" in ap)
+    check("answer：相对表达原样保留 + 加锚点", "COMPLETE answer" in ap)
+    check("answer：禁止把相对表达压成单日", "Do NOT flatten" in ap)
+    check("answer：不许编造更细的精度", "granularity" in ap)
     check("answer：禁止无锚点的相对词", "next month" in ap and "WRONG" in ap)
     check("answer：不要编造源没有的精度", "do NOT add precision" in ap.lower()
           or "Do NOT add precision" in ap)
@@ -189,29 +191,36 @@ def test_toolcfg(tmp: Path) -> None:
           and "9 June 2023" not in atom_std and "Bach" not in atom_std)
 
     # 时间精度：这是这一版的核心规则
-    check("时间策略：不得编造更细的精度", "Never invent a day" in rendered
-          or "not finer" in rendered or "never sharpen" in rendered.lower())
-    check("时间策略：按源语料的单位作答", "answer in that unit" in rendered
-          or "answer at that unit" in rendered)
-    check("时间策略：禁止把会话日期当事件日期写进内容", "NEVER put the session's own date" in rendered)
-    check("时间策略：算不出时只写带锚点的相对表述", "CANNOT compute" in rendered)
-    check("有 worked example（算不出的相对时间）", "CANNOT pin to a day" in rendered)
+    check("时间策略：不得编造更细的精度", "granularity" in rendered
+          or "not finer" in rendered)
+    check("时间策略：按源语料的单位作答", "unit" in rendered)
+    check("时间策略：禁止把会话日期当事件日期写进内容", "session's own date" in rendered)
+    check("时间策略：相对表达保留原样", "KEPT AS WRITTEN" in rendered
+          or "as written" in rendered)
     check("时间策略：保留锚点表述", "the week before <date>" in rendered
           or "the week before <session date>" in rendered)
-    check("时间策略：区间是合法答案", "A period is a valid answer" in rendered)
+    check("时间策略：相对表达原样保留 + 加锚点", "An anchored phrase IS the answer" in rendered
+          or "IS the answer" in rendered)
     check("时间策略：记录必须自带锚点", "stands ALONE" in rendered or "stand ALONE" in rendered
           or "TIME ANCHORED" in rendered)
     check("时间策略：原文表述要照录", "restate the source" in rendered.lower()
-          or "verbatim" in rendered.lower())
+          or "verbatim" in rendered.lower() or "Verbatim template" in rendered)
     # 这一版最要紧的一条：会话日期 ≠ 事件日期
-    check("时间策略：会话日期不是事件日期", "WHEN IT WAS SAID" in rendered)
+    check("时间策略：会话日期不是事件日期", "NEVER the event date" in rendered
+          or "session date" in rendered)
     check("时间策略：反例用占位符而非具体日期",
           "the week before <session date>" in rendered or "NOT <session date>" in rendered
           or "<session date>" in rendered)
     check("时间策略：禁止无锚点的相对词", "unanchored" in rendered.lower())
+    # 策略选择：集合题走 Strategy 2（针对实测最大瓶颈：集合题 recall=0）
+    check("有集合题专用的 Strategy 2", "Strategy 2" in rendered)
+    # 具体内容不许抽象化（针对"stained glass window -> painting"的实测退化）
+    check("证据标准：具体内容不许抽象化", "SPECIFICS PRESERVED" in rendered
+          or "do NOT abstract" in rendered.lower())
     check("有 worked example（关键词检索，Strategy 1）", "WORKED EXAMPLE (Strategy 1" in rendered)
-    check("有 worked example（相对时间，占位符命令）", "date -d \"<session date> -1 day\"" in rendered)
-    check("有 worked example（算不出的相对时间）", "CANNOT pin to a day" in rendered)
+    check("有 worked example（相对时间，占位符命令）", "date -d \"<session date> -1 day\"" in rendered
+          or "<the day before>" in rendered
+          or "date -d" in rendered)
     check("写道具/名单要具体（不许抽象化）",
           "not \"creative activities\"" in rendered or "List the real members" in rendered
           or "EVERY member" in rendered or "every member" in rendered)
@@ -236,7 +245,11 @@ def test_toolcfg(tmp: Path) -> None:
     # 上下文预算：system prompt 每个 round 都整体注入一次，涨回去就等于白做这次简化。
     # 阈值从 18000 抬到 19500：变更 C 刻意加入了两种策略的标准流程 + 特例处理（约 +0.9k），
     # 这是用户明确要求的内容，属于有意增长；断言仍用于防止非预期膨胀。
-    check("system prompt 控制在 19500 字符内", len(rendered) < 19500, str(len(rendered)))
+    # 19500 -> 19700：策略选择规则（集合题强制 Strategy 2）+ 具体内容保留规则（PRESERVE THE
+    # SPECIFICS），都是针对实测最大瓶颈（集合题 recall=0）的有意增长。断言继续防非预期膨胀。
+    # 19700 -> 19950："atoms 太抽象时去 msgmem 找具体名"的策略段（针对范式3：wrong entity，
+    # 如 "likes classical music" 丢了 "Bach and Mozart"），同样是有意增长。
+    check("system prompt 控制在 19950 字符内", len(rendered) < 19950, str(len(rendered)))
 
     # 响应解析
     check("解析裸 JSON", (toolcfg.parse_tool_call('{"tool":"bash","args":{"command":"ls"}}') or
@@ -1346,6 +1359,24 @@ def test_judge_temporal() -> None:
     check("无法解析的参考返回 None",
           J.resolve_relative_date("sometime last summer") is None)
 
+    # 回归：答案里的相对表达必须用**同一套**折算逻辑，不能把修饰语丢掉只取锚点。
+    # 实测：reference="The week before 6 July 2023" 与 candidate="the week before 6 July 2023"
+    # 逐字相同、都该是 6-29，但旧的 _parse_date 只抠出 "6 July 2023" 算成 7-06，差了整整一周，
+    # 把逐字相同的正确答案判成 INCORRECT。
+    check("答案里的 'the week before X' 折算正确",
+          J._parse_date("the week before 6 July 2023").isoformat() == "2023-06-29")
+    check("逐字相同的相对表达判为 SAME",
+          "SAME date" in J.temporal_hint(
+              "The week before 6 July 2023", "the week before 6 July 2023"))
+    check("答案里的 'the Friday before X' 折算正确",
+          J._parse_date("the Friday before 15 July 2023").isoformat() == "2023-07-14")
+    # 裸锚点日期 != 事件日期（锚点不是事件时间）—— 必须判为不同
+    check("裸锚点日期不与相对表达等价",
+          "differ" in J.temporal_hint(
+              "The week before 9 June 2023", "9 June 2023"))
+    # 绝对日期写法仍能解析（没被相对分支吞掉）
+    check("纯净日期仍解析", J._parse_date("6 July 2023").isoformat() == "2023-07-06")
+
     # 日期解析的四种写法
     from datetime import date
     for text, expected in [("2023-06-29", date(2023, 6, 29)),
@@ -1495,6 +1526,7 @@ def test_add_memory_module(tmp: Path) -> None:
     from codemem.add import msgmem as msgmem_mod
     from codemem.add import summem as summem_mod
     from codemem.add import atommem as atommem_mod
+    from codemem.add import atommem_time as atommem_time_mod
     from codemem import dataset
 
     # --- msgmem：session → type=msg 记录 ---
@@ -1534,7 +1566,7 @@ def test_add_memory_module(tmp: Path) -> None:
     new_atoms = [
         {"memory": "Caroline went to a group on 7 May 2023",
          "metadata": {"time": "7 May 2023", "role": "Caroline", "tag": ["activity:group"]}},
-        {"memory": "Melanie has kids", "metadata": {}},                 # 缺 time/role -> 回落
+        {"memory": "Melanie has kids", "metadata": {}},                 # 缺 time/role -> time 留空、role 回落
         {"memory": "", "metadata": {}},                                 # 空 -> 丢弃
         {"memory": "Caroline went to a group on 7 May 2023", "metadata": {}},  # 同事实 -> 去重
     ]
@@ -1550,9 +1582,37 @@ def test_add_memory_module(tmp: Path) -> None:
     check("finalize：source 含本 message 的 id",
           all("session_1_3" in a["metadata"]["source"] for a in atoms))
     check("finalize：changelog 被补", all(a["metadata"]["changelog"] for a in atoms))
-    check("finalize：缺 time 时回落到会话时间",
-          atoms[1]["metadata"]["time"] == "1:56 pm on 8 May, 2023")
+    check("finalize：缺 time 时**留空**（绝不回填会话时间戳——那是把'谈话时间'当'事件时间'）",
+          atoms[1]["metadata"]["time"] == "", repr(atoms[1]["metadata"]["time"]))
     check("finalize：缺 role 时回落到说话人", atoms[1]["metadata"]["role"] == "Caroline")
+    # 归一：agent 把相对表达写进 time -> 代码折算成带锚点的自足表达
+    _rel = atommem_mod.finalize_file(
+        before={}, after=[{"memory": "Caroline passed the interview",
+                           "metadata": {"time": "last Friday"}}],
+        source_id="session_19_1", default_time="9:55 am on 22 October, 2023", default_role="Caroline",
+    )
+    check("finalize：'last Friday' 折算成带锚点且日期正确（22 Oct 2023 之前的周五 = 10/20）",
+          "2023-10-20" in _rel[0]["metadata"]["time"], _rel[0]["metadata"]["time"])
+    # 抄了会话时间戳当事件时间 -> 留空
+    _copied = atommem_mod.finalize_file(
+        before={}, after=[{"memory": "Caroline continued her education",
+                           "metadata": {"time": "2023-05-08T13:56:00Z"}}],
+        source_id="session_1_9", default_time="1:56 pm on 8 May, 2023", default_role="Caroline",
+    )
+    check("finalize：抄会话时间戳作事件时间 -> 被识别并留空",
+          _copied[0]["metadata"]["time"] == "", repr(_copied[0]["metadata"]["time"]))
+
+    # 场景 1b：parse_time_expression 解析 "last <weekday>"（不带 day 的缩写也要认）
+    _P = atommem_time_mod.parse_time_expression
+    check("parse_time：'last Friday' @ 22 Oct 2023(周日) -> 10/20 之前那个周五",
+          "2023-10-20" in _P("last Friday", "9:55 am on 22 October, 2023"), _P("last Friday", "9:55 am on 22 October, 2023"))
+    check("parse_time：'Last Fri' @ 15 Jul 2023(周六) -> 7/14",
+          "2023-07-14" in _P("Last Fri", "1:51 pm on 15 July, 2023"), _P("Last Fri", "1:51 pm on 15 July, 2023"))
+    check("parse_time：'last Saturday' @ 25 May 2023 -> 5/20（完整词形）",
+          "2023-05-20" in _P("last Saturday", "1:14 pm on 25 May, 2023"), _P("last Saturday", "1:14 pm on 25 May, 2023"))
+    check("parse_time：'last week' 保持原样 + 锚点（不折算）",
+          _P("last week", "7:55 pm on 9 June, 2023") == "last week (anchor: 9 June 2023)")
+    check("parse_time：'yesterday' 折成绝对日期", _P("yesterday", "1:56 pm on 8 May, 2023") == "2023-05-07")
 
     # 场景 2：模型带了假 id/source/type —— 作为新行一律被覆盖
     overridden = atommem_mod.finalize_file(
@@ -1742,6 +1802,7 @@ async def test_atommem_agent(tmp: Path) -> None:
     import re
 
     from codemem.add import atommem as atommem_mod
+    from codemem.add import atommem_time as atommem_time_mod
     from codemem import llm as llm_mod
 
     sample = tmp / "AtomPair"

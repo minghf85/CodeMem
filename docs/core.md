@@ -102,8 +102,11 @@ python -m codemem.add                      # msgmem → summem → atommem，全
 python -m codemem.add Caroline_Melanie     # 只处理指定目录
 python -m codemem.add --stage msgmem       # 只跑第一层（纯 CPU，不调模型）
 python -m codemem.add --stage atommem --limit-messages 20   # 只跑前 20 条 message（调试）
-python -m codemem.add --stage atommem --use-agent           # 使用 agent loop（旧模式，默认用 pipeline）
 ```
+
+> **atommem 只有一种实现：并行 add agent**（见 §1.1）。曾经有过"三阶段 pipeline"与"串行
+> agent"两个变体，实测**都过度合并**（一条消息只出一个原子），检索命中率显著低于 agent 的
+> 细拆分，已删除（2026-10-08）。
 
 **三层，产出三种记忆文件**（都在 `data/{speaker_a}_{speaker_b}/` 下，JSONL 一行一条）：
 
@@ -573,6 +576,157 @@ temporal +22 个点。**
 **教训**：judge 是被测量的一部分。它的 prompt 一改，**历史分数就不能直接比了**。
 `scripts/judge_impact.py` 就是为此写的 —— 它拿新规则扫一遍已存的结果，列出"按新规则应该
 翻转"的条目，改 judge 之前先跑它看一眼影响面。
+
+### 2.4.2 时间处理的最优方案：保留相对表达，不折算（2026-10-06）
+
+§2.4 的规则里留着一条**自相矛盾**的指导：一边说"带锚点的短语就是答案"（规则 4），一边又写
+"**Compute when you can: lead with the computed date**"（旧规则 3）。8B 在矛盾下倾向于执行
+"尽量折算"，于是把 "last week" 算成了**会话日期本身** —— 恰好踩中规则 1 明令禁止的错误。
+全量跑后 temporal 只有 36%，但 evidence_recall 高达 83% —— **检索到了，是作答/判定把时间搞错了**。
+
+#### 三个叠加的 bug（逐条实测确认）
+
+**① search 把相对表达错误折算成会话日期。**
+
+```
+源消息 (session_3_1, 时间 9 June 2023): "my school event last week"
+atommem (正确): time = "last week (anchor: 9 June 2023)"  ← pipeline 已保留
+search 写的 evidence (错): "Caroline gave a speech at a school on 9 June 2023"  ← "last week" 被吞成锚点本身
+参考答案: "The week before 9 June 2023"
+```
+
+**② judge 折算 candidate 时丢掉了修饰语，把逐字相同的答案判成不同日期。**
+
+`judge._parse_date("the week before 6 July 2023")` 走的是**绝对日期**分支 —— 它抠出
+"6 July 2023" 算成 `2023-07-06`，**完全无视 "the week before"**。而 reference 走
+`resolve_relative_date` 算出 `2023-06-29`。于是：
+
+```
+reference: "The week before 6 July 2023"  → 2023-06-29
+candidate: "the week before 6 July 2023"  → 2023-07-06   ← 逐字相同却算成差 7 天
+judge: "These differ by 7 day(s)" → INCORRECT
+```
+
+逐字相同的正确答案被判错。**这是 judge 最隐蔽、也最该先修的 bug** —— 它污染测量，
+让"答案其实对了"的题显示为错。
+
+**③ answer 把锚点当成事件时间作答。**
+
+#### 最优方案（用户定的口径）
+
+> **相对时间表达本身就是一个完整、精确、充沛的答案。** "The week before 6 July 2023" 自带锚点
+> 6 July，任何人（包括 judge）都能验证两个答案是否相同 —— **不需要、也不应该折算成绝对日期**。
+> 折算是有损的：它丢掉"一周内哪天"的信息（"the week before X" 是一个**周区间**，不是一个点），
+> 还会引入算错的风险。而"上周发生的"（模糊描述）= 一个周内发生，**不能具体到某一天**。
+> **不要随意理解日期。**
+
+落成三条规则：
+
+| 表达 | 处理 | 理由 |
+|---|---|---|
+| `yesterday` / `today` / `tomorrow` | **折算成绝对日期**（`date -d`，单步精确） | 唯一"精确且平凡"的折算 |
+| `last week` / `last Friday` / `the week before X` / `N years ago` | **保留原表达 + 锚点**，不折算 | 自带锚点即完整答案；折算是信息损失 |
+| `a few weeks ago` / `recently` | 保留为**粗粒度窗口**，绝不细化成日期 | 源就是模糊的，细化 = 编造 |
+
+**具体修改**：
+
+1. **`tool.json` 的 `time_policy`**（search 侧）：删掉"compute when you can"，改成
+   "**preserve, don't convert**" + "只有 yesterday/today/tomorrow 才折算" + "按源的单位作答，绝不细化"。
+2. **`tool.json` 的 worked examples**：把"lead with the computed date"的例子改成
+   "keep 'last week' + anchor" 的正确形态。
+3. **`prompts.ANSWER_PROMPT`**（answer 侧）：加"keep the source's own time wording, anchored --
+   do NOT flatten it into a date" + "read the unit the source used and answer at that unit"。
+4. **`prompts.EVIDENCE_STANDARD`**：第 3 条改为 "TIME ANCHORED, KEPT AS WRITTEN"。
+5. **`judge._parse_date`**：**先试相对表达**（复用 `resolve_relative_date` 的同一套逻辑），
+   识别不到再回退到绝对日期解析 —— 保证 reference 与 candidate **口径完全一致**。
+   把折算逻辑抽成 `_resolve_relative_expression` 供两个函数共用。
+
+#### 实测（Caroline_Melanie 的 3 条 temporal QA）
+
+| QA | 修改前 | 修改后 |
+|---|---|---|
+| qa8 | `9 June 2023`（吞成锚点）❌ | `the week before 9 June 2023` ✅ CORRECT |
+| qa9 | `9 June 2023` ❌ | `the week before 9 June 2023` ✅ CORRECT |
+| qa28 | `15 July 2023` ❌ | `the week before 15 July 2023` ⚠️（差在 "Friday" vs "week"，非时间方案问题）|
+
+token_f1 从 ~0.5 升到 **0.944**。新生成的 evidence 正是期望的形态：
+
+```
+Caroline gave a speech at a school 'last week' (message dated 7:55 pm on 9 June, 2023)
+  -- i.e. the week before 9 June 2023.
+```
+
+### 2.4.3 全量跑后的错因分析：最大瓶颈是"集合题检索不到"（2026-10-06）
+
+时间方案落地后全量跑（`search_20261006_112146`）：**judge 55.4%**，temporal 从 36% 升到 **61.1%**
+（时间方案生效），但 single_hop 62.1%、multi_hop 40.7%、open_domain 33.3%。
+
+#### 按 recall 拆开 58 个错误，瓶颈一目了然
+
+| 错误形态 | 条数 | 含义 |
+|---|---|---|
+| **recall=0（检索不到）** | **29** | evidence 完全没覆盖标注证据 —— 最大瓶颈 |
+| unsupported（没答） | 13 | search 判"证据不足"直接放弃 |
+| recall=1（检索到但答错） | 12 | 证据对，作答/判定错 |
+| recall 部分 | 4 | 集合收不全 |
+
+**29 条 recall=0 里绝大多数是"集合型问题"**（"what activities/pets/books/items does X have"、
+"where has X camped"、"what types of pottery…"）—— 标注证据是一**组散点**，search 收漏一条就大量丢分。
+
+#### 三个具体错因（逐条看轨迹确认）
+
+**① 集合题，agent 只做关键词 grep，不读会话。**
+
+qa18「Where has Melanie camped?」（真答案 `beach, mountains, forest`）的 12 步轨迹全是
+`grep "camp"` / `grep "mountains"` / `grep "campfire"` —— **它从没用过 Strategy 2 的"读会话"**。
+成员散落在多个会话，关键词法永远抓不全。
+
+**② 具体内容被抽象化。**
+
+qa127「What did Caroline make for a local church?」原子层**是对的**（`Caroline made a stained
+glass window`），但 search 写成 `"Caroline created a painting"` —— **"stained glass window" 被抽象成了
+"painting"**。qa112（`a sunset with a palm tree` → `a nature-themed artwork`）同理。
+这正是 `ATOM_AGENT_STANDARD` 规则 13 禁止的，但 search 的 `EVIDENCE_STANDARD` 没有对应条款。
+
+**③ answer 复述 prompt 模板占位符。**
+
+qa18 的 answer 输出 `"the week before <session date>"`、qa71 输出 `"the year before session_7_8"`
+—— 因为 `ANSWER_PROMPT` 的工作示例里写的是 `<session date>` / `<year-1>` 这种**模板标记**，
+模型逐字照抄了，还把它当成了答案。
+
+#### 修改
+
+1. **`strategy`（策略选择）**：加一条判据 —— 集合/计数题**必须走 Strategy 2**，并警告
+   "grep 人名会匹配几乎每一行，`head` 只看到噪声，不是成员"。
+2. **`EVIDENCE_STANDARD` 第 8 条**：新增 `SPECIFICS PRESERVED` —— 保留具体内容（stained glass
+   window / sunset with a palm tree / 标语原文），禁止抽象成类别。
+3. **`verifier`**：加两条 —— 集合题要**具体成员**（不是类别）、答案要**保留具体细节**。
+4. **`ANSWER_PROMPT` 示例**：把 `<session date>` / `<year-1>` 占位符换成**真实示意日期**
+   （9 June 2023 / 2022），并明确"示例里的日期是示意值，必须替换成真实日期；绝不复制占位符、
+   session id 或示例值"。
+5. `system prompt` 上限 19500 → **19700**（上述规则是有意的、针对最大瓶颈的增长）。
+
+#### 诚实记录：一次失败的方向
+
+最初把规则写成"you MUST use Strategy 2"，结果 **充分率从 42% 掉到 0%** —— 8B 把它理解成
+"要 grep 人名"，于是 `grep "Melanie" | head -20` 反复重试、卡住不写 evidence。
+**加规则 ≠ 改行为**：抽象描述（"list the sessions, then read"）8B 会误读，必须给**具体命令形态**
+和**明确的反例**（"grep 人名只会看到噪声"）。这是 add / search agent 反复验证过的教训。
+
+#### 实测（20 条混合题，中等规模验证）
+
+| 指标 | 全量（改前） | 20 条（改后） |
+|---|---|---|
+| judge_accuracy | 55.4% | **60.0%** |
+| unsupported_rate | 10.0% | **0.0%** |
+| token_f1 | 0.404 | **0.442** |
+| sufficient_rate | 42% | **75%** |
+
+（20 条样本小、判分条数少，只作方向参考；全量验证见下。）
+
+
+**一句话总结**：相对时间**保留原样 + 附锚点**是答案，绝对日期只是"锚点 + 偏移"的另一写法；
+judge 两边都要用同一套折算逻辑，否则会把逐字相同的答案判成不同。
 
 ### 2.5 输出 schema：`reasoning` 必须放在第一个字段
 
@@ -1499,3 +1653,87 @@ python scripts/test_api.py          # 封装 API 自测（37 项）
       "单层（消解后消息）"的 evidence recall 与 judge 准确率，验证 atommem 的拆分/消解质量
 
 （注：`data/*/atommem.jsonl` 的 10 个目录为旧原子记忆体系的遗留数据，格式与 S14 不同。）
+
+### S15: 优化 atommem 时间处理 + 原子粒度（2026-10-06）
+
+**bad case 分析（search_20261005_235035）**：总体准确率 50.8%，temporal 只有 40%、multi_hop 31.8%。
+逐条分析 104 条 INCORRECT，发现三类核心问题：
+
+#### 问题 A: 时间处理过于机械（11/35 temporal 错）
+
+**案例 A1**: 相对时间被硬算成绝对日期，丢失锚点
+
+```
+原始: "my school event last week" (9 June 2023)
+atommem 产出: time="2023-06-02"
+正确答案: "The week before 9 June 2023"
+系统答案: "9 June 2023" ❌
+```
+
+**根因**: `parse_time_expression` 把 "last week" 用 `date -d` 算成了 2023-06-02，但丢掉了原始表达和锚点。
+
+**案例 A2**: 持续时间信息完全丢失
+
+```
+原始: "5 years already!" (9 June 2023)
+atommem 产出: time="2023-07-14"
+正确答案: "5 years"
+系统答案: "0 days" ❌
+```
+
+**根因**: pipeline 只处理了事件时间点，"5 years" 这个持续信息完全丢失。
+
+#### 问题 B: 原子抽取粒度不当
+
+**案例 B1**: 复合概念未拆分
+
+```
+原始: "Luna and Oliver! They are so sweet..."
+atommem 产出: 只有 Oliver 和 Bailey 的独立 atom，Luna 没有
+正确答案: "Oliver, Luna, Bailey"
+系统答案: "Oliver and Bailey" (漏了 Luna)
+```
+
+**案例 B2**: 关键属性被掩盖
+
+```
+原始: "tough as a single parent"
+atommem 产出: "Caroline is up for the challenge of being a single parent."
+正确答案: "Single"
+系统答案: "in a committed relationship" ❌
+```
+
+**根因**: 只关注动作/状态，"single" 这个关键属性被埋没了；没有独立抽一条 "Caroline is single"。
+
+#### 优化方案（S15）
+
+**方案 A: 改进时间处理（P0）**
+
+1. 新增 `metadata.time_expr` 和 `metadata.time_anchor` 字段保留原始时间表达
+2. 修改 `parse_time_expression` 策略：相对时间优先保留 "原表达 (锚点)" 形式，只有精确时点（yesterday）才算成绝对日期
+3. 修改 EVIDENCE_STANDARD：优先使用 `time_expr + time_anchor` 而不是硬算的 `time`
+
+```json
+{
+  "memory": "Caroline talked about her transgender journey at a school event.",
+  "metadata": {
+    "time": "last week (anchor: 9 June 2023)",
+    "time_expr": "last week",
+    "time_anchor": "7:55 pm on 9 June, 2023"
+  }
+}
+```
+
+**方案 B: 改进原子粒度（P0）**
+
+1. 集合成员强制拆分：ATOM_EXTRACTION_SYSTEM 规则 6 新增 "Split compound entities"
+2. 关键属性显式抽取：规则 7 新增 "Extract key attributes explicitly"
+3. 示例补充：添加 "Luna and Oliver" 拆分、"single parent" 属性抽取的示例
+
+**实测效果**：
+- ✓ time_expr/time_anchor 正确产出
+- ✓ "last week" 保留为 "last week (anchor: 9 June 2023)"
+- ✓ "yesterday" 算成 "2023-06-08"
+- ✓ prompt 新增集合拆分 + 关键属性抽取规则
+
+**预期提升**: temporal +15-20%（从 40% → 55-60%），single_hop +10-15%（从 62% → 72-77%）。

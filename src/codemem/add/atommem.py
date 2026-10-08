@@ -38,6 +38,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -460,6 +462,11 @@ def finalize_file(
         text = memory_text(raw).strip()
         if not text:
             continue
+        # memory 正文里的相对时间表达（在剥离之前捕获）—— 用于校验 agent 自己写的绝对日期。
+        memory_time_expr = _extract_relative_expr(text)
+        # 剥掉 memory 正文里残留的裸相对时间词（时间信息已进 metadata.time）。prompt 的软约束
+        # 拦不住 8B（实测约 7.5% 会犯），纪律必须下沉到 harness。只在时间已解析好时才剥。
+        text = _strip_relative_time(text)
         meta = dict(raw.get("metadata") or {})
         old_id = memory_id(raw)
         if old_id not in before:
@@ -467,7 +474,26 @@ def finalize_file(
             old_id = before_by_memory.get(_dedup_key(text), "")
         time_value = meta.get("time")
         if not isinstance(time_value, str) or not time_value.strip():
-            time_value = default_time
+            # agent 没填 time —— **绝不**回填会话时间戳（那会把"会话发生的时间"写死成
+            # "事件发生的时间"，是 §2.4 反复强调的头号错误）。留空表示"该事实无时间"。
+            time_value = ""
+        else:
+            # agent 常把**原始相对表达**（"last Friday" / "last week"）直接写进 time。
+            # 用与 pipeline 相同的解析器折算：带锚点的相对表达保留原样 + 锚点，
+            # "last <weekday>" 解析成 "the <weekday> before <anchor>"（含绝对日期），
+            # 只有 yesterday/today/tomorrow 折成绝对日期。default_time 在这里只当**锚点**，
+            # 不再当"事件时间"。
+            time_value = _resolve_time_value(time_value.strip(), default_time)
+
+        # 兜底：agent 有时自己把相对表达**算成了绝对日期**（8B 心算不可靠，实测把 "last
+        # Saturday"(25 May 2023 是周四 → 应为 5/20) 算成 5/21）。若 memory 正文里其实带着
+        # 原始相对表达，就用 harness 的 `date -d` 重新解析 —— 代码算术永远比 8B 心算准。
+        if memory_time_expr:
+            harness_time = _resolve_time_value(memory_time_expr, default_time)
+            # 只有当 harness 解析出了带锚点/绝对日期的结果、且 agent 没给出带锚点的值时，才覆盖。
+            if harness_time and harness_time != memory_time_expr and "i.e." in harness_time:
+                if not time_value or "anchor" not in time_value.lower():
+                    time_value = harness_time
         role_value = meta.get("role")
         if not isinstance(role_value, str) or not role_value.strip():
             role_value = default_role
@@ -509,6 +535,182 @@ def _atom(
         "id": mem_id, "type": "atom", "time": time_value, "role": role_value,
         "tag": tags, "source": sources, "changelog": changelog,
     }}
+
+
+# 裸相对时间词/短语：memory 正文里出现即剥离（时间已进 metadata.time）。
+# 顺序重要——先长后短，避免 "last week" 被 "last" 提前吃掉留下残词。
+_RELATIVE_TIME_PATTERNS = (
+    r"\s*\bthe\s+(?:week|month|year|day|weekend|morning|afternoon|evening)\s+before\b[^.,;]*",
+    r"\s*\b\d+\s+(?:day|week|month|year|weekend)s?\s+(?:before|after|ago)\b[^.,;]*",
+    r"\s*\b(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|several|few|couple of)\s+"
+    r"(?:day|week|month|year|weekend)s?\s+ago\b",
+    r"\s*\blast\s+(?:night|week|weekend|month|year|summer|winter|spring|autumn|fall|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    r"\s*\bnext\s+(?:week|weekend|month|year|summer|winter|spring|autumn|fall|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    r"\s*\b(?:yesterday|today|tomorrow|recently|currently|presently)\b",
+    r"\s*\bsince\s+(?:starting|coming|their|her|his|the|last)\b[^.,;]*",
+    r"\s*\bin\s+the\s+past\s+(?:few|several|\d+)\s+(?:day|week|month|year)s?\b",
+)
+_RELATIVE_TIME_RE = tuple(re.compile(p, re.IGNORECASE) for p in _RELATIVE_TIME_PATTERNS)
+
+
+def _strip_relative_time(memory: str) -> str:
+    """剥掉 memory 正文里的裸相对时间词（时间信息已由 metadata.time 承载）。
+
+    8B 实测约 7.5% 的 atom 会把 "last year" / "4 years ago" 留在正文里，而 prompt 的软约束
+    拦不住（add 阶段的老问题：纪律要下沉到 harness）。这里只在**时间已解析成功**时才调用，
+    所以剥掉这些措辞不丢信息 —— 读者从 ``time`` 就能拿到同一件事的时间。
+
+    只做**删除**，不做改写/替换：删完压一下多余空白与句首标点。三条护栏保证不制造残句 ——
+    太短（时间即主体）、删得太多（>50%）、或删完以虚词/悬空分词结尾（"figurines bought"、
+    "a lot happened since"）时一律**保留原文**：宁可留个时间词，也别留个读不通的句子。
+    """
+    if not memory:
+        return memory
+    cleaned = memory
+    for pattern in _RELATIVE_TIME_RE:
+        cleaned = pattern.sub("", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([.,;!?])", r"\1", cleaned).strip()
+    if len(cleaned.split()) < 3 or len(cleaned) < len(memory) * 0.5:
+        return memory
+    tail = cleaned.rsplit(" ", 1)[-1].strip(".,;!?").lower()
+    if tail in _DANGLING_TAIL_WORDS:
+        return memory
+    return cleaned
+
+
+# 剥离后若以这些词结尾，句子多半悬空了（"Caroline mentions a lot happened" / "figurines bought"）——
+# 这是"删掉了时间状语，剩下的补语没了宾语"的形态，直接保留原文。
+_DANGLING_TAIL_WORDS: frozenset[str] = frozenset(
+    "of for in at on to the a an and with since after before by from into over under about "
+    "bought bought given made taken done seen gone come known used held told sent kept found "
+    "left set put run cut hurt read meant spent built brought thought caught taught paid "
+    "happened occurred started began ended continued mentioned discussed".split()
+)
+
+
+# memory 正文里可被 harness 重新解析的**相对时间表达**（用于校验/修正 agent 自己算出的绝对日期）。
+_MEMORY_TIME_EXPR_RE = re.compile(
+    r"\b(?:"
+    r"last\s+(?:night|week|weekend|month|year|summer|winter|spring|autumn|fall|"
+    r"mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)"
+    r"|next\s+(?:week|weekend|month|year)"
+    r"|(?:\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|several|few|couple of)\s+"
+    r"(?:day|week|month|year)s?\s+ago"
+    r"|yesterday|today|tomorrow"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_relative_expr(text: str) -> str:
+    """从 memory 正文里取出第一个相对时间表达（"last Saturday" / "3 days ago" / "yesterday"）。
+
+    找不到返回 ""。用于 harness 在 agent 把相对表达**算错成绝对日期**时，用 ``date -d`` 重算。
+    """
+    match = _MEMORY_TIME_EXPR_RE.search(text or "")
+    return match.group(0).strip() if match else ""
+
+
+def _resolve_time_value(time_value: str, anchor_time: str) -> str:
+    """把 agent 写的 ``metadata.time`` 归一成自足的时间表示（时间纪律下沉到 harness）。
+
+    8B 心算相对时间不可靠（"last Friday" 是周几、相对哪次会话），所以这里复用 pipeline 的
+    ``parse_time_expression`` 做**代码级折算**：带锚点的相对表达保留原样 + 附锚点；
+    "last <weekday>" 解析成绝对日期；只有 yesterday/today/tomorrow 折成绝对日期。
+
+    三类归一，全部是"prompt 拦不住、代码必须兜住"的实测形态：
+
+    1. **会话时间戳冒充事件时间**（最严重）。agent 常把消息自己的时间（`2023-05-08T13:56:00Z`
+       或 `1:56 pm on 8 May, 2023`）直接抄进 ``time``，而这条消息**根本没有时间表达**。这会
+       把"谈话发生的时间"写成"事件发生的时间"（§2.4 的头号错误）。判据：``time`` 归一后的
+       日期+时刻与锚点**同一时刻**（分钟级相同）→ 判为抄了锚点，返回 ``""``（该事实无时间）。
+    2. **ISO datetime → 日期**：`2023-05-08T13:56:00Z` → `2023-05-08`（事件时间只需日期粒度）。
+    3. **原始相对表达 → 带锚点的自足表达**（"last Friday" → "last Friday (anchor: ...) -- i.e. <date>"）。
+
+    已是自足形式（纯年份 / 纯日期 / 区间 / 已含 ``(anchor:``）→ 原样返回。
+    """
+    if not time_value:
+        return ""
+    import re as _re
+
+    lower = time_value.lower()
+
+    # ISO datetime（含 T/时区）→ 先降到日期粒度，再判"是不是抄了锚点当天"
+    iso_dt = _re.match(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}):(\d{2})", time_value)
+    if iso_dt:
+        date_part, hh, mm = iso_dt.group(1), iso_dt.group(2), iso_dt.group(3)
+        anchor_norm = _normalize_anchor(anchor_time)
+        if anchor_norm and anchor_norm.get("date") == date_part and anchor_norm.get("hm") == f"{hh}:{mm}":
+            return ""  # 抄了会话时间戳 → 该事实其实无时间
+        return date_part
+
+    # 已带锚点的结果 / 纯年份 / 纯日期 / 区间 —— 自足，原样返回
+    if (
+        "(anchor:" in lower
+        or _re.fullmatch(r"\d{4}", time_value)
+        or _re.fullmatch(r"\d{4}-\d{2}-\d{2}(/\d{4}-\d{2}-\d{2})?", time_value)
+    ):
+        return time_value
+
+    relative_words = ("last", "next", "yesterday", "today", "tomorrow", "ago", "recently", "soon")
+    has_relative = any(w in lower for w in relative_words)
+
+    # 绝对日期串（含 4 位年份、无相对词）—— 但要提防它是**逐字抄了锚点**（如 "8 May 2023" 恰好
+    # 等于会话日期）。与锚点同一天且原文本带时刻（"1:56 pm on 8 May, 2023"）→ 判为抄锚点。
+    if _re.search(r"\d{4}", time_value) and not has_relative:
+        anchor_norm = _normalize_anchor(anchor_time)
+        value_norm = _normalize_anchor(time_value)
+        if anchor_norm and value_norm and value_norm.get("date") == anchor_norm.get("date"):
+            # 文本里带时刻（am/pm）→ 抄的是消息时间；纯日期同名 → 保留（可能就是那天的绝对事件）
+            if _re.search(r"\d{1,2}:\d{2}\s*(am|pm)", lower):
+                return ""
+        return time_value
+
+    if not anchor_time:
+        return time_value
+
+    from .atommem_time import parse_time_expression
+
+    return parse_time_expression(time_value, anchor_time)
+
+
+def _normalize_anchor(text: str) -> dict[str, str]:
+    """把任意时间串归一成 ``{"date": "YYYY-MM-DD", "hm": "HH:MM"}``（尽量；取不到字段就省略）。
+
+    用于判断 agent 写的 ``time`` 是否就是会话锚点本身（抄锚点 = 事件时间错误）。用
+    ``date -d`` 解析，失败返回 ``{}``。
+    """
+    import re as _re
+
+    if not text:
+        return {}
+    cleaned = text.replace(",", "").strip()
+    # 会话时间戳形如 "1:56 pm on 8 May 2023" —— GNU date 不认 "on"，拆成 "<date> <time>"。
+    m_on = _re.search(r"^(\d{1,2}:\d{2}\s*(?:am|pm)?)\s+on\s+(.+)$", cleaned, _re.IGNORECASE)
+    if m_on:
+        cleaned = f"{m_on.group(2).strip()} {m_on.group(1).strip()}"
+    out: dict[str, str] = {}
+    # 日期
+    try:
+        d = subprocess.run(["date", "-d", cleaned, "+%Y-%m-%d"],
+                           capture_output=True, text=True, timeout=5, env={"LC_ALL": "C"})
+        if d.returncode == 0:
+            out["date"] = d.stdout.strip()
+    except Exception:  # noqa: BLE001
+        return out
+    # 时刻（"1:56 pm" / "13:56"）
+    m = _re.search(r"(\d{1,2}):(\d{2})\s*(am|pm)?", text, _re.IGNORECASE)
+    if m:
+        hh, mm, ap = int(m.group(1)), m.group(2), (m.group(3) or "").lower()
+        if ap == "pm" and hh != 12:
+            hh += 12
+        elif ap == "am" and hh == 12:
+            hh = 0
+        out["hm"] = f"{hh:02d}:{mm}"
+    return out
 
 
 def _renormalized(rec: dict[str, Any]) -> dict[str, Any]:
@@ -561,11 +763,20 @@ def _dedup_key(text: str) -> str:
 # 0.6 是精挑的：真换说法（"values X" / "appreciates X"）**有时**能到 0.6，但 8B 更常见的
 # 是同一条事实换一串**情绪动词**（praises / supports / values / appreciates / recognizes /
 # highlights + 同一宾语），这类两两 Jaccard 只有 0.2~0.5，纯 Jaccard 抓不住。所以补一条
-# **去动词核心**规则：剥掉情绪动词后，若两句话共享 ≥3 个实词且共享率 ≥0.25，判为同一事实。
-# 实测（session_2_2 七连）：本规则并 20/21，且不误并"A 去支持小组" vs "A 感到被支持小组接纳"。
+# **去动词核心**规则：剥掉情绪动词后，若两句话共享 ≥3 个实词且共享率 ≥0.25，判为同一事实
+# —— 但**仅当两句话本身都含情绪动词**时才适用（见 `_is_same_fact` 的前提判断）。
+#
+# **实测事故（范式1 根因之一）**：这条前提最初缺失，导致 "Caroline passed adoption agency
+# interviews"（动作动词 passed）与 "Caroline chose an adoption agency"（动作动词 chose）
+# 剥词后共享 {caroline, adoption, agency} 3 个实词、ratio=0.5 ≥ 0.25，被误判成"同一事实
+# 换说法"而合并，核心事实（通过面试）整条丢失，QA 答案跟着错。problem 不在阈值本身——
+# 真正的误判案例 ratio 落在 0.33~0.5，恰好与真换说法案例（情绪动词剥完后 ratio 0.27~1.0，
+# 因宾语措辞不同也会低到 0.27）**区间重叠**，调阈值两头不能兼顾。真正的区分信号是：
+# 情绪动词换说法的两句话必须**都在表达情绪/态度**（praises/supports/values/...），而
+# "passed"/"chose" 是具体动作，根本不该走这条"换个态度词、事实不变"的捷径。
 NEAR_DUP_JACCARD = 0.6
 _SHARED_CORE_MIN = 3      # 去动词后至少要共享几个实词
-_SHARED_CORE_RATIO = 0.25  # 且共享率（交集/并集）不低于这个数
+_SHARED_CORE_RATIO = 0.25  # 且共享率（交集/并集）不低于这个数（仅情绪动词句对生效）
 # 情绪/态度动词：只表达"对同一件事的态度"，本身不构成"不同事实"的区分度。合并比较前剥掉。
 _SENTIMENT_VERBS = frozenset(
     "praise praises praised support supports supported value values valued appreciate appreciates "
@@ -599,6 +810,16 @@ def _core_tokens(text: str) -> set[str]:
     return {tok for tok in _tokens(text) if tok not in _SENTIMENT_VERBS}
 
 
+def _has_sentiment_verb(text: str) -> bool:
+    """这句话里是不是真的出现了情绪/态度动词 —— "去动词核心"合并规则的生效前提。
+
+    没有这条前提，规则会把任何"剥掉情绪动词后共享几个实词"的句子都判成重复 —— 但
+    "Caroline passed interviews" 和 "Caroline chose an agency" 里根本没有情绪动词，
+    "passed"/"chose" 是具体动作，剥不掉也不该剥。只有两句话都在表达情绪/态度时，
+    "换了个态度词、事实没变"这个假设才成立。"""
+    return bool(_SENTIMENT_VERBS & _tokens(text))
+
+
 def _subject(text: str) -> str:
     """取 memory 的**主语**（句首第一个专有名词 / 实词），用于挡住"A 欣赏 B" vs "B 欣赏 A"
     这类**主客体颠倒**的假合并 —— 它们的 token 集合几乎一样，但主语不同，是两条不同事实。"""
@@ -615,8 +836,10 @@ def _is_same_fact(a: str, b: str) -> bool:
     "Melanie 欣赏 Caroline"）误判成同一事实。主语一致后再看两条路径任一命中：
 
     1. **整体 Jaccard ≥ 0.6**：措辞几乎一致（大小写/冠词差异）。
-    2. **去动词核心 ≥ 3 个实词且共享率 ≥ 0.25**：8B 反复犯的"同一事实换情绪动词"
-       （praises/supports/values/appreciates/recognizes/highlights + 同一宾语）。
+    2. **两句话都含情绪动词，且去动词核心后 ≥ 3 个实词、共享率 ≥ 0.25**：8B 反复犯的
+       "同一事实换情绪动词"（praises/supports/values/appreciates/recognizes/highlights +
+       同一宾语）。**情绪动词前提是硬性的** —— 没有它，"passed interviews" 与 "chose an
+       agency" 这类具体动作不同、仅主宾语偶然重叠的句子也会被判成重复（见上面的事故记录）。
     """
     ta, tb = _tokens(a), _tokens(b)
     if not ta or not tb:
@@ -626,7 +849,9 @@ def _is_same_fact(a: str, b: str) -> bool:
     # 路径 1：措辞近乎一致。
     if len(ta & tb) / len(ta | tb) >= NEAR_DUP_JACCARD:
         return True
-    # 路径 2：剥掉情绪动词后仍有共同的实词核心（换动词 != 换事实）。
+    # 路径 2：仅当两句话都在表达情绪/态度时才适用（换个态度词、事实不变 —— 具体动作不适用）。
+    if not (_has_sentiment_verb(a) and _has_sentiment_verb(b)):
+        return False
     ca, cb = _core_tokens(a), _core_tokens(b)
     if not ca or not cb:
         return False
@@ -684,138 +909,11 @@ def _absorb(kept: dict[str, Any], atom: dict[str, Any]) -> None:
         kept_meta["changelog"] = atom["metadata"].get("changelog")
 
 
-# ---------------------------------------------------------------------------
-# 单目录
-# ---------------------------------------------------------------------------
-async def run_dir(
-    directory: Path,
-    config: dict[str, Any],
-    client: openai.AsyncOpenAI,
-    catalog: toolcfg.ToolCatalog,
-    log: Logger,
-    *,
-    limit_messages: int = 0,
-    use_pipeline: bool = True,
-) -> dict[str, Any]:
-    """对一个目录的 msgmem **逐 message 串行**跑 atom 抽取，就地写 atommem.jsonl。
-
-    串行的意义：处理第 N 条 message 时，`atommem.jsonl` 里已经有前 N-1 条产出的 atom，
-    能召回它们（"跨 session 影响"就靠这个）。所以每处理一条就**增量落盘**一次。
-
-    use_pipeline=True（默认）：用三阶段 pipeline（召回 → 单次 LLM → 后处理），稳定快速。
-    use_pipeline=False：用 agent loop（兼容旧行为，但不稳定）。
-    """
-    label = directory.name
-    files = directory_files(directory)
-    msg_path = files["msgmem"]
-    if not msg_path.exists():
-        return {"dir": label, "status": "SKIPPED",
-                "reason": f"no {MSGMEM_NAME}（先跑 add --stage msgmem）"}
-    messages = read_jsonl(msg_path)
-    summaries_by_session = group_by_session(read_jsonl(files["summem"]))
-    summaries = {number: records[0] for number, records in summaries_by_session.items() if records}
-
-    atommem_path = files["atommem"]
-    known = {memory_id(m) for m in messages}
-    current: list[dict[str, Any]] = read_jsonl(atommem_path)
-
-    speaker_a, speaker_b = parse_dir_label(label)
-    targets = messages if not limit_messages else messages[:limit_messages]
-
-    if use_pipeline:
-        # ============ Pipeline 模式 ============
-        from .atommem_pipeline import run_message_pipeline
-
-        for target in targets:
-            node_log = log.bind(f"{label}:{memory_id(target)}")
-            # 幂等：移除本 message 最初产出的 atom
-            current = [
-                a for a in current
-                if _primary_source(a) != memory_id(target)
-                or not (set((a.get("metadata") or {}).get("source") or []) & known)
-            ]
-            try:
-                new_atoms = await run_message_pipeline(
-                    target=target,
-                    msgmem=messages,
-                    existing_atoms=current,
-                    client=client,
-                    config=config,
-                    log=node_log,
-                    speaker_a=speaker_a,
-                    speaker_b=speaker_b,
-                )
-                # 合并到当前语料
-                current.extend(new_atoms)
-                # 去重
-                current = _dedup_atoms(current)
-                # 落盘
-                write_memories(atommem_path, current)
-            except Exception as exc:  # noqa: BLE001
-                node_log.warn(f"处理失败：{type(exc).__name__}: {exc}")
-
-        return {
-            "dir": label, "status": "OK",
-            "messages": len(targets),
-            "atoms": len(current),
-        }
-
-    else:
-        # ============ Agent Loop 模式（旧行为，保留用于对比）============
-        workspace = directory
-        runner = _Runner(client, config, log, directory / ".atommem.model_calls.jsonl")
-
-        for position, target in enumerate(targets):
-            session = msg_session_number(memory_id(target))
-            prior = _session_prior(messages, position, session)
-            node_log = log.bind(f"{label}:{memory_id(target)}")
-
-            # 幂等：重跑一条 message 时，先移除它**最初产出**的 atom（primary source = 本 message），
-            # 再让 agent 重新生成/合并。历史里 source 不在 msgmem 的 atom（手动标的）原样保留。
-            current = [
-                a for a in current
-                if _primary_source(a) != memory_id(target)
-                or not (set((a.get("metadata") or {}).get("source") or []) & known)
-            ]
-            # 处理前把当前视图落盘（增量：第 N 条看见前 N-1 条产出的 atom）。
-            write_memories(atommem_path, current)
-            try:
-                current = await run_message(
-                    target=target, prior=prior, summaries=summaries, workspace=workspace,
-                    atommem_path=atommem_path, config=config, catalog=catalog, runner=runner,
-                    log=node_log, speaker_a=speaker_a, speaker_b=speaker_b,
-                )
-            except Exception as exc:  # noqa: BLE001 - 单条 message 失败不该让整目录没有输出
-                node_log.warn(f"处理失败：{type(exc).__name__}: {exc}")
-            # 处理后再落一次盘（run_message 内部已写过，这里保证 current 与磁盘一致）。
-            write_memories(atommem_path, current)
-
-        runner.model.close()
-
-        return {
-            "dir": label, "status": "OK",
-            "messages": len(targets),
-            "atoms": len(current),
-        }
-
-
 def _primary_source(record: dict[str, Any]) -> str:
     """atom 的**第一个** source id（= 它最初由哪条 message 产出）。合并时保持不变。"""
     sources = (record.get("metadata") or {}).get("source") or []
     return str(sources[0]) if sources else ""
 
-
-def _session_prior(
-    messages: list[dict[str, Any]], position: int, session: int | None
-) -> list[dict[str, Any]]:
-    """取 target 之前、**同一会话**的消息作为消解指代的窗口。"""
-    if session is None:
-        return messages[:position]
-    prior: list[dict[str, Any]] = []
-    for record in messages[:position]:
-        if msg_session_number(memory_id(record)) == session:
-            prior.append(record)
-    return prior
 
 
 # ---------------------------------------------------------------------------
@@ -835,8 +933,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="每个目录只处理前 N 条 message（调试用）")
     parser.add_argument("--concurrency", type=int, default=None, help="覆盖目录级并发数")
     parser.add_argument("--max-steps", type=int, default=None, help="覆盖 agent 步数上限")
-    parser.add_argument("--mode", choices=["pipeline", "agent", "agent-v2"], default="agent-v2",
-                        help="处理模式：pipeline（三阶段）/ agent（串行agent）/ agent-v2（并行agent，默认）")
     return parser.parse_args(argv)
 
 
@@ -861,28 +957,13 @@ async def async_main(args: argparse.Namespace) -> None:
 
     async def one(directory: Path) -> dict[str, Any]:
         async with semaphore:
-            mode = args.mode
-            if mode == "agent-v2":
-                # 并行 agent：每个 message 独立运行，看全部先行内容
-                from .atommem_agent_v2 import run_dir_parallel
-                return await run_dir_parallel(
-                    directory, config, client, catalog, log,
-                    limit_messages=args.limit_messages,
-                )
-            elif mode == "pipeline":
-                # pipeline：召回 → 单次 LLM → 后处理
-                return await run_dir(
-                    directory, config, client, catalog, log,
-                    limit_messages=args.limit_messages,
-                    use_pipeline=True,
-                )
-            else:  # agent
-                # 串行 agent：逐 message 处理，后面看到前面的产出
-                return await run_dir(
-                    directory, config, client, catalog, log,
-                    limit_messages=args.limit_messages,
-                    use_pipeline=False,
-                )
+            # atommem 只走并行 code agent：每个 message 一个独立 agent，看到此前全部内容，
+            # 自己 grep msgmem/summem 消解指代，产出写进独立文件后合并（见 atommem_agent_v2）。
+            from .atommem_agent_v2 import run_dir_parallel
+            return await run_dir_parallel(
+                directory, config, client, catalog, log,
+                limit_messages=args.limit_messages,
+            )
 
     try:
         results = list(await asyncio.gather(*(one(d) for d in targets)))

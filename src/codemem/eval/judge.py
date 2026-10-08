@@ -41,7 +41,28 @@ _WEEKDAYS = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
 
 
 def _parse_date(text: str) -> "date | None":
-    """从一句回答里抽出日期。支持 ISO / day-first / month-first / 只有年月。"""
+    """从一句回答里抽出日期。支持相对表达 / ISO / day-first / month-first / 只有年月。
+
+    **先试相对表达**（"the week before X" / "the <weekday> before X"）：这种表达自带
+    锚点，是一个**完整、精确**的答案，必须用与 ``resolve_relative_date`` **完全相同**
+    的逻辑折算 —— 否则两边口径不一致，会把逐字相同的答案判成不同日期（实测：
+    reference="The week before 6 July 2023" 与 candidate="the week before 6 July 2023"
+    都该是 6-29，但旧的绝对日期分支把 candidate 里的 "6 July 2023" 抠出来算成 7-06，
+    差了整整一周）。所以相对表达优先，绝对日期兜底。
+    """
+    value = str(text or "")
+    relative = _resolve_relative_expression(value)
+    if relative is not None:
+        return relative
+    return _parse_absolute_date(value)
+
+
+def _parse_absolute_date(text: str) -> "date | None":
+    """从文本里抽出一个**绝对**日期。支持 ISO / day-first / month-first / 只有年月。
+
+    只认字面上出现的日期，**不解释任何相对修饰语**（"the week before" 之类由
+    ``_resolve_relative_expression`` 处理）。
+    """
     import re
     from datetime import date
 
@@ -73,20 +94,11 @@ def _parse_date(text: str) -> "date | None":
     return None
 
 
-def resolve_relative_date(reference: Any) -> "date | None":
-    """把参考里 ``the week/weekend/<weekday> before X`` 折算成绝对日期。
+def _resolve_relative_expression(text: str) -> "date | None":
+    """把 ``the week/weekend/<weekday> before X`` 折算成绝对日期（内部实现）。
 
-    **为什么要在这里算**：judge 是 8B 模型，"13 Sep 2023 是周三，之前的周末是 9-10 号"
-    这种推算它做不可靠 —— 实测同一条判 3 次都判错，而正确答案是确定的。
-    日期算术属于**确定性计算**，不该交给语言模型（本项目在 search 阶段已经就这一点
-    做过同样的取舍：相对时间交给确定性代码，而不是模型）。
-
-    支持的形式（大小写不敏感）：
-        the <weekday> before X      -> X 之前最近的那个星期几（严格早于 X）
-        the weekend before X        -> X 之前最近的周六
-        N weekends before X         -> X 之前第 N 个周六
-        the week before X           -> X - 7 天
-        N weeks before X            -> X - 7N 天
+    ``_parse_date``（解析答案）与 ``resolve_relative_date``（解析参考）**共用**这一个入口 ——
+    两边口径必须完全一致，否则逐字相同的两个答案会被算成不同日期。
 
     **两个实测踩过的坑**（后果都是把对的答案判成错的，比不折算更糟）：
 
@@ -100,7 +112,7 @@ def resolve_relative_date(reference: Any) -> "date | None":
     import re
     from datetime import timedelta
 
-    text = str(reference or "")
+    text = str(text or "")
 
     # ---- 星期几分支：必须先试，否则 "Friday" 的 "day" 会被下面的单位正则吃掉 ----
     match = re.search(
@@ -110,7 +122,7 @@ def resolve_relative_date(reference: Any) -> "date | None":
         text, re.IGNORECASE,
     )
     if match:
-        base = _parse_date(match.group(3))
+        base = _parse_absolute_date(match.group(3))
         if base is None:
             return None
         target = _WEEKDAYS[match.group(2).lower()]
@@ -128,7 +140,7 @@ def resolve_relative_date(reference: Any) -> "date | None":
     )
     if not match:
         return None
-    base = _parse_date(match.group(3))
+    base = _parse_absolute_date(match.group(3))
     if base is None:
         return None
 
@@ -140,6 +152,24 @@ def resolve_relative_date(reference: Any) -> "date | None":
     if unit == "day":
         return base - timedelta(days=count)
     return base - timedelta(days=7 * count)
+
+
+def resolve_relative_date(reference: Any) -> "date | None":
+    """把参考里 ``the week/weekend/<weekday> before X`` 折算成绝对日期。
+
+    **为什么要在这里算**：judge 是 8B 模型，"13 Sep 2023 是周三，之前的周末是 9-10 号"
+    这种推算它做不可靠 —— 实测同一条判 3 次都判错，而正确答案是确定的。
+    日期算术属于**确定性计算**，不该交给语言模型（本项目在 search 阶段已经就这一点
+    做过同样的取舍：相对时间交给确定性代码，而不是模型）。
+
+    支持的形式（大小写不敏感）：
+        the <weekday> before X      -> X 之前最近的那个星期几（严格早于 X）
+        the weekend before X        -> X 之前最近的周六
+        N weekends before X         -> X 之前第 N 个周六
+        the week before X           -> X - 7 天
+        N weeks before X            -> X - 7N 天
+    """
+    return _resolve_relative_expression(str(reference or ""))
 
 
 _COUNT_WORDS = {"a": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
