@@ -104,9 +104,9 @@ python -m codemem.add --stage msgmem       # 只跑第一层（纯 CPU，不调�
 python -m codemem.add --stage atommem --limit-messages 20   # 只跑前 20 条 message（调试）
 ```
 
-> **atommem 只有一种实现：并行 add agent**（见 §1.1）。曾经有过"三阶段 pipeline"与"串行
-> agent"两个变体，实测**都过度合并**（一条消息只出一个原子），检索命中率显著低于 agent 的
-> 细拆分，已删除（2026-10-08）。
+> **atommem 默认走三阶段 pipeline**（单次 LLM 抽取 + 后处理），这是产出 1000+ 条、judge 最高
+> 的那一版。另有并行 code agent（`--mode agent-v2`）与串行 agent（`--mode agent`），用于对比；
+> agent 更灵活但 8B 在 loop 里**不稳定**（同一条消息多次跑产出 0/2/4 不等），故不作默认。
 
 **三层，产出三种记忆文件**（都在 `data/{speaker_a}_{speaker_b}/` 下，JSONL 一行一条）：
 
