@@ -189,16 +189,14 @@
     ]
   },
   "time_policy": {
-    "headline": "Time: a record's date is WHEN IT WAS SAID, not when the event happened. Never write the session date as the event date.",
+    "headline": "Time: keep the source's OWN time wording and attach its session-date anchor. Do NOT convert a relative phrase into a date unless it is exact and trivial (a single 'yesterday').",
     "rules": [
-      "**This is the mistake to avoid above all others.** A message dated <session date> that says 'I did X last week' establishes X as **the week before <session date>** -- NOT <session date>. The session timestamp is only the **anchor** you count back from.",
-      "**NEVER put the session's own date into the content as if the event happened then.** A record like '<event> on <session date> (she said last year)' is WRONG -- the event was a year before; you copied the anchor. If you write a date into the content, it MUST be the resolved event date.",
-      "**Compute when you can: lead with the computed date.** 'yesterday' on a <session date> message -> 'did X on <session date minus 1 day>'. Use `date -d`; never compute in your head.",
-      "**When you CANNOT compute, lead with the anchored phrase and give NO raw date.** 'I read this book last year' (message dated <session date>) -> '<person> read the book in <year-1>, a year before the <session date> conversation' -- NOT 'on <session date>'. Never sharpen a coarse unit ('last year' -> a year) into a day.",
-      "**Restate the source's own words, then anchor them.** Do this in every time record: `<person> said she did X 'last week' (message dated <session date>) -- i.e. the week before <session date>.`",
-      "**An anchored phrase IS the answer.** 'the week before <date>', 'the <weekday> before <date>' are exact and complete. Keep them as written; the anchor alone ('<date>') is NOT acceptable.",
-      "**Never leave a relative word unanchored.** 'next month' alone means nothing to a reader who cannot see the session -- write '<the month after the conversation date>'. Read what unit the source used and answer at that unit, not finer.",
-      "A period is a valid answer: '<month> <year>', 'the week of <date>' are complete when that is all the source supports."
+      "**preserve, don't convert -- the core rule.** A relative phrase ('last week', 'last Friday', 'the week before X', 'N years ago') becomes a COMPLETE, precise answer once you attach its anchor. Keep it AS WRITTEN; converting to an absolute date is lossy and error-prone.",
+      "**The session timestamp is only the ANCHOR, never the event date.** A message dated <session date> saying 'I did X last week' means X happened **the week before <session date>** -- NOT on <session date>. A record like '<event> on <session date>' is WRONG (you copied the anchor).",
+      "**Only compute an absolute date when exact and trivial.** 'yesterday'/'today'/'tomorrow' -> the exact calendar date; 'last/next <weekday>' -> that weekday's date (use `date -d`, never mental math). EVERYTHING ELSE -- 'last week', 'the week before X', 'N years ago', 'recently' -- stays an ANCHORED PHRASE, unconverted.",
+      "**Verbatim template for every time record:** `<person> did X 'last week' (message dated <session date>) -- i.e. the week before <session date>.` The quoted source wording stays; the anchor is attached right after.",
+      "**Read the unit the source used; answer at that unit, never finer.** 'last week' -> 'the week before X' (a week-window, NOT a day). 'last year' -> a year. An anchored phrase ('the week before <date>', 'the <weekday> before <date>') IS the answer; the bare anchor alone is NOT.",
+      "**Never leave a relative word unanchored.** 'next month' alone means nothing to a reader who cannot see the session -- write '<the month after the conversation date>'."
     ]
   },
   "schema": {

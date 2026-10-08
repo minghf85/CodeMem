@@ -194,7 +194,8 @@ def test_toolcfg(tmp: Path) -> None:
     check("时间策略：不得编造更细的精度", "granularity" in rendered
           or "not finer" in rendered)
     check("时间策略：按源语料的单位作答", "unit" in rendered)
-    check("时间策略：禁止把会话日期当事件日期写进内容", "session's own date" in rendered)
+    check("时间策略：禁止把会话日期当事件日期写进内容", "never the event date" in rendered
+          or "copied the anchor" in rendered)
     check("时间策略：相对表达保留原样", "KEPT AS WRITTEN" in rendered
           or "as written" in rendered)
     check("时间策略：保留锚点表述", "the week before <date>" in rendered

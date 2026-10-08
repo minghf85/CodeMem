@@ -909,6 +909,131 @@ def _absorb(kept: dict[str, Any], atom: dict[str, Any]) -> None:
         kept_meta["changelog"] = atom["metadata"].get("changelog")
 
 
+async def run_dir(
+    directory: Path,
+    config: dict[str, Any],
+    client: openai.AsyncOpenAI,
+    catalog: toolcfg.ToolCatalog,
+    log: Logger,
+    *,
+    limit_messages: int = 0,
+    use_pipeline: bool = True,
+) -> dict[str, Any]:
+    """对一个目录的 msgmem **逐 message 串行**跑 atom 抽取，就地写 atommem.jsonl。
+
+    串行的意义：处理第 N 条 message 时，`atommem.jsonl` 里已经有前 N-1 条产出的 atom，
+    能召回它们（"跨 session 影响"就靠这个）。所以每处理一条就**增量落盘**一次。
+
+    use_pipeline=True（默认）：用三阶段 pipeline（召回 → 单次 LLM → 后处理），稳定快速。
+    use_pipeline=False：用 agent loop（兼容旧行为，但不稳定）。
+    """
+    label = directory.name
+    files = directory_files(directory)
+    msg_path = files["msgmem"]
+    if not msg_path.exists():
+        return {"dir": label, "status": "SKIPPED",
+                "reason": f"no {MSGMEM_NAME}（先跑 add --stage msgmem）"}
+    messages = read_jsonl(msg_path)
+    summaries_by_session = group_by_session(read_jsonl(files["summem"]))
+    summaries = {number: records[0] for number, records in summaries_by_session.items() if records}
+
+    atommem_path = files["atommem"]
+    known = {memory_id(m) for m in messages}
+    current: list[dict[str, Any]] = read_jsonl(atommem_path)
+
+    speaker_a, speaker_b = parse_dir_label(label)
+    targets = messages if not limit_messages else messages[:limit_messages]
+
+    if use_pipeline:
+        # ============ Pipeline 模式 ============
+        from .atommem_pipeline import run_message_pipeline
+
+        for target in targets:
+            node_log = log.bind(f"{label}:{memory_id(target)}")
+            # 幂等：移除本 message 最初产出的 atom
+            current = [
+                a for a in current
+                if _primary_source(a) != memory_id(target)
+                or not (set((a.get("metadata") or {}).get("source") or []) & known)
+            ]
+            try:
+                new_atoms = await run_message_pipeline(
+                    target=target,
+                    msgmem=messages,
+                    existing_atoms=current,
+                    client=client,
+                    config=config,
+                    log=node_log,
+                    speaker_a=speaker_a,
+                    speaker_b=speaker_b,
+                )
+                # 合并到当前语料
+                current.extend(new_atoms)
+                # 去重
+                current = _dedup_atoms(current)
+                # 落盘
+                write_memories(atommem_path, current)
+            except Exception as exc:  # noqa: BLE001
+                node_log.warn(f"处理失败：{type(exc).__name__}: {exc}")
+
+        return {
+            "dir": label, "status": "OK",
+            "messages": len(targets),
+            "atoms": len(current),
+        }
+
+    else:
+        # ============ Agent Loop 模式（旧行为，保留用于对比）============
+        workspace = directory
+        runner = _Runner(client, config, log, directory / ".atommem.model_calls.jsonl")
+
+        for position, target in enumerate(targets):
+            session = msg_session_number(memory_id(target))
+            prior = _session_prior(messages, position, session)
+            node_log = log.bind(f"{label}:{memory_id(target)}")
+
+            # 幂等：重跑一条 message 时，先移除它**最初产出**的 atom（primary source = 本 message），
+            # 再让 agent 重新生成/合并。历史里 source 不在 msgmem 的 atom（手动标的）原样保留。
+            current = [
+                a for a in current
+                if _primary_source(a) != memory_id(target)
+                or not (set((a.get("metadata") or {}).get("source") or []) & known)
+            ]
+            # 处理前把当前视图落盘（增量：第 N 条看见前 N-1 条产出的 atom）。
+            write_memories(atommem_path, current)
+            try:
+                current = await run_message(
+                    target=target, prior=prior, summaries=summaries, workspace=workspace,
+                    atommem_path=atommem_path, config=config, catalog=catalog, runner=runner,
+                    log=node_log, speaker_a=speaker_a, speaker_b=speaker_b,
+                )
+            except Exception as exc:  # noqa: BLE001 - 单条 message 失败不该让整目录没有输出
+                node_log.warn(f"处理失败：{type(exc).__name__}: {exc}")
+            # 处理后再落一次盘（run_message 内部已写过，这里保证 current 与磁盘一致）。
+            write_memories(atommem_path, current)
+
+        runner.model.close()
+
+        return {
+            "dir": label, "status": "OK",
+            "messages": len(targets),
+            "atoms": len(current),
+        }
+
+
+def _session_prior(
+    messages: list[dict[str, Any]], position: int, session: int | None
+) -> list[dict[str, Any]]:
+    """取 target 之前、**同一会话**的消息作为消解指代的窗口。"""
+    if session is None:
+        return messages[:position]
+    prior: list[dict[str, Any]] = []
+    for record in messages[:position]:
+        if msg_session_number(memory_id(record)) == session:
+            prior.append(record)
+    return prior
+
+
 def _primary_source(record: dict[str, Any]) -> str:
     """atom 的**第一个** source id（= 它最初由哪条 message 产出）。合并时保持不变。"""
     sources = (record.get("metadata") or {}).get("source") or []
@@ -933,6 +1058,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="每个目录只处理前 N 条 message（调试用）")
     parser.add_argument("--concurrency", type=int, default=None, help="覆盖目录级并发数")
     parser.add_argument("--max-steps", type=int, default=None, help="覆盖 agent 步数上限")
+    parser.add_argument("--mode", choices=["pipeline", "agent", "agent-v2"], default="pipeline",
+                        help="处理模式：pipeline（三阶段，默认，效果最好）/ agent（串行agent）/ agent-v2（并行agent）")
     return parser.parse_args(argv)
 
 
@@ -957,13 +1084,16 @@ async def async_main(args: argparse.Namespace) -> None:
 
     async def one(directory: Path) -> dict[str, Any]:
         async with semaphore:
-            # atommem 只走并行 code agent：每个 message 一个独立 agent，看到此前全部内容，
-            # 自己 grep msgmem/summem 消解指代，产出写进独立文件后合并（见 atommem_agent_v2）。
+            mode = args.mode
+            if mode == "pipeline":
+                return await run_dir(directory, config, client, catalog, log,
+                                     limit_messages=args.limit_messages, use_pipeline=True)
+            if mode == "agent":
+                return await run_dir(directory, config, client, catalog, log,
+                                     limit_messages=args.limit_messages, use_pipeline=False)
             from .atommem_agent_v2 import run_dir_parallel
-            return await run_dir_parallel(
-                directory, config, client, catalog, log,
-                limit_messages=args.limit_messages,
-            )
+            return await run_dir_parallel(directory, config, client, catalog, log,
+                                          limit_messages=args.limit_messages)
 
     try:
         results = list(await asyncio.gather(*(one(d) for d in targets)))
