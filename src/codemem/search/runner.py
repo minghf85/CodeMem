@@ -74,6 +74,10 @@ CORPUS_FILES = ("msgmem.jsonl", "summem.jsonl", "atommem.jsonl")
 DEFAULT_CONFIG: dict[str, Any] = {
     "generator": {"base_url": "http://127.0.0.1:30000/v1", "api_key": "sglang", "model": "local",
                   "temperature": 0.2, "max_tokens": 4096, "enable_thinking": False},
+    # 原生函数调用：true 时把工具 schema 作为 OpenAI `tools=` 传给端点（而不是靠 prompt 里的
+    # 文本协议）。给**不遵守文本协议的模型**（如 gpt-4o-mini）用 —— 否则它会把 prompt 示例里的
+    # 命令原样当纯文本吐回，解析不出工具调用、一步都不调、零证据。也可写在 generator 段里。
+    "native_tools": False,
     "max_steps": 30,
     "no_progress_patience": 6,
     "max_verify_rounds": 2,
@@ -176,9 +180,61 @@ def gen_call_config(config: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+def native_tools_from_config(
+    config: dict[str, Any], catalog: "toolcfg.ToolCatalog", section: str = "generator"
+) -> list[dict[str, Any]] | None:
+    """按配置决定要不要用**原生函数调用**；要就把工具 schema 从 ``catalog`` 渲染出来。
+
+    ``native_tools`` 真值即启用，可写在模型子段（默认 ``generator``）或顶层。给**不遵守
+    文本协议的模型**（如 gpt-4o-mini）用 —— 否则它会把 prompt 示例里的命令当纯文本吐回、
+    一步工具都不调（见 ``ModelRunner``）。未启用返回 ``None``。
+
+    统一放在这里，让离线 search、API 检索、add 侧 agent 三处走**同一份**判定逻辑，
+    不会各写各的、各漏一处。
+    """
+    sub = config.get(section) or {}
+    enabled = bool(sub.get("native_tools")) if isinstance(sub, dict) else False
+    enabled = enabled or bool(config.get("native_tools"))
+    return catalog.openai_tool_specs() if enabled else None
+
+
 # ---------------------------------------------------------------------------
 # 模型调用
 # ---------------------------------------------------------------------------
+
+def message_to_reply(message: Any) -> tuple[str, int]:
+    """把一次模型回复折回 agent loop 已经在用的**文本协议**。
+
+    返回 ``(reply_text, dropped_tool_calls)``：
+
+    - 有原生 ``tool_calls`` → 取第一次调用，序列化成 ``{"tool": ..., "args": {...}}``
+      （就是 ``toolcfg.parse_tool_call`` 认的形状）。**文本协议和原生函数调用因此走同一条
+      解析路径 —— agent loop 一个字都不用改。**
+    - 没有 ``tool_calls`` → 原样返回正文（在 agent 协议里这是"做完了"信号）。
+
+    ``dropped_tool_calls`` 是本次被丢弃的并行调用数（>0 说明模型一次给了多个）。本 loop 一步
+    只执行一个调用，所以只取第一个并让调用方记账 —— 观测结果会让模型下一轮自然重发其余调用，
+    不静默丢工作。
+
+    为什么必须折回文本、而不是让上层直接吃 message 对象：``run_agent_round`` 的每一步、
+    ``_RepeatTracker``、``compact_messages`` 的摘要全都建立在"回复是一个字符串"之上。
+    在这里做一次转换，比把整条链路改成对象便宜得多，也让两种后端的行为在 loop 里完全一致。
+    """
+    calls = getattr(message, "tool_calls", None) or []
+    if not calls:
+        return message.content or "", 0
+    call = calls[0]
+    function = getattr(call, "function", None)
+    name = str(getattr(function, "name", "") or "")
+    arguments = getattr(function, "arguments", "") or "{}"
+    try:
+        args = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError):
+        args = {}
+    if not isinstance(args, dict):
+        args = {"value": args}
+    return json.dumps({"tool": name, "args": args}, ensure_ascii=False), len(calls) - 1
+
 
 class ModelRunner:
     """封装生成模型：带重试、统计调用数、可选地把每次调用落盘。
@@ -194,30 +250,53 @@ class ModelRunner:
     默认只记 ``raw``（模型的原始输出）+ 元信息，排错需要的正是这些；要复现"模型当时
     看到了什么"时再开 ``--log-full-messages``（或直接看 debug 日志 —— 它本来就打印完整
     prompt 与观测）。
+
+    ``native_tools``：给了就用 **OpenAI 原生函数调用**（把 ``catalog.openai_tool_specs()``
+    的 schema 作为 ``tools=`` 传给端点）。这是给**不遵守文本协议**的模型（如 gpt-4o-mini）
+    准备的 —— 它们会把 prompt 里示例的命令当纯文本吐出来，一步工具都不调。verifier 永远
+    不用原生工具（它要的是 JSON 判定文本，不是动作）。
     """
 
     def __init__(self, client: openai.AsyncOpenAI, config: dict[str, Any],
                  log: Logger, raw_log_path: Path | None = None,
-                 full_messages: bool = False) -> None:
+                 full_messages: bool = False,
+                 native_tools: list[dict[str, Any]] | None = None) -> None:
         self.client = client
         self.config = config
         self.log = log
         self.raw_log_path = raw_log_path
         self.full_messages = full_messages
+        self.native_tools = native_tools
         self.calls = 0
         self.failures = 0
+        self.dropped_tool_calls = 0
         self._raw_handle = raw_log_path.open("w", encoding="utf-8") if raw_log_path else None
         self._lock = asyncio.Lock()
 
     async def __call__(self, messages: list[dict[str, str]], meta: dict[str, Any]) -> str:
-        from ..llm import chat_completion
+        from ..llm import chat_completion, chat_completion_message
 
         async with self._lock:
             self.calls += 1
             call_index = self.calls
         role = meta.get("role", "agent")
+        # 只有 agent 用原生工具；verifier 要的是纯文本 JSON 判定。
+        use_tools = self.native_tools if role == "agent" else None
         try:
-            raw = await chat_completion(self.client, self.config, messages)
+            if use_tools:
+                message = await chat_completion_message(
+                    self.client, self.config, messages, tools=use_tools
+                )
+                raw, dropped = message_to_reply(message)
+                if dropped:
+                    async with self._lock:
+                        self.dropped_tool_calls += dropped
+                    self.log.warn(
+                        f"模型调用 #{call_index} 返回 {dropped + 1} 个并行工具调用，"
+                        f"本步只执行第一个，其余丢弃 {dropped} 个"
+                    )
+            else:
+                raw = await chat_completion(self.client, self.config, messages)
         except Exception as exc:  # noqa: BLE001 - 模型调用失败不炸整条 QA
             async with self._lock:
                 self.failures += 1
@@ -247,7 +326,8 @@ class ModelRunner:
         return raw
 
     def stats(self) -> dict[str, Any]:
-        return {"calls": self.calls, "failures": self.failures}
+        return {"calls": self.calls, "failures": self.failures,
+                "dropped_tool_calls": self.dropped_tool_calls}
 
     def close(self) -> None:
         if self._raw_handle is not None:
@@ -1006,9 +1086,14 @@ async def run_dir(
 
     # 每次模型调用落盘：默认只记原始输出（完整 messages 会把体积放大十几倍，见 ModelRunner）
     raw_log_path = out_dir / f"{label}.model_calls.jsonl"
+    # 原生函数调用（给不遵守文本协议的模型用；见 ModelRunner）。
+    native_tools = native_tools_from_config(config, catalog, "generator")
+    if native_tools:
+        log.info(f"原生函数调用：启用（{len(native_tools)} 个工具 schema 随请求下发）")
     model = ModelRunner(
         generator, gen_call_config(config), log, raw_log_path,
         full_messages=bool(config.get("log_full_messages", False)),
+        native_tools=native_tools,
     )
     semaphore = asyncio.Semaphore(max(1, int(config.get("concurrency", 4))))
     qa_path = out_dir / f"{label}.qa_trajectories.jsonl"
@@ -1196,6 +1281,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None, help="覆盖 max_steps")
     parser.add_argument("--max-verify-rounds", type=int, default=None, help="覆盖 max_verify_rounds")
     parser.add_argument("--concurrency", type=int, default=None, help="覆盖 QA 级并发")
+    parser.add_argument("--native-tools", dest="native_tools", action="store_true", default=None,
+                        help="强制启用原生函数调用（OpenAI tools=）；覆盖配置")
+    parser.add_argument("--no-native-tools", dest="native_tools", action="store_false",
+                        help="强制关闭原生函数调用（回退到 prompt 里的文本 JSON 协议）")
     parser.add_argument("--experiment", default="search", help="实验名，作为输出子目录前缀")
     parser.add_argument("--output-dir", default=str(DATA_DIR / "search_runs"), help="输出根目录")
     parser.add_argument("--prune-runs", action="store_true",
@@ -1261,6 +1350,8 @@ async def async_main(args: argparse.Namespace) -> None:
     ):
         if override is not None:
             config[key] = override
+    if args.native_tools is not None:
+        config.setdefault("generator", {})["native_tools"] = args.native_tools
     if args.log_full_messages:
         config["log_full_messages"] = True
 

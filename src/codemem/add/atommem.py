@@ -258,13 +258,20 @@ def build_messages(
 # ---------------------------------------------------------------------------
 
 class _Runner:
-    """把整体的重试参数与模型配置合成一份，供 ``ModelRunner`` 使用。"""
+    """把整体的重试参数与模型配置合成一份，供 ``ModelRunner`` 使用。
+
+    ``native_tools``：给不遵守文本协议的模型（如 gpt-4o-mini）下发的原生工具 schema。
+    由调用方用 ``search.runner.native_tools_from_config`` 从 ``catalog`` 渲染后传入；
+    ``None`` 表示走文本 JSON 协议（微调过的 Qwen3-8B 用这条）。
+    """
 
     def __init__(self, client: openai.AsyncOpenAI, config: dict[str, Any], log: Logger,
-                 raw_path: Path | None = None) -> None:
+                 raw_path: Path | None = None,
+                 native_tools: list[dict[str, Any]] | None = None) -> None:
         from ..search.runner import ModelRunner
 
-        self.model = ModelRunner(client, gen_call_config(config, "atommem"), log, raw_path)
+        self.model = ModelRunner(client, gen_call_config(config, "atommem"), log, raw_path,
+                                 native_tools=native_tools)
 
 
 async def run_message(
@@ -1013,7 +1020,10 @@ async def run_dir(
         summaries_by_session = group_by_session(read_jsonl(files["summem"]))
         summaries = {number: records[0] for number, records in summaries_by_session.items() if records}
         workspace = directory
-        runner = _Runner(client, config, log, directory / ".atommem.model_calls.jsonl")
+        from ..search.runner import native_tools_from_config
+
+        runner = _Runner(client, config, log, directory / ".atommem.model_calls.jsonl",
+                         native_tools=native_tools_from_config(config, catalog, "atommem"))
 
         for position, target in enumerate(targets):
             session = msg_session_number(memory_id(target))

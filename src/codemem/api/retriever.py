@@ -186,6 +186,8 @@ async def search(
         client, runner_mod.gen_call_config(agent_cfg), log,
         run_dir / "model_calls.jsonl",
         full_messages=bool(agent_cfg.get("log_full_messages", False)),
+        # 原生函数调用：不遵守文本协议的模型（如 gpt-4o-mini）必须开，否则一步工具都不调。
+        native_tools=runner_mod.native_tools_from_config(agent_cfg, catalog, "generator"),
     )
 
     try:

@@ -36,17 +36,21 @@ from .store import UserStore
 CONFIG_FILE = PROJECT_ROOT / "configs" / "api.yaml"
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    # 离线配置来源：API 的模型与行为**直接复用**它们（见 load_config / _merge_offline_configs）
+    "search_config": "configs/search.yaml",
+    "add_config": "configs/add.yaml",
+    "tool_config": "configs/tool.json",
+    # API 自有：存储 / 并发 / 检索默认
+    "store_dir": "data/api_store",
+    "concurrency": 8,
+    "add_concurrency": 8,
+    "top_k": 100,
+    "log": {"level": "info", "output": "data/api_runs"},
+    # 下面这些会被离线配置覆盖（这里给缺省，离线文件缺失时兜底）。
     "generator": {"base_url": "http://127.0.0.1:30000/v1", "api_key": "sglang", "model": "local",
                   "temperature": 0.2, "max_tokens": 4096, "enable_thinking": False},
     "index": {"base_url": "http://127.0.0.1:30000/v1", "api_key": "sglang", "model": "local",
               "temperature": 0.2, "max_tokens": 4096, "enable_thinking": False},
-    "store_dir": "data/api_store",
-    "tool_config": "configs/tool.json",
-    "add_tool_config": "configs/add_tool.json",
-    "concurrency": 8,
-    "add_concurrency": 8,
-    "top_k": 100,
-    # Add 侧：summem / atommem 的预算（atommem 是逐 message 的 add agent，默认 8 步）
     "add_max_steps": 8,
     "timeout": 300,
     "max_retries": 3,
@@ -54,12 +58,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "rate_limit_backoff": 10.0,
     "max_backoff": 60.0,
     "backoff_jitter": 0.2,
-    "log": {"level": "info", "output": "data/api_runs"},
 }
+
+#: search.yaml 里属于 search agent（API 的 Search 走 agent loop）的键 —— 提到 API 顶层。
+_SEARCH_TOP_LEVEL_KEYS = (
+    "max_steps", "no_progress_patience", "max_verify_rounds", "observation_max_chars",
+    "write_nudge_after", "evidence_soft_limit", "context_max_chars", "context_keep_recent",
+    "bash_timeout", "repeat_limit", "max_parse_retries", "timeout", "max_retries",
+    "backoff_base", "rate_limit_backoff", "max_backoff", "backoff_jitter",
+)
+#: add.yaml 里属于 add 侧（summem + atommem pipeline）模型/行为的键 —— 放进 API 的 ``index`` 段。
+_ADD_INDEX_KEYS = (
+    "model", "base_url", "api_key", "temperature", "max_tokens", "enable_thinking",
+    "context_window", "timeout", "max_retries", "backoff_base", "rate_limit_backoff",
+    "max_backoff", "backoff_jitter",
+)
 
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]:
-    """读 ``configs/api.yaml``，缺省值兜底（与其它步骤同形）。"""
+    """读 ``configs/api.yaml``，再把离线 ``search.yaml`` / ``add.yaml`` 并进来（缺省值兜底）。"""
     config = json.loads(json.dumps(DEFAULT_CONFIG))
     target = Path(path) if path else CONFIG_FILE
     if target.exists():
@@ -70,7 +87,42 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
                     config[key].update(value)
                 else:
                     config[key] = value
+    _merge_offline_configs(config)
     return config
+
+
+def _merge_offline_configs(config: dict[str, Any]) -> None:
+    """把离线 ``search.yaml`` / ``add.yaml`` 的模型与行为并进 API 配置（就地修改）。
+
+    只在离线文件**确实给了**该键时才覆盖 —— 文件缺失 / 少字段时保留 api.yaml 与默认值，
+    不会因为读不到文件就把 API 打回"本地模型"。
+    """
+    from ..add import atommem as atommem_mod
+    from ..search import runner as search_runner
+
+    search_path = _resolve_path(config.get("search_config") or "configs/search.yaml")
+    if search_path.exists():
+        search_cfg = search_runner.load_config(search_path)
+        if isinstance(search_cfg.get("generator"), dict):
+            config["generator"] = dict(search_cfg["generator"])
+        for key in _SEARCH_TOP_LEVEL_KEYS:
+            if key in search_cfg:
+                config[key] = search_cfg[key]
+        if search_cfg.get("concurrency") is not None:
+            config["concurrency"] = search_cfg["concurrency"]
+
+    add_path = _resolve_path(config.get("add_config") or "configs/add.yaml")
+    if add_path.exists():
+        add_cfg = atommem_mod.load_config(add_path)
+        index = dict(config.get("index") or {})
+        for key in _ADD_INDEX_KEYS:
+            if add_cfg.get(key) is not None:
+                index[key] = add_cfg[key]
+        config["index"] = index
+        if add_cfg.get("max_steps") is not None:
+            config["add_max_steps"] = add_cfg["max_steps"]
+        if add_cfg.get("concurrency") is not None:
+            config["add_concurrency"] = add_cfg["concurrency"]
 
 
 # ---------------------------------------------------------------------------

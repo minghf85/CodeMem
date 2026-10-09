@@ -65,7 +65,8 @@ async def fake_chat_completion(client, config, messages):  # noqa: ANN001
 
     - verifier（"evidence auditor"）→ 判足够
     - summem（"You summarize ONE session"）→ 一段会话总结
-    - atommem agent（默认）→ 第一轮 append 一条 atom，之后回纯文本表示完成
+    - atommem **pipeline**（"extracting atomic facts"）→ 一个 JSON 数组（time_expr 交给代码解析）
+    - search agent（"You build the evidence"）→ 写 evidence.jsonl
     """
     system = str(messages[0].get("content", "")) if messages else ""
 
@@ -82,6 +83,13 @@ async def fake_chat_completion(client, config, messages):  # noqa: ANN001
             "memory": "Caroline went to a LGBTQ support group on 7 May 2023.",
         })
 
+    # atommem pipeline：单次抽取，返回 JSON 数组（memory 不含时间词，时间走 time_expr）
+    if "extracting atomic facts" in system:
+        return json.dumps([
+            {"memory": "Caroline went to an LGBTQ support group",
+             "time_expr": "yesterday", "role": "Caroline", "tag": ["activity:group"]},
+        ])
+
     # search 的 agent loop（system 说 "You build the evidence"）：写 evidence.jsonl
     if "You build the evidence" in system or "evidence.jsonl" in system:
         has_assistant = any(m.get("role") == "assistant" for m in messages)
@@ -91,7 +99,7 @@ async def fake_chat_completion(client, config, messages):  # noqa: ANN001
                 "path": "evidence.jsonl", "append": body}})
         return "The evidence already answers the question."
 
-    # atommem agent: 第一轮 append 一条 atom，之后回纯文本表示完成
+    # 其它（add agent 模式等）：第一轮 append 一条 atom，之后回纯文本表示完成
     has_assistant = any(m.get("role") == "assistant" for m in messages)
     if not has_assistant:
         body = json.dumps({
@@ -163,7 +171,6 @@ def _app_with_temp_store(tmp: Path):
     config = {
         "store_dir": str(tmp / "store"),
         "tool_config": str(PROJECT_ROOT / "configs" / "tool.json"),
-        "add_tool_config": str(PROJECT_ROOT / "configs" / "add_tool.json"),
         "generator": {"base_url": "http://127.0.0.1:1/v1", "model": "fake"},
         "index": {"base_url": "http://127.0.0.1:1/v1", "model": "fake"},
         "top_k": 100,
@@ -227,8 +234,11 @@ def test_endpoints(tmp: Path) -> None:
           atoms and atoms[0]["metadata"]["type"] == "atom"
           and "session_1_1" in atoms[0]["metadata"]["source"],
           str(atoms[:1]))
-    check("atom 的 memory 消解了时间",
-          atoms and "7 May 2023" in atoms[0]["memory"], str(atoms[:1]))
+    # pipeline 把时间从 memory 里剥离、解析进 metadata.time（"yesterday" → 锚点前一日）
+    check("atom 的时间解析进 metadata.time",
+          atoms and atoms[0]["metadata"]["time"] == "7 May 2023", str(atoms[:1]))
+    check("atom 的 memory 不含时间词",
+          atoms and "yesterday" not in atoms[0]["memory"].lower(), str(atoms[:1]))
 
     # 幂等：同一个 request_id 再送一次
     resp2 = client.post("/add", json=add_body)

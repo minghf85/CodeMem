@@ -131,12 +131,19 @@ def backoff_seconds(exc: Exception, attempt: int, config: dict[str, Any]) -> flo
 # 调用
 # ---------------------------------------------------------------------------
 
-async def chat_completion(
+async def _complete_choice(
     client: openai.AsyncOpenAI,
     config: dict[str, Any],
     messages: list[dict[str, Any]],
-) -> str:
-    """调一次 chat completion 并返回正文。失败按 ``max_retries`` 重试。
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    require_text: bool = True,
+) -> Any:
+    """调一次 chat completion，返回 ``choices[0]``。失败按 ``max_retries`` 重试。
+
+    ``tools`` 非空时走 **OpenAI 原生函数调用**（``tools=`` 参数）。这一模式下结果是
+    ``message.tool_calls``，``content`` 可以是空的 —— 所以此时传 ``require_text=False``，
+    把"空正文"从错误降级为合法状态（"既没有正文也没有工具调用"仍然算失败、要重试）。
 
     配置里若指定了与 ``client`` 不同的 ``base_url``，**显式切换** —— OpenAI SDK 的默认
     client 会忽略请求级 base_url，导致请求被静默发到旧地址（这个坑踩过）。
@@ -153,6 +160,12 @@ async def chat_completion(
         "max_tokens": config.get("max_tokens", 4096),
         "stream": False,
     }
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "auto"
+        # agent loop 一步只执行一个调用，所以要求端点一次只给一个（否则并行调用会被丢弃）。
+        # 这是可选参数：不支持的端点 400，下面的循环会把它去掉再试。
+        kwargs["parallel_tool_calls"] = False
     # 只有 qwen3 端点支持关闭思考；其它端点会因未知参数 400。
     if "qwen3" in str(config.get("model", "")).lower() and config.get("enable_thinking") is False:
         kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
@@ -165,19 +178,35 @@ async def chat_completion(
             response = await client.chat.completions.create(**kwargs)
             choice = response.choices[0]
             message = choice.message
+            tool_calls = getattr(message, "tool_calls", None)
             content = message.content or ""
-            if not content.strip():
-                # 关思考后偶发空回复：补 reasoning 兜底，仍空则当瞬时错误重试
-                content = (getattr(message, "reasoning", None) or "").strip()
-            if not content:
-                raise RuntimeError("empty completion content")
-            if getattr(choice, "finish_reason", None) == "length":
-                raise TruncatedCompletion(
-                    f"completion truncated by max_tokens (tail: {content[-80:]!r})"
-                )
-            return content
+            if require_text:
+                if not content.strip():
+                    # 关思考后偶发空回复：补 reasoning 兜底，仍空则当瞬时错误重试
+                    content = (getattr(message, "reasoning", None) or "").strip()
+                if not content:
+                    raise RuntimeError("empty completion content")
+                if getattr(choice, "finish_reason", None) == "length":
+                    raise TruncatedCompletion(
+                        f"completion truncated by max_tokens (tail: {content[-80:]!r})"
+                    )
+            else:
+                # 原生工具调用：有 tool_calls 就成功；都没有才算失败。
+                if not tool_calls and not content.strip():
+                    raise RuntimeError("empty completion content (no tool_calls)")
+                if not tool_calls and getattr(choice, "finish_reason", None) == "length":
+                    raise TruncatedCompletion(
+                        f"completion truncated by max_tokens (tail: {content[-80:]!r})"
+                    )
+            return choice
         except openai.APIStatusError as exc:
             last_error = exc
+            # 端点不认识 ``parallel_tool_calls``（可选参数）就 400 —— 去掉它再试一次，
+            # 而不是把整次调用判死。工具本身仍能正常工作，只是可能一次给多个调用。
+            if (exc.status_code == 400 and "parallel_tool_calls" in kwargs
+                    and "parallel_tool_calls" in str(exc)):
+                kwargs.pop("parallel_tool_calls", None)
+                continue
             if exc.status_code in non_retryable:
                 raise
         except Exception as exc:  # noqa: BLE001 - 连接/超时/解析等瞬时错误
@@ -188,6 +217,39 @@ async def chat_completion(
     if isinstance(last_error, TruncatedCompletion):
         raise TruncatedCompletion(f"chat completion failed after retries: {last_error}")
     raise RuntimeError(f"chat completion failed after retries: {last_error}")
+
+
+async def chat_completion(
+    client: openai.AsyncOpenAI,
+    config: dict[str, Any],
+    messages: list[dict[str, Any]],
+) -> str:
+    """调一次 chat completion 并返回正文（文本协议：正文就是全部信息）。"""
+    choice = await _complete_choice(client, config, messages, require_text=True)
+    message = choice.message
+    content = message.content or ""
+    if not content.strip():
+        # 关思考后偶发空回复：补 reasoning 兜底（返回值不再校验，故这里再兜一次）
+        content = (getattr(message, "reasoning", None) or "").strip()
+    return content
+
+
+async def chat_completion_message(
+    client: openai.AsyncOpenAI,
+    config: dict[str, Any],
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> Any:
+    """调一次并返回 assistant **message 对象**（含原生 ``tool_calls``）。
+
+    给"用原生函数调用而不是文本协议"的模型（如 gpt-4o-mini）用：``tools`` 非空时走
+    ``tools=``，``message.tool_calls`` 是要执行的动作，``message.content`` 是纯文本
+    （在 agent 协议里就是"做完了"信号）。调用方负责把两者折回自己的协议。
+    """
+    choice = await _complete_choice(
+        client, config, messages, tools=tools or None, require_text=not tools
+    )
+    return choice.message
 
 
 async def complete(

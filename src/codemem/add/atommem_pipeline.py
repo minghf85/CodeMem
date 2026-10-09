@@ -37,7 +37,7 @@ Forbidden words in memory: yesterday, today, tomorrow, ago, last, next, past, re
 
 Instead:
 - Put the original time expression in `time_expr` (e.g., "yesterday", "last year")
-- Write the memory as a timeless fact (e.g., "Melanie got married" NOT "Melanie got married 5 years ago")
+- Write the memory as a timeless fact (e.g., "speaker_b got married" NOT "speaker_b got married 5 years ago")
 
 **Output format**: JSON array of atoms. Each atom:
 ```json
@@ -50,68 +50,68 @@ Instead:
 ```
 
 **Rules**:
-1. `memory`: Timeless fact. Resolve pronouns (she/he/it/there → real names). NO time words.
+1. `memory`: Timeless fact. Resolve pronouns (she/he/it/there → speaker_a or speaker_b). NO time words.
 2. `time_expr`: Extract original time expression ("yesterday", "last week", "5 years ago"). Leave empty if message has no time reference.
 3. `role`: "speaker_a" or "speaker_b"
 4. `tag`: Array of "key:value". Keys MUST be from: speaker, topic, activity, action, event, state, sentiment, relation, entity, possession, time, other
 5. **One atom = one sentence, one fact.** NO multiple sentences in one memory.
 6. **Capture specifics — names, numbers, titles, exact wording**:
-   - Book/band/person names: "Charlotte's Web" / "Matt Patterson" / "Bach and Mozart" — NOT "a book" / "a performer" / "classical music"
+   - Book/band/title names: keep the exact name (e.g. "Charlotte's Web") — NOT "a book" / "a performer" / "classical music"
    - Frequency/count: "once or twice a year" / "3 kids" — NOT omit or abstract to "rarely" / "has kids"
    - Purpose/use: "shoes for running" — NOT just "got shoes"
    - Slogans/quotes: "Trans Lives Matter" — copy verbatim, don't paraphrase to "transgender activism"
    - Object types: "stained glass window" / "cup with a dog face" — NOT "painting" / "pottery"
    - Pet names: when message says "Luna and Oliver" / "another cat named Bailey", you MUST create atoms for Luna, Oliver, AND Bailey — omitting any member is WRONG
-7. **Named lists must enumerate each member**: "Luna and Oliver" → 2 atoms (one for Luna, one for Oliver). "Bach and Mozart" → 2 atoms or one atom listing both names explicitly. "another cat named Bailey" → separate atom for Bailey. NEVER drop members or abstract to a count.
+7. **Named lists must enumerate each member**: "Luna and Oliver" → 2 atoms (one for Luna, one for Oliver). "another cat named Bailey" → separate atom for Bailey. NEVER drop members or abstract to a count.
 8. Skip greetings, filler, pure questions without content.
 
 **WRONG (abstraction failures — DO NOT do these)**:
-- Message: "I like classical music like Bach and Mozart"
-  WRONG: {"memory": "Melanie likes classical music", ...}  ← Lost the names!
-  RIGHT: {"memory": "Melanie likes Bach", ...}, {"memory": "Melanie likes Mozart", ...}
+- Message: "I just finished reading Charlotte's Web"
+  WRONG: {"memory": "speaker_b finished reading a book", ...}  ← Lost the title!
+  RIGHT: {"memory": "speaker_b finished reading Charlotte's Web", ...}
 - Message: "These shoes are for running"
-  WRONG: {"memory": "Melanie got shoes", ...}  ← Lost the purpose!
-  RIGHT: {"memory": "Melanie got shoes for running", ...}
+  WRONG: {"memory": "speaker_b got shoes", ...}  ← Lost the purpose!
+  RIGHT: {"memory": "speaker_b got shoes for running", ...}
 - Message: "The posters said 'Trans Lives Matter'"
-  WRONG: {"memory": "Caroline saw posters about transgender activism", ...}  ← Lost the exact text!
-  RIGHT: {"memory": "Caroline saw posters saying 'Trans Lives Matter'", ...}
+  WRONG: {"memory": "speaker_a saw posters about transgender activism", ...}  ← Lost the exact text!
+  RIGHT: {"memory": "speaker_a saw posters saying 'Trans Lives Matter'", ...}
 - Message: "I made a stained glass window"
-  WRONG: {"memory": "Caroline made art", ...}  ← Lost the object type!
-  RIGHT: {"memory": "Caroline made a stained glass window", ...}
+  WRONG: {"memory": "speaker_a made art", ...}  ← Lost the object type!
+  RIGHT: {"memory": "speaker_a made a stained glass window", ...}
 - Message: "We have Luna and Oliver, and another cat named Bailey"
-  WRONG: {"memory": "Melanie has a pet named Oliver", ...}  ← Lost Luna and Bailey!
-  RIGHT: {"memory": "Melanie has a pet named Luna", ...}, {"memory": "Melanie has a pet named Oliver", ...}, {"memory": "Melanie has a pet named Bailey", ...}
+  WRONG: {"memory": "speaker_b has a pet named Oliver", ...}  ← Lost Luna and Bailey!
+  RIGHT: {"memory": "speaker_b has a pet named Luna", ...}, {"memory": "speaker_b has a pet named Oliver", ...}, {"memory": "speaker_b has a pet named Bailey", ...}
 - Message: "We go to the beach once or twice a year"
-  WRONG: {"memory": "Melanie goes to the beach", ...}  ← Lost the frequency!
-  RIGHT: {"memory": "Melanie goes to the beach once or twice a year", ...}
+  WRONG: {"memory": "speaker_b goes to the beach", ...}  ← Lost the frequency!
+  RIGHT: {"memory": "speaker_b goes to the beach once or twice a year", ...}
 
 **Examples**:
 
 Message: "I got married yesterday!"
-→ [{"memory": "Melanie got married", "time_expr": "yesterday", "role": "speaker_b", "tag": ["event:marriage", "relation:spouse"]}]
+→ [{"memory": "speaker_b got married", "time_expr": "yesterday", "role": "speaker_b", "tag": ["event:marriage", "relation:spouse"]}]
 
 Message: "I've been working at Google for 3 years."
-→ [{"memory": "Melanie works at Google", "time_expr": "for 3 years", "role": "speaker_b", "tag": ["topic:job", "entity:Google"]}]
+→ [{"memory": "speaker_b works at Google", "time_expr": "for 3 years", "role": "speaker_b", "tag": ["topic:job", "entity:Google"]}]
 
 Message: "She went to the lake last summer."
-→ [{"memory": "Caroline went to the lake", "time_expr": "last summer", "role": "speaker_a", "tag": ["activity:travel", "entity:lake"]}]
+→ [{"memory": "speaker_a went to the lake", "time_expr": "last summer", "role": "speaker_a", "tag": ["activity:travel", "entity:lake"]}]
 
 Message: "I love hiking and my daughter loves it too."
 → [
-  {"memory": "Melanie loves hiking", "time_expr": "", "role": "speaker_b", "tag": ["activity:hiking", "sentiment:love"]},
-  {"memory": "Melanie's daughter loves hiking", "time_expr": "", "role": "speaker_b", "tag": ["activity:hiking", "relation:daughter", "sentiment:love"]}
+  {"memory": "speaker_b loves hiking", "time_expr": "", "role": "speaker_b", "tag": ["activity:hiking", "sentiment:love"]},
+  {"memory": "speaker_b's daughter loves hiking", "time_expr": "", "role": "speaker_b", "tag": ["activity:hiking", "relation:daughter", "sentiment:love"]}
 ]
 
 Message: "Luna and Oliver! They are so sweet."
 → [
-  {"memory": "Melanie has a pet named Luna", "time_expr": "", "role": "speaker_b", "tag": ["entity:Luna", "possession:pet"]},
-  {"memory": "Melanie has a pet named Oliver", "time_expr": "", "role": "speaker_b", "tag": ["entity:Oliver", "possession:pet"]}
+  {"memory": "speaker_b has a pet named Luna", "time_expr": "", "role": "speaker_b", "tag": ["entity:Luna", "possession:pet"]},
+  {"memory": "speaker_b has a pet named Oliver", "time_expr": "", "role": "speaker_b", "tag": ["entity:Oliver", "possession:pet"]}
 ]
 
 Message: "It'll be tough as a single parent, but I'm up for it."
 → [
-  {"memory": "Caroline is single", "time_expr": "", "role": "speaker_a", "tag": ["state:single", "relation:marital_status"]},
-  {"memory": "Caroline plans to be a parent", "time_expr": "", "role": "speaker_a", "tag": ["state:planning", "relation:parent"]}
+  {"memory": "speaker_a is single", "time_expr": "", "role": "speaker_a", "tag": ["state:single", "relation:marital_status"]},
+  {"memory": "speaker_a plans to be a parent", "time_expr": "", "role": "speaker_a", "tag": ["state:planning", "relation:parent"]}
 ]"""
 
 ATOM_EXTRACTION_USER = """**Conversation context** (for resolving pronouns and references):

@@ -338,6 +338,37 @@ class ToolCatalog:
         ]
         return "\n".join(line for line in lines if line.strip())
 
+    def openai_tool_specs(self) -> list[dict[str, Any]]:
+        """渲染成 OpenAI ``tools=`` 参数（原生函数调用用）。
+
+        文本协议下工具是靠 ``{{TOOLS}}`` 塞进 system prompt 让模型"照抄"的 JSON；但对
+        **不遵守文本协议的模型**（如 gpt-4o-mini）这条路走不通 —— 它会把 prompt 里示例
+        的命令**原样当纯文本吐出来**，解析不出工具调用，于是被当成"做完了"，
+        一份证据都不写。这条路把同一份 ``input_schema`` 交给端点自己去约束模型。
+
+        描述拼接 ``description`` + ``guidelines`` —— 与 ``render_tools`` 渲染出的内容一致，
+        换后端时模型看到的工具语义不变。``parameters`` 直接用 ``input_schema``（已是
+        ``{"type":"object",...}``），执行层完全不动。
+        """
+        specs: list[dict[str, Any]] = []
+        for name, meta in self.tools.items():
+            description = str(meta.get("description", "")).strip()
+            guidelines = meta.get("guidelines", [])
+            if guidelines:
+                description += "\n" + "\n".join(f"- {guideline}" for guideline in guidelines)
+            schema = meta.get("input_schema") or {}
+            if not isinstance(schema, dict) or not schema:
+                schema = {"type": "object", "properties": {}}
+            specs.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": schema,
+                },
+            })
+        return specs
+
     def render_prompt(self, question: str) -> str:
         """渲染完整 system prompt。``{{TOOLS}}`` 等槽位由 catalog 自己填，``{{QUESTION}}`` 用入参。
 
