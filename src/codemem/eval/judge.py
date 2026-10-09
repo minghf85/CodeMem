@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
 from typing import Any
 
 from .. import llm
@@ -27,8 +26,6 @@ def load_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
         merged.update(config)
     return merged
 
-CONFIG_FILE = PROJECT_ROOT / "configs" / "judge.yaml"
-
 
 # ---------------------------------------------------------------------------
 # 相对时间的确定性折算
@@ -38,23 +35,84 @@ _MONTHS = {m.lower(): i for i, m in enumerate(
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
 _WEEKDAYS = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
              "friday": 4, "saturday": 5, "sunday": 6}
+#: 3 字母缩写 → 星期下标（add 侧保留相对表达时会写 "last Fri (anchor: ...)" 这种缩写）。
+_WEEKDAYS_BY_ABBR = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
 
 def _parse_date(text: str) -> "date | None":
-    """从一句回答里抽出日期。支持相对表达 / ISO / day-first / month-first / 只有年月。
+    """从一句回答里抽出日期。支持 anchor-form / 相对表达 / ISO / day-first / month-first / 只有年月。
 
-    **先试相对表达**（"the week before X" / "the <weekday> before X"）：这种表达自带
-    锚点，是一个**完整、精确**的答案，必须用与 ``resolve_relative_date`` **完全相同**
-    的逻辑折算 —— 否则两边口径不一致，会把逐字相同的答案判成不同日期（实测：
-    reference="The week before 6 July 2023" 与 candidate="the week before 6 July 2023"
-    都该是 6-29，但旧的绝对日期分支把 candidate 里的 "6 July 2023" 抠出来算成 7-06，
-    差了整整一周）。所以相对表达优先，绝对日期兜底。
+    **先试 ``<relative> (anchor: <date>)`` 形态**（"last week (anchor: 9 June 2023)"）—— 这是
+    add 侧（``atommem_time.parse_time_expression``）保留相对表达时落盘的**规范形态**，search 的
+    evidence 与 answer 都会直接采用它。旧版只会从里面抠出锚点日期（"9 June 2023"），把
+    "last week (anchor: 9 June 2023)" 当成 9 June 本身（差一周），逐字正确的答案被判定为错。
+
+    **再试相对表达**（"the week before X" / "the <weekday> before X"）：这种表达自带锚点，是一个
+    **完整、精确**的答案，必须用与 ``resolve_relative_date`` **完全相同**的逻辑折算 —— 否则两边
+    口径不一致，会把逐字相同的答案判成不同日期。绝对日期兜底。
     """
     value = str(text or "")
-    relative = _resolve_relative_expression(value)
-    if relative is not None:
-        return relative
+    for resolver in (_resolve_anchor_form, _resolve_relative_expression):
+        resolved = resolver(value)
+        if resolved is not None:
+            return resolved
     return _parse_absolute_date(value)
+
+
+def _resolve_anchor_form(text: str) -> "date | None":
+    """把 ``<relative phrase> (anchor: <date>)`` 折成绝对日期（与相对表达同一套基准）。
+
+    规范形态举例（都是 add 侧保留相对表达时的落盘形态）：
+        last week (anchor: 27 June 2023)      -> 27 June - 7 天
+        last weekend (anchor: 17 July 2023)   -> 17 July 之前最近的周六
+        last Friday (anchor: 15 July 2023)    -> 15 July 之前最近的周五
+        last month (anchor: 13 October 2023)  -> 该锚点的上一个月（取 1 号）
+        next month (anchor: 28 August 2023)   -> 该锚点的下一个月（取 1 号）
+        last year (anchor: 8 May 2023)        -> 2022 年同日
+    识别不到（无 ``(anchor: ...)`` 或锚点解析不出）返回 ``None``，交给下一个解析器。
+    """
+    import re
+    from datetime import date, timedelta
+
+    match = re.match(r"^\s*(.+?)\s*\(anchor:\s*(.+?)\)\s*$", str(text or ""), re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    rel = match.group(1).strip().lower()
+    anchor = _parse_absolute_date(match.group(2).strip())
+    if anchor is None:
+        return None
+
+    weekday = re.search(
+        r"\b(monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|"
+        r"friday|fri|saturday|sat|sunday|sun)\b",
+        rel,
+    )
+    if weekday:
+        target = _WEEKDAYS_BY_ABBR[weekday.group(1)[:3]]
+        delta = (anchor.weekday() - target) % 7 or 7
+        return anchor - timedelta(days=delta)
+    if "weekend" in rel:
+        return anchor - timedelta(days=(anchor.weekday() - 5) % 7 or 7)
+    if "week" in rel:
+        return anchor - timedelta(days=7)
+    if "night" in rel:
+        return anchor - timedelta(days=1)
+    if "month" in rel:
+        year, month = anchor.year, anchor.month
+        if rel.startswith("last"):
+            year, month = (year - 1, 12) if month == 1 else (year, month - 1)
+        elif rel.startswith("next"):
+            year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+        return date(year, month, 1)
+    if "year" in rel:
+        if rel.startswith("last"):
+            return date(anchor.year - 1, anchor.month, anchor.day)
+        if rel.startswith("next"):
+            return date(anchor.year + 1, anchor.month, anchor.day)
+        return anchor
+    if "day" in rel or "today" in rel:
+        return anchor
+    return None
 
 
 def _parse_absolute_date(text: str) -> "date | None":
@@ -300,18 +358,6 @@ def parse_judge_output(text: str) -> dict[str, Any]:
         return {"label": "CORRECT", "reason": text.strip()}
 
     raise ValueError(f"Could not parse judge output: {text[:200]}")
-
-
-def judge_answer(
-    question: str,
-    reference: str,
-    candidate: Any,
-    unsupported: bool = False,
-    config: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    merged = load_config(config)
-    raw = llm.complete_sync(merged, build_judge_messages(question, reference, candidate, unsupported))
-    return parse_judge_output(raw)
 
 
 async def judge_answer_async(

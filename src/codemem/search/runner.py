@@ -611,11 +611,6 @@ def _id_of(memory: dict[str, Any]) -> str:
 # ``atommem``（原子事实）。search 用同一套 grep/read 检索它们 —— atommem 是提炼过的原子
 # （首选），msgmem 补具体答案与原话，summem 定位"哪次会话谈过这件事"。
 
-def corpus_files(inputs_dir: Path) -> list[Path]:
-    """``inputs/`` 下存在的记忆文件（按 msgmem → summem → atommem 顺序）。"""
-    return [inputs_dir / name for name in CORPUS_FILES if (inputs_dir / name).exists()]
-
-
 def has_corpus(directory: Path) -> bool:
     """该目录是否有可检索的语料（至少一个记忆文件存在）。"""
     return any((directory / name).exists() for name in CORPUS_FILES)

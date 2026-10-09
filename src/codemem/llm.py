@@ -203,8 +203,3 @@ async def complete(
         return await chat_completion(owned, config, messages)
     finally:
         await owned.close()
-
-
-def complete_sync(config: dict[str, Any], messages: list[dict[str, Any]]) -> str:
-    """同步入口，给脚本/自测用。"""
-    return asyncio.run(complete(config, messages))

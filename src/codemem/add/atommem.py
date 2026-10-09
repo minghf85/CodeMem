@@ -50,7 +50,7 @@ import yaml
 from .. import llm
 from ..io import DATA_DIR, PROJECT_ROOT, memory_id, memory_role, memory_text, now_iso, read_jsonl
 from ..log import Logger
-from ..prompts import ATOM_AGENT_STANDARD, ATOM_AGENT_SYSTEM_PROMPT, ATOM_AGENT_USER_PROMPT
+from ..prompts import ATOM_AGENT_USER_PROMPT
 from ..search import agent as agent_mod
 from ..search import toolcfg
 from ..search import tools as tools_mod
@@ -829,6 +829,32 @@ def _subject(text: str) -> str:
     return match.group(0).lower() if match else ""
 
 
+# 句首大写但**不是**专有名词的功能词 —— 不参与"专有名词"集合（否则 "The kids..." 里的
+# "The" 会被当成实体名）。只留真正的实体名（人名/地名/书名/宠物名…）。
+_PROPER_STOP = frozenset(
+    "the a an this that these those her his their its it he she they we i my our your there then "
+    "when if and or but in on at for with from by as of to after before during last next every "
+    "each some all both no not".split()
+)
+
+
+def _proper_nouns(text: str) -> set[str]:
+    """句子里的**专有名词**集合（首字母大写的实词，小写化；去句首功能词）。
+
+    用来挡住"模板相同、只有名字不同"的误合并 —— 实测 `_is_same_fact` 把
+    "Melanie has a pet named **pup**" 与 "Melanie has a pet named **Luna**" 判成同一事实
+    （token Jaccard 0.67），于是把 Luna / Oliver / Bailey 三条**并进了 pup 那条**，枚举成员
+    名全丢（qa52 / qa124 的 pet 题就错在这）。**不同的专有名词 = 不同的实体 = 不同的事实。**
+    """
+    import re
+
+    return {
+        word.lower()
+        for word in re.findall(r"\b[A-Z][a-zA-Z]+\b", text)
+        if word.lower() not in _PROPER_STOP
+    }
+
+
 def _is_same_fact(a: str, b: str) -> bool:
     """两条 memory 是否描述**同一事实**。
 
@@ -845,6 +871,10 @@ def _is_same_fact(a: str, b: str) -> bool:
     if not ta or not tb:
         return False
     if _subject(a) and _subject(b) and _subject(a) != _subject(b):
+        return False
+    # **专有名词不同 = 不同事实。** 挡住 "has a pet named pup/Luna/Oliver" 这类
+    # "同一模板、仅名字不同"的误合并 —— 名字正是区分枚举成员的关键，措辞再像也不能并。
+    if _proper_nouns(a) != _proper_nouns(b):
         return False
     # 路径 1：措辞近乎一致。
     if len(ta & tb) / len(ta | tb) >= NEAR_DUP_JACCARD:
@@ -918,14 +948,17 @@ async def run_dir(
     *,
     limit_messages: int = 0,
     use_pipeline: bool = True,
+    semaphore: "asyncio.Semaphore | None" = None,
 ) -> dict[str, Any]:
-    """对一个目录的 msgmem **逐 message 串行**跑 atom 抽取，就地写 atommem.jsonl。
+    """对一个目录的 msgmem 抽 atom，就地写 atommem.jsonl。
 
-    串行的意义：处理第 N 条 message 时，`atommem.jsonl` 里已经有前 N-1 条产出的 atom，
-    能召回它们（"跨 session 影响"就靠这个）。所以每处理一条就**增量落盘**一次。
+    **pipeline 模式（默认）整目录并行**：每条 message 的抽取互不依赖 —— 召回只读 ``msgmem``
+    （不需要"前 N-1 条已产出的 atom"），id 按各自 source 独立分配，去重是收尾的一次全局 pass
+    —— 所以全部 message 并发抽取（受 ``concurrency`` 限流），最后一次性去重落盘。实测 419 条
+    message：串行 ~45 分钟 → 并行 ~1 分钟。
 
-    use_pipeline=True（默认）：用三阶段 pipeline（召回 → 单次 LLM → 后处理），稳定快速。
-    use_pipeline=False：用 agent loop（兼容旧行为，但不稳定）。
+    **agent 模式（``use_pipeline=False``，兼容旧行为，不稳定）逐个 message 串行**：第 N 条要能
+    grep 到前面已产出的 atom，所以增量落盘。
     """
     label = directory.name
     files = directory_files(directory)
@@ -934,8 +967,6 @@ async def run_dir(
         return {"dir": label, "status": "SKIPPED",
                 "reason": f"no {MSGMEM_NAME}（先跑 add --stage msgmem）"}
     messages = read_jsonl(msg_path)
-    summaries_by_session = group_by_session(read_jsonl(files["summem"]))
-    summaries = {number: records[0] for number, records in summaries_by_session.items() if records}
 
     atommem_path = files["atommem"]
     known = {memory_id(m) for m in messages}
@@ -945,45 +976,42 @@ async def run_dir(
     targets = messages if not limit_messages else messages[:limit_messages]
 
     if use_pipeline:
-        # ============ Pipeline 模式 ============
+        # ============ Pipeline 模式：整目录并行抽取 → 一次性去重落盘 ============
         from .atommem_pipeline import run_message_pipeline
 
-        for target in targets:
-            node_log = log.bind(f"{label}:{memory_id(target)}")
-            # 幂等：移除本 message 最初产出的 atom
-            current = [
-                a for a in current
-                if _primary_source(a) != memory_id(target)
-                or not (set((a.get("metadata") or {}).get("source") or []) & known)
-            ]
-            try:
-                new_atoms = await run_message_pipeline(
-                    target=target,
-                    msgmem=messages,
-                    existing_atoms=current,
-                    client=client,
-                    config=config,
-                    log=node_log,
-                    speaker_a=speaker_a,
-                    speaker_b=speaker_b,
-                )
-                # 合并到当前语料
-                current.extend(new_atoms)
-                # 去重
-                current = _dedup_atoms(current)
-                # 落盘
-                write_memories(atommem_path, current)
-            except Exception as exc:  # noqa: BLE001
-                node_log.warn(f"处理失败：{type(exc).__name__}: {exc}")
+        # 幂等：先移除**本次要处理的每个 message** 最初产出的 atom（重跑不累积）。
+        target_ids = {memory_id(t) for t in targets}
+        kept = [
+            a for a in current
+            if _primary_source(a) not in target_ids
+            or not (set((a.get("metadata") or {}).get("source") or []) & known)
+        ]
 
-        return {
-            "dir": label, "status": "OK",
-            "messages": len(targets),
-            "atoms": len(current),
-        }
+        # 并发闸门：多目录一起跑时共用调用方传进来的**全局** semaphore（否则每个目录各开
+        # concurrency 个任务，10 个目录就是 10×concurrency 个并发请求，会把模型端点打爆）。
+        gate = semaphore or asyncio.Semaphore(max(1, int(config.get("concurrency", 8))))
+
+        async def extract(target: dict[str, Any]) -> list[dict[str, Any]]:
+            async with gate:
+                node_log = log.bind(f"{label}:{memory_id(target)}")
+                try:
+                    return await run_message_pipeline(
+                        target=target, msgmem=messages, existing_atoms=[], client=client,
+                        config=config, log=node_log, speaker_a=speaker_a, speaker_b=speaker_b,
+                    )
+                except Exception as exc:  # noqa: BLE001 - 单条失败不该让整目录没有输出
+                    node_log.warn(f"处理失败：{type(exc).__name__}: {exc}")
+                    return []
+
+        groups = await asyncio.gather(*(extract(t) for t in targets))
+        merged = _dedup_atoms(kept + [a for group in groups for a in group])
+        write_memories(atommem_path, merged)
+        return {"dir": label, "status": "OK", "messages": len(targets), "atoms": len(merged)}
 
     else:
         # ============ Agent Loop 模式（旧行为，保留用于对比）============
+        summaries_by_session = group_by_session(read_jsonl(files["summem"]))
+        summaries = {number: records[0] for number, records in summaries_by_session.items() if records}
         workspace = directory
         runner = _Runner(client, config, log, directory / ".atommem.model_calls.jsonl")
 
@@ -1083,11 +1111,13 @@ async def async_main(args: argparse.Namespace) -> None:
     semaphore = asyncio.Semaphore(max(1, int(config.get("concurrency", 8))))
 
     async def one(directory: Path) -> dict[str, Any]:
-        async with semaphore:
-            mode = args.mode
-            if mode == "pipeline":
-                return await run_dir(directory, config, client, catalog, log,
-                                     limit_messages=args.limit_messages, use_pipeline=True)
+        mode = args.mode
+        if mode == "pipeline":
+            # 并发由所有 message 任务共享的**全局** sem 统一约束（跨目录也收敛到 concurrency）。
+            return await run_dir(directory, config, client, catalog, log,
+                                 limit_messages=args.limit_messages, use_pipeline=True,
+                                 semaphore=semaphore)
+        async with semaphore:  # agent 模式逐条串行 → 用目录级并发
             if mode == "agent":
                 return await run_dir(directory, config, client, catalog, log,
                                      limit_messages=args.limit_messages, use_pipeline=False)

@@ -15,7 +15,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..io import memory_id, memory_type, read_jsonl, write_jsonl
+from ..io import memory_id, write_jsonl
 
 #: 三层记忆的文件名（相对 ``data/{dir}/``）。定义在共享层，msgmem/summem/atommem 都从这里取。
 MSGMEM_NAME = "msgmem.jsonl"
@@ -47,23 +47,6 @@ def group_by_session(records: Iterable[dict[str, Any]]) -> dict[int, list[dict[s
             continue
         grouped.setdefault(number, []).append(record)
     return dict(sorted(grouped.items()))
-
-
-def load_memories(path: Path, memory_type_value: str = "") -> list[dict[str, Any]]:
-    """读一个记忆文件；``memory_type_value`` 非空时只保留该 type 的记录。"""
-    records = read_jsonl(path)
-    if not memory_type_value:
-        return records
-    return [r for r in records if memory_type(r) == memory_type_value]
-
-
-def recent_window(
-    records: list[dict[str, Any]], index: int, window: int
-) -> list[dict[str, Any]]:
-    """取 ``records[index]`` 之前（不含自己）最近 ``window`` 条。"""
-    if window <= 0 or index <= 0:
-        return []
-    return records[max(0, index - window):index]
 
 
 def write_memories(path: Path, records: list[dict[str, Any]]) -> None:

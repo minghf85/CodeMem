@@ -7,58 +7,60 @@
 ANSWER_PROMPT = """
 Prompt template: memory-grounded question answering
 
-You are an intelligent memory assistant tasked with retrieving accurate information from conversation memories.
+You are a memory assistant. Answer the QUESTION using ONLY the memories below.
 
-# CONTEXT:
-You have access to memories from two speakers in a conversation. These memories contain timestamped information that may be relevant to answering the question.
+# GROUNDING
+- Use only facts stated in the memories (plus reliable general knowledge for general world facts). Never
+  invent a date, number, name, or place.
+- If the memories do not support an answer, set "answer" to null and "unsupported": true. Do not guess.
+- Resolve every pronoun and pointing word (he/she/it/there/that time) to the concrete person, place, or
+  date. The answer must make sense on its own, without the question or the memories.
 
-# INSTRUCTIONS:
-1. Carefully analyze all provided memories from both speakers
-2. Pay special attention to the timestamps to determine the answer
-3. If the question asks about a specific event or fact, look for direct evidence in the memories
-4. If the memories contain contradictory information, prioritize the most recent memory
-5. **The memory timestamp is WHEN THE CONVERSATION HAPPENED -- it is almost never when the event happened.** A memory dated <session date> saying "I did X last week" means X happened in the week before <session date>, NOT on <session date>. Never answer with the memory's own timestamp as if it were the event date.
-6. **A relative expression that carries its anchor is a COMPLETE answer.** "the week before <date>", "the <weekday> before <date>", "the weekend before <date>" are exact and need no further context -- answer with that form, or with the single date it resolves to, whichever the memory supports. Do NOT flatten an anchored expression into the anchor itself.
-7. **Only answer with a bare relative word if the anchor is resolvable and you state it.** "next month" alone is WRONG; "<the month after the conversation date>" is right. Same for "last year" -> give the year, "recently" -> give the week or month. Never leave the reader to guess what "next" or "recent" is relative to.
-8. Focus only on the content of the memories from both speakers. Do not confuse character names mentioned in memories with the actual users who created those memories.
-9. If memories are insufficient and the question is about a general world fact, you may use reliable general world knowledge.
-10. Keep the final answer concise, typically no more than 10-12 words; do not omit essential entities or dates.
+# TIME (CRITICAL)
+- **A memory's timestamp is WHEN THE CONVERSATION HAPPENED, not when the event happened.** A memory dated
+  <session date> saying "I did X last week" means X happened the week BEFORE <session date>, NOT on
+  <session date>. Never answer with the memory's own timestamp (or any anchor) as the event date.
+- **An anchored relative phrase is a COMPLETE answer -- keep it EXACTLY as the evidence gives it.** If the
+  evidence says "the week before 3 July 2023" or "the Friday before 15 July 2023", answer with that same
+  anchored phrase. **Never replace it with the computed date** -- "2023-07-14" is a WORSE answer than
+  "the Friday before 15 July 2023": the reader cannot verify your arithmetic, but the anchored form is exact
+  and self-checking. Also NEVER collapse it to the bare anchor: "3 July 2023" is WRONG for "the week before
+  3 July 2023".
+  Example -- evidence: "<person> gave a speech 'last week' (anchor: 9 June 2023)"
+    RIGHT: "the week before 9 June 2023"   WRONG: "9 June 2023"   WRONG: "2023-06-02"
+- **Write dates as "7 May 2023"** (day month-name year), never ISO "2023-05-07".
+- **Match the source's granularity -- never add precision it lacks.** "last year" -> a year, not a day;
+  "next / this / last month" -> NAME that month (e.g. "June 2023"). Use `date -d` for any arithmetic.
+- **Convert an EXACT one-day offset against a known anchor into the calendar date:** yesterday / today /
+  tomorrow, "N days ago", "last night". Anchor on the memory's own date.
+- **Never leave a relative word unanchored.** "next month" alone is WRONG; write the month it denotes
+  ("June 2023"). Same for "this month" / "last month" / "recently".
+- Never write a session id, record id, or a placeholder (e.g. "session_3_11", "<session date>") as a date.
+  Resolve it to the real date the memory supplies.
 
-# GROUNDING RULES (CRITICAL):
-- Use ONLY facts stated in the memories, or clear logical consequences of them. Never invent a date, number, name, place, or detail.
-- If the memories partially support an answer, give the part that is supported and mark the missing part as unknown rather than guessing.
-- If the memories do not support an answer at all, set "answer" to null and "unsupported": true.
+# LISTS / ENUMERATION
+- For what / which / who / where / how-many questions whose answer is a SET, enumerate every member the
+  memories support, by its concrete name or number (e.g. "X, Y and Z") -- never a category or a paraphrase
+  ("various activities", "her pets"). For a count, give the number the memories support.
 
-# LIST / ENUMERATION QUESTIONS (CRITICAL):
-- When the question asks WHAT / WHICH / WHO / WHERE / HOW MANY and the answer is a SET of members (activities, books, pets, instruments, places, people, items, children, times), ENUMERATE every member the memories support -- do not summarise them.
-- Name each member concretely: list the actual members -- NOT a category like "various creative activities", and NOT a paraphrase like "items for her family". List the real names (e.g. "X, Y and Z"), never "her pets" / "her children".
-- For a counting question ("how many times", "how many children"), give the NUMBER the memories support. If several memories each add one instance, count them and give the total.
-- Prefer the union of all memories over the single most recent one: gather every member across all of them, then list.
+# COUNTERFACTUAL / "WOULD ..." QUESTIONS
+- There is no literal statement to copy: you must INFER from the person's revealed preferences, values,
+  habits, and circumstances. **Do NOT answer null/"unsupported" for a "would X" question unless the memories
+  say NOTHING at all about X** -- abstaining is a wrong answer here, not a safe one.
+- **Weigh the evidence and commit to the direction it supports.** If X has shown they like / practice / care
+  about the relevant thing, answer "Yes" / "Likely yes"; if X has shown disinterest, declined, or it
+  conflicts with what X values, answer "No" / "Likely no". Do not default to "Unlikely" -- follow the
+  evidence. Use a bare "Yes"/"No" only with a direct basis; otherwise hedge with "Likely".
+- Keep it short: "<Yes | No | Likely yes | Likely no>; <one-clause reason>".
+  e.g. "Likely no; she does not refer to herself as part of it", "Yes; it's classical music".
 
-# COUNTERFACTUAL / "WOULD ..." QUESTIONS (CRITICAL):
-- Some questions ask you to PREDICT: "Would X likely ...?", "Would X have ...?". There is no literal statement to copy -- you must reason from related facts X has revealed and give the best-supported judgment.
-- Do NOT abstain just because no memory states the prediction outright. Gather the relevant facts about the person (their preferences, habits, values, circumstances), reason about what they imply, and commit to a Yes / No / Likely / Unlikely answer with a one-clause reason.
-- Example: "Would <person> enjoy <an item in a category they have shown they like>?" + memories show <person> likes things in that category -> answer "Yes, likely -- <person> shows a liking for that category."
-- Only abstain if the memories give NO basis at all for reasoning about the prediction.
-
-# SPECIFICITY RULES (CRITICAL):
-- **Resolve a relative time against its own anchor, not against the conversation date.** "last <weekday>" in a memory dated <session date> is "the <weekday> before <session date>"; "N years ago" in a memory dated <session date> is the year, if that is all the speaker gave.
-- An anchored phrase ("the week before <date>", "the <weekday> before <date>") is already absolute -- keep it as-is, or give the date it resolves to. Both are accepted; the anchor alone is NOT.
-- Do NOT add precision the memory does not have. If the speaker said "last year", a year is the correct granularity; do not invent a specific day.
-- Resolve every pronoun and deictic reference (he, she, they, it, this, that, here, there, that time) into the concrete entity, place, or date it refers to.
-- Name every person, place, organization, and event explicitly instead of referring to them indirectly.
-- Prefer the most specific form the memories actually support (a year over "a couple of years ago", a name over "she", a city over "there").
-- Make the answer understandable on its own, without the question or the memories.
-- If a detail cannot be resolved from the memories, do NOT invent it; either omit it or mark it unknown.
-
-# APPROACH (Think step by step):
-1. First, examine all memories that contain information related to the question
-2. Examine the timestamps and content of these memories carefully
-3. Look for explicit mentions of dates, times, locations, or events that answer the question
-4. If the answer requires calculation, DO the calculation and show it in reasoning: name the anchor date and the offset. Never write the anchor date as the answer to a "when did X happen" question
-5. Formulate a precise, concise answer based on the evidence in the memories, using general world knowledge only if memories are insufficient
-6. Double-check that your answer directly addresses the question asked
-7. Ensure your final answer is specific and avoids vague time references
+# STYLE
+- **Always give the COMPLETE answer first.** A SET / list question must list every member the memories
+  support; a "how many" must give the count; a single-fact question gives the fact. Never shorten the
+  answer by dropping part of it.
+- Then keep the PHRASING short and direct -- a phrase, not a restated question, and no padding the question
+  did not ask for. "mental health" beats "It raised awareness for mental health."; "Sweden" beats
+  "Caroline's grandma is from Sweden.".
 
 Memories:
 {context}
@@ -66,23 +68,17 @@ Memories:
 Question: {question}
 
 # OUTPUT
-CRITICAL: Your entire response must be ONLY a JSON object. No markdown fences, no explanation, no text before or after the JSON.
+Your entire response must be ONLY a JSON object. No markdown fences, no explanation, no text around it.
 
 Format:
-{{"reasoning": "<first: name the memory you used, its date, and how you resolved the time>", "answer": "<final answer, or null if the memories do not support one>", "unsupported": <true|false>}}
+{{"reasoning": "<FIRST: name the memory you used, its date, and how you resolved the time>", "answer": "<final answer, or null if the memories do not support one>", "unsupported": <true|false>}}
 
-- "reasoning": FIRST. One or two sentences: which memory you used, that memory's date, and how you turned its wording into the answer. Write this before the answer.
-- "answer": concise and specific (normally <= 10-12 words); resolve all relative times and pronouns as described above.
-- "unsupported": true only when the memories do not support any answer; then "answer" must be null.
+- "reasoning": FIRST, one or two sentences.
+- "answer": concise and specific (normally <= 10-12 words), with relative times and pronouns resolved as above.
+- "unsupported": true only when the memories support no answer; then "answer" must be null.
 
-Example (memory dated <session date>: "<person> did X 'last year'"):
-{{"reasoning": "Memory dated <session date> says <person> did X last year; one year before <session date> is <year-1>.", "answer": "<year-1>", "unsupported": false}}
+REMINDER: Output ONLY the JSON object. Start with {{ and end with }}."""
 
-Example (memory dated <session date>: "I gave a speech 'last week'"):
-{{"reasoning": "Memory dated <session date>; the speech was 'last week', i.e. the week before <session date> -- not on <session date> itself.", "answer": "the week before <session date>", "unsupported": false}}
-
-REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing else.
-"""
 
 BASELINE_ANSWER_PROMPT = """
 You are an intelligent memory assistant answering a question from the complete conversation memory of two speakers.
@@ -248,28 +244,6 @@ Decision Rules:
 - When in doubt about temporal alignment, mark INCORRECT
 - For all other criteria, lean towards ACCEPTANCE if the core answer is clearly present
 - A prediction that adds reasonable, non-contradictory context around the correct answer should generally be accepted
-
-Examples:
-- Q: "When did <person> do <event>?" | Ref: "<year>" | Pred: "<the same period, worded relatively>"
-  → Depends on context. If the conversation is dated in <year+1>, the relative form is CORRECT;
-    with no context to anchor it, INCORRECT.
-
-- Q: "When did <person> do <event>?" | Ref: "<year>" | Pred: "<same fact, longer sentence>"
-  → Same as above. Context-dependent.
-
-- Q: "When did <person> do <event>?" | Ref: "<year>" | Pred: "in <year>" → CORRECT
-
-- Q: "What did <person> research?" | Ref: "<topic A>" | Pred: "<topic A> and <topic B>"
-  → INCORRECT if <topic B> is not supported by the evidence. If the evidence supports both, CORRECT.
-
-- Q: "Where did <person> go?" | Ref: "<place>" | Pred: "<person> went to <place> for <reason>"
-  → CORRECT. Core fact preserved, minor addition doesn't contradict.
-
-- Q: "Who went to <place>?" | Ref: "<name>" | Pred: "<a pronoun for <name>>" (e.g. "he went there")
-  → CORRECT if the question context makes the referent unambiguous. INCORRECT if ambiguous.
-
-- Q: "Where has <person> camped?" | Ref: "<place A>, <place B>, <place C>" | Pred: "<place A> and <place B>"
-  → INCORRECT. Missing <place C> is a key omission.
 
 # OUTPUT
 CRITICAL: Your entire response must be ONLY a JSON object. No markdown fences, no explanation, no text before or after the JSON.
@@ -528,5 +502,6 @@ EVIDENCE_STANDARD = """A record is ACCEPTABLE only if it passes every check belo
 8. SPECIFICS PRESERVED. Keep the source's concrete content -- the real name, number, count, object, colour, or list member. Never abstract it into a category: name the actual object (NOT a vague class word like "art"), the actual text (NOT "a sign"), the actual members (NOT "some items"). A paraphrase that loses the specific detail is WRONG.
 9. SUBJECT BINDING. When the question asks about a specific person, the evidence MUST be about that same person. Do NOT merge or substitute facts from different people: "<person A>'s <thing>" is not answered by "<person B>'s <thing>". If you only found records about the wrong person, DO NOT write evidence -- the answer is "no information".
 10. FREQUENCY vs OCCURRENCE. If the question asks "how often" / "how many times", the evidence must state a frequency, rate, or count ("once or twice a year", "every weekend", "3 times"), NOT just "X happened on [date]". A single occurrence does not answer a frequency question.
+11. PROSE, NOT IDS. The record's `content` is a sentence for a human reader. Never write a session id / record id / placeholder inside it (`session_3_11`, `session_N_M`, `<session date>`) -- ids belong ONLY in `metadata.source`. In particular never use a session id where a date belongs ("the week before session_3_11" is WRONG; resolve it to the real date).
 
 If a candidate record fails a check, fix it (usually by adding the name or the anchor) rather than dropping the evidence. Drop it only when you genuinely cannot resolve it -- a partially-resolved record is worse than a resolved one, but a dropped one scores nothing."""

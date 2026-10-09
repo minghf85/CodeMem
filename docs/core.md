@@ -1737,3 +1737,292 @@ atommem 产出: "Caroline is up for the challenge of being a single parent."
 - ✓ prompt 新增集合拆分 + 关键属性抽取规则
 
 **预期提升**: temporal +15-20%（从 40% → 55-60%），single_hop +10-15%（从 62% → 72-77%）。
+
+---
+
+## S16: 从 bad case 逆向的四阶段优化：judge → answer → search → add（2026-10-08）
+
+**起点**：`search_20261008_070515`（atommem pipeline + search agent 全量 152 QA）——
+judge_accuracy **57.6%**、token_f1 0.393、evidence_recall 37.1%、unsupported 11.0%。
+按用户要求**逆向分阶段**（judge → answer → search → add）逐层修，每层用现有数据回归。
+
+### 逐条 bad case 的归类（50 条 INCORRECT / 118）
+
+| 形态 | 条数 | 根因 |
+|---|---|---|
+| **时间坍缩**：evidence/answer 把"X 之前的那周/那天"写成了**会话当天的日期** | 11 | **add 侧**（见下）——不是 search 的错 |
+| **集合成员不全/被抽象**：`stained glass window`→`a piece`、`Oliver, Luna, Bailey`→`Oliver and pup` | 12 | add 的**去重把成员名合并没了** + search 早停 |
+| **检索不到（unsupported）** | 13 | search 对集合/计数题收不全 |
+| **session id 泄漏进正文**：answer `the week before session_3_11` | 2 | evidence 用 session id 当日期锚点 |
+| **judge 把集合子集判成 CORRECT** | 4 | judge prompt 自相矛盾（"多给不算错"压过了 COMPLETENESS） |
+
+### 各阶段改动与实测（`--sample Caroline_Melanie`）
+
+| 阶段 | 改动 | 实测 |
+|---|---|---|
+| **judge** | 删掉一整段冗余 worked examples（行为中性）；新增 `_resolve_anchor_form`：把 add 侧落盘的规范形态 `"last week (anchor: 27 June 2023)"` 按**相对表达同一套逻辑**折算（旧版只抠出锚点 `27 June`，差一周）。 | 基线重判不变（57.6%，基线答案没有 anchor-form）；修完后 answer 侧 +3pt |
+| **answer** | `ANSWER_PROMPT` 大幅精简（~78→~40 行）；时间规则重写：锚定短语**原样保留**、只有精确一天偏移才折算、**禁止把锚点当答案**、**禁止回答里出现 session id/占位符** | 固定 evidence 上 58.5% → **60.2%** |
+| **search** | `time_policy` 加两条：**atom.time 等于它自己的会话日期＝红旗**（add 侧可能坍缩过）、**禁止拿 session id 当日期**；`EVIDENCE_STANDARD` 加第 11 条"正文不写 id/占位符" | 单靠 search 修不动时间题（原子本身是错的），必须先修 add |
+| **add** | ① `atommem_pipeline.parse_time_expression` 改为**委托**给单一事实源 `atommem_time.parse_time_expression`；② 去重加**专有名词守卫**（见下） | 见下 |
+
+### add 的两处根因（本轮的**关键**）
+
+**① 时间解析器是坏的（`date -d` 的陷阱）。** pipeline 自己那份 `parse_time_expression` 直接
+`date -d "<anchor> <expr>"`，两个实测缺陷都直接造成 temporal 答错：
+
+- `date -d "25 May 2023 last saturday"` → **`2023-05-25`**（GNU date 返回的正是会话日期本身），
+  于是 "last Saturday" 被错记成会话当天 —— qa5/qa28/qa29/qa79… 一批题全错在这。
+- 粗粒度表述（"last week"）被压成**单日日期**，丢掉锚点，下游只能照抄这个日期。
+
+修正版 `atommem_time.parse_time_expression` 早就写好了（保留锚点、星期几用 Python 精确折算、
+精度只减不增），但**只有 agent 模式在用**；默认的 pipeline 走的是自己那份坏的。改为委托后：
+`last Saturday`(25 May) → `2023-05-20`、`last week`(9 June) → `"last week (anchor: 9 June 2023)"`。
+全量 atommem：`flat_iso` 106→**37**、`anchored` 79→**136**。
+
+**② 去重把枚举成员合并没了。** `_is_same_fact` 的 token-Jaccard（≥0.6）会把
+`"Melanie has a pet named pup"` 与 `"...named Luna"` 判成同一事实（Jaccard 0.67）——于是
+**Luna / Oliver / Bailey 三条被并进"pup"那条，成员名全丢**（qa52/qa124 的 pet 题死在这）。
+修法：**专有名词不同 ⇒ 不同事实**（新 `_proper_nouns` 守卫）。名字正是区分枚举成员的关键，
+措辞再像也不能并。修完后 atommem 里 `named Luna / Oliver / Bailey` 三条齐全。
+
+### 实测（同一目录、同一 judge）
+
+| 指标 | 优化前 | 优化后 |
+|---|---|---|
+| **judge_accuracy** | 57.6% | **70.9%** |
+| evidence_recall | 37.1% | **51.0%** |
+| unsupported_rate | 11.0% | **5.5%** |
+| token_f1 | 0.393 | 0.395 |
+
+| category | 前 | 后 |
+|---|---|---|
+| multi_hop | 35.0% | **76.2%** |
+| temporal | 57.1% | **72.2%** |
+| single_hop | 65.4% | **71.7%** |
+| open_domain | 62.5% | 50.0%（n=8→10，样本小） |
+
+**同集合口径**（两跑共有的 106 条 QA）：59.4% → **70.8%**（20 条变好 / 8 条变差）。
+
+### 诚实记录：本轮的三个教训
+
+1. **judge 的措辞极度敏感，不能当"顺手简化"的对象。** 试着把 JUDGE_PROMPT 重写得更短，
+   分数在 **46.6% ↔ 61.9%** 之间来回跳（同一批答案）——8B 对"默认 CORRECT/extra 不算错/
+   空答案必错"这些措辞极其敏感。最终**只删了冗余示例块**（行为中性），逻辑一字未动。
+2. **测量口径要先校准。** judge 不能读 `"(anchor: X)"` 形态是**真 bug**，但它同时压低了
+   基线和新跑——所以要先修 judge，否则 new/old 不可比。
+3. **改下游 prompt 修不动上游的数据。** search 的 time_policy 再怎么强调"别用会话日期当事件
+   日期"，只要 atom 的 `time` 本身就是会话日期（add 的错），agent 就会照抄。**根因在哪一层，
+   就必须在哪一层修。**
+
+---
+
+## S17: 清理死代码 / 过时配置 + atommem 并行化（2026-10-08）
+
+三件事：**atommem pipeline 并行化**、**删确定死代码**、**修过时/重复的 yaml 与一处配置 bug**。
+
+### atommem pipeline 并行化（效率）
+
+原来是**逐 message 串行**（`run_dir` 的 `for target in targets: await run_message_pipeline(...)`），
+每处理一条就把全库重写一遍。但**每条 message 的抽取其实互不依赖**：
+
+- 召回（`recall_context`）只读 `msgmem`，**不需要**"前 N-1 条已产出的 atom"；
+- id 按各自 `source_id` 独立分配（`_max_suffix(set(), source_id)` 对全新 source 恒为 0）；
+- 去重本就可以是收尾的**一次全局 pass**（保留首次出现，与逐条增量等价）。
+
+改成：全部 message 并发抽取（`asyncio.gather` + `Semaphore(concurrency)`）→ `_dedup_atoms` 一次
+→ 落盘一次。**实测 419 条 message：串行 ~45 分钟 → 并行 ~1 分钟**。agent / agent-v2 模式保持原样
+（串行/并行各自成立）。同时把管道模式不再使用的 `summem` 读取移到 agent 分支里。
+
+### 删除的确定死代码（AST 全仓扫描，含 `scripts/` 与 `__all__` 复核）
+
+| 文件 | 删除 |
+|---|---|
+| `io.py` | `append_jsonl` / `ensure_jsonl` / `resolve_dir` / `default_config_path` / `msg_role` / `msg_kind` / `source_content` / `source_time` / `make_session_record` / `memory_tags` / `memory_speaker` / `dedupe_by_id` / `format_time`（全部 0 引用） |
+| `search/tools.py` | `create_write_tool`（`write` 工具早已删除）+ 级联的 `shrink_notice` |
+| `search/agent.py` | `steps_for_record` |
+| `search/runner.py` | `corpus_files` |
+| `search/evidence.py` | `_try_whole_file` |
+| `add/memory.py` | `load_memories` / `recent_window` |
+| `add/msgmem.py` | `parse_session_datetime` |
+| `eval/judge.py` | 同步版 `judge_answer` |
+| `llm.py` | `complete_sync` |
+| `api/store.py` | `debug_dump` |
+| 各文件 | 十余处未使用 import（`json` / `sys` / `Path` / `field` / 未用的 `_TAG_ALIASES` 等） |
+
+`eval/legacy.py` 与 `scripts/eval_baseline|rag|atommem` 是 core.md §6 记录的**历史对照链路**，保留。
+
+### 修掉的过时 / 重复配置（含一处真 bug）
+
+- **`eval/judge.py` 有两处 `CONFIG_FILE` 赋值**：第一处指向 `configs/eval.yaml`，第二处（模块末尾）
+  却指向**并不存在的** `configs/judge.yaml` —— 于是 `load_config` 一直在读一个不存在的文件，
+  **`eval.yaml` 的 `judge:` 段被静默忽略**。删掉那行后，`eval.yaml` 的 judge 配置才真正生效。
+- **`search.yaml`** 顶部注释写的是"消解后的会话语料（sessions/）"——`sessions/` 早被三层记忆文件
+  （`atommem`/`msgmem`/`summem`）取代。重写抬头；冗余长注释压到 `runner.py` 的 `DEFAULT_CONFIG`（单一事实源）。
+- **`add.yaml`**：`enable_thinking` **重复出现两次**（YAML 后者覆盖前者）；`tool_config` 键**无人读取**
+  （CLI 走 `--tool-config`）——两者都删。注释里"逐 message agent"与默认（pipeline）不符，已更正，
+  并把只被 agent 模式读取的键归到一段。
+- **`answer.yaml` / `eval.yaml`**：删掉过时的远程模型（openlux / gpt-4o-mini，含明文 key）注释块。
+- **`configs/atommem.yaml`**：只被历史 baseline 脚本使用，加抬头注明"历史对照、不参与当前管线"。
+
+### 验证
+
+`python scripts/test_search.py`（470 项）与 `python scripts/test_api.py`（44 项）全绿；
+五个 CLI（add/search/answer/eval/api）`--help` 均可跑；`python -m compileall src/codemem` 通过。
+
+---
+
+## S18: 时间形态对齐参考语料 + answer 风格 + 全量 run_eval（2026-10-08）
+
+用户反馈三点，逐一处理。
+
+### ① 时间答案要**照参考的形态**，不要折算成算出的日期
+
+实测（`search_20261008_090757`）：qa28/qa29 参考是 ``"The Friday before 15 July 2023"``，而系统答
+``"2023-07-14"`` —— **算对了，但形态不对**。问题在于：
+
+- judge 未必能复核日期算术（§2.4 早已反复踩）；
+- token F1 直接受损（两个答案 token 几乎不重叠）；
+- 参考语料里 "when" 类答案**绝大多数本身就是** ``"the week/day/weekend before <日期>"`` 这种形态
+  （全库 72 条 anchored-relative，见下）。
+
+**改法：** ``atommem_time.parse_time_expression`` 不再把相对表达折算成绝对日期，而是产出**与参考
+同形的锚定表述**：
+
+| 源（会话时间锚点） | 旧产出 | 新产出 |
+|---|---|---|
+| "last Saturday"（25 May 2023） | `2023-05-20` | `the Saturday before 25 May 2023` |
+| "last week"（9 June 2023） | `2023-06-02` | `the week before 9 June 2023` |
+| "Last Fri"（15 July 2023） | `2023-07-14` | `the Friday before 15 July 2023` |
+| "last weekend"（17 July 2023） | `2023-07-15` | `the weekend before 17 July 2023` |
+| "yesterday"（8 May 2023） | `2023-05-07` | `7 May 2023`（非 ISO） |
+| "last night"（14 August 2023） | `2023-08-13` | `13 August 2023` |
+| "two days ago"（12 July 2023） | `2023-07-10` | `10 July 2023` |
+| "last year" | `2022` | `2022`（不变） |
+
+绝对日期统一写成 ``"7 May 2023"`` 形态（``date -d ... +"%-d %B %Y"``），不再写 ISO。
+另补两处漏洞：数词（"two days ago"）与星期缩写（"last Tues"）之前识别不了。
+
+**answer 侧同步**（``prompts.ANSWER_PROMPT``）：显式禁止把 "the Friday before X" 替换成算出的日期
+（"2023-07-14" 是更差的答案）；日期写 ``"7 May 2023"`` 而非 ISO；并要求**答案要短**
+（短语而非整句，不复述问题）——参考语料很多答案就是一个短语（"mental health" / "Sweden" / "5 years"），
+贴风格既提升 token F1 也更容易判对。
+
+**实测（10 条 temporal QA）**：改前多数答成算出的日期或会话日期；改后 **10/10 与参考逐字同形**：
+
+```
+qa0  7 May 2023                          ✓
+qa5  the Saturday before 25 May 2023     ✓
+qa8  the week before 9 June 2023         ✓
+qa28/29 the Friday before 15 July 2023   ✓
+qa41 the Tuesday before 20 July 2023     ✓
+qa44 13 August 2023                      ✓
+qa54 the week before 23 August 2023      ✓
+qa74 the weekend before 20 October 2023  ✓
+qa79 the Friday before 22 October 2023   ✓
+```
+
+### ② open_domain（LoCoMo cat3，反事实题）偏弱
+
+实测 37.5%（n=8）。逐条看：一半是**弃答**（"Would Caroline be religious?" → null），一半是**方向答反**
+（"Would Melanie enjoy Vivaldi?" 参考 "Yes; classical music"，答 "Unlikely"）。改法是把
+``ANSWER_PROMPT`` 的 counterfactual 段写死：**"would X" 题除非语料对 X 一无所知，否则禁止弃答**；
+要从 X 已显露的偏好/价值**判断方向**（喜欢/做过 → Yes/Likely yes；明确拒绝/冲突 → No/Likely no），
+不要默认 "Unlikely"；输出短句 "<Yes|No|Likely …>; <一句理由>"（与参考同形）。
+
+### ③ `run_eval.py --limit 0` 只跑了 Caroline_Melanie
+
+根因：``scripts/run_eval.py`` 的 ``--dirs`` **默认值写死了** ``["Caroline_Melanie"]``。改为默认
+``[]``（= 全部含 ``msgmem.jsonl`` 的目录），并在文档里说明 ``--limit 0`` 才是全量。
+
+### ④ add 并行的**全局**并发闸门（顺带修的）
+
+上一版把 atommem 改成整目录并行后，``async_main`` 的"目录级 semaphore" + ``run_dir`` 的"message 级
+semaphore"是**两层独立**的 → 跑 10 个目录会有 ``concurrency × 10`` 个并发请求打在模型端点上。
+改成：一个**全局** semaphore，所有目录、所有 message 任务共用（单一上限 = ``concurrency``）。
+
+### 验证
+
+``scripts/test_search.py``（478 项）与 ``test_api.py``（44 项）全绿；``parse_time_expression``
+的 8 个新模式各有断言；all-dirs 重新生成 atommem 走通。跨全部 10 个目录的全量评测留给
+``python scripts/run_eval.py --limit 0``（现在会真的跑全部目录）。
+
+### S18 实测（Caroline_Melanie 全量，`search_anchorfix_20261008_100103`）
+
+| 指标 | 改前（090757） | 改后 |
+|---|---|---|
+| **token_f1** | 0.408 | **0.473** |
+| **open_domain** | 37.5% | **75.0%** |
+| evidence_recall | 48.4% | 52.3% |
+| unsupported_rate | 8.9% | **2.3%** |
+| judge_accuracy | 69.1% | 66.4% |
+| temporal | 76.5% | 70.3%（**定向 10 条 temporal 全对**，见上表）|
+| multi_hop | 71.4% | 52.4% |
+| single_hop | 68.3% | 67.7% |
+
+**同集合口径**（两跑共有的 113 条）：judge 69.0% → 68.1%（**基本不变**）；分项
+open_domain 0.50→0.67、single_hop 0.67→0.69、temporal 0.76→0.76、multi_hop 0.67→0.50。
+
+**诚实说明 multi_hop 的落差**：它**不是**这几处 prompt 改动造成的，而是 search 的逐跑随机性
+（temp 0.2）—— 两次运行 **113 条里有 89 条答案不同**。抽查 qa37（"what did Melanie paint
+recently?"，参考 "sunset"）与 qa24（"ways to destress"，参考 "Running, pottery"）：新跑的
+**evidence 里就没有** sunset / pottery（search 没检索到），answer 无米下炊，与 answer prompt 无关。
+answer 侧本身也有 ±2~3pt 的方差（同一 evidence、只改 STYLE 措辞，multi_hop 在 47.6%~57.1% 之间跳）。
+
+**结论**：锚定时间形态（+token F1）与 counterfactual 强化（+open_domain）是**确定的正向**；
+judge 整体在噪声内持平；STYLE 段保留"先给完整答案"的写法以规避集合题漏成员。
+
+---
+
+## S19: S18 的一次回归及其根因（2026-10-08）
+
+S18 落地后用户全量复测：judge **69.1% → 61.7%**，且 `reference="2022"` 答成 `8 May 2023`、
+`"June 2023"` 答成 `next month`、`"July 2023"` 答成 `this month` —— 明显回归。逐条查证后是**两处**
+改动叠加，都定位到了具体机制。
+
+### 根因 1：`EVIDENCE_STANDARD` 第 3 条被改写，把 search agent 带偏
+
+S18 把第 3 条从
+> "Keep a relative phrase AS WRITTEN **and attach its anchor when a reader ... would need it**: '<person>
+> did X 'last week' -- i.e. the week before <session date>'"
+
+改成
+> "Keep a relative phrase AS WRITTEN **with its anchor**: 'last week' -> 'the week before <session date>'"
+
+措辞看着等价，但 8B 的实际行为变了：它开始**照抄 msgmem 的原始相对词**（`last year` / `next month`），
+而不是照抄 atommem 里**已经解算好**的 `time`（`2022` / `September 2023`）。**对照实验**（把旧 atommem 换回来、
+prompt 不变）证明这不是语料问题：qa1 在新旧 atommem 下都答错 → 是 **prompt** 的锅。
+
+**修法：把第 3 条回退到 S18 之前的措辞**（保留 "attach its anchor when a reader would need it" 的原句）。
+
+### 根因 2：`atommem_time` 把月份写成 `the month after 28 August 2023`
+
+S18 让相对表达产出"与参考同形"的锚定表述，但**月份的参考形态是月份名**（`June 2023` / `September 2023`），
+不是 `the month after X`。更糟的是 judge 的 `resolve_relative_date` 只认 `the <unit> **before** X`
+（不认 `after`），于是 `the month after 28 August 2023` 既非参考形态、judge 也解析不出。
+
+**修法：`last/this/next month` 直接产出月份名 + 年份**（`_shift_month`）——`next month` @ 28 Aug → `September 2023`。
+week/weekend/weekday 仍保留 `the <unit> before <anchor>`（那正是参考形态）。
+
+### 实测（Caroline_Melanie 全量）
+
+| 运行 | 状态 | judge |
+|---|---|---|
+| `search_090757` | S17（改动前） | 69.1% |
+| `search_123213` | S18（回归） | 61.7% |
+| `search_fix2` | S18 + 这两处修复 | **72.3%** |
+
+**同集合口径**（fix2 vs 090757 共有的 115 条）：68.7% → **73.9%**；分项 temporal 0.76→**0.85**、
+single_hop 0.67→**0.74**、multi_hop 0.67→0.61（噪声）、open_domain 0.50→0.50。
+
+### 教训
+
+- **search agent（8B）对 prompt 措辞极其敏感** —— 一句"看着等价"的改写就能让它整体换一种行为。
+  任何 search prompt 改动**必须全量跑一次**才能宣布有效，不能用"读起来更清楚"来判断。
+- **"与参考同形"要按每条参考的实际形态定**：日期是 `7 May 2023`、周是 `the week before X`、
+  **月是 `September 2023`** —— 不能一刀切。
+- judge 的解析能力是"答案形态"的硬约束：产出 judge 认不出的形态（`the month after X`）等于答错。
+
+> **另一处试过但**没生效**的修法（记录以免重试）**：qa6/qa17 这类"evidence 里就是一个裸相对词
+> （`next month` / `this month`）"的情况，试过在 answer prompt 里加"用该条记忆里的任何日期把它解析出来"
+> 的规则 —— 实测**不生效**（8B answer 仍原样输出 `next month`），且 0.723 → 0.708 轻微拖累，已回退。
+> 要根治只能在 **search 侧**让 agent 产出带锚点的 evidence（风险高，需整轮复测）。

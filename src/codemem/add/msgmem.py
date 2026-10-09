@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from .. import dataset
@@ -35,18 +34,6 @@ from ..io import DATA_DIR, make_memory, now_iso, write_jsonl
 from .memory import ATOMMEM_NAME, MSGMEM_NAME, SUMMEM_NAME
 
 __all__ = ["ATOMMEM_NAME", "MSGMEM_NAME", "SUMMEM_NAME", "main", "run"]
-
-
-def parse_session_datetime(date_time: str) -> str:
-    """``'1:56 pm on 8 May, 2023'`` -> ISO-8601（无时区）。解析失败原样返回。
-
-    **不加时区**：会话时间在数据里是本地时间，硬套 UTC 会把它平移几个小时甚至一天，
-    而下游要拿它做日期算术 —— 差一天就是错的答案。
-    """
-    try:
-        return datetime.strptime(date_time, "%I:%M %p on %d %B, %Y").isoformat()
-    except (ValueError, TypeError):
-        return date_time
 
 
 def build_msg_item(message: dataset.RawMessage) -> dict:

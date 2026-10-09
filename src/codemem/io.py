@@ -255,44 +255,6 @@ def write_jsonl(path: Path, items: Iterable[dict[str, Any]]) -> None:
         raise
 
 
-def append_jsonl(path: Path, items: Iterable[dict[str, Any]]) -> None:
-    """追加写（断点续跑用）。每行独立，中断只会丢最后一行。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        for item in items:
-            handle.write(json.dumps(item, ensure_ascii=False) + "\n")
-
-
-def ensure_jsonl(path: Path) -> None:
-    """确保文件存在（可能为空）。断点续跑时用来"占位"。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.touch(exist_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# 路径
-# ---------------------------------------------------------------------------
-
-def resolve_dir(target: str | Path, root: Path | None = None) -> Path | None:
-    """把一个"目录名或路径"解析成实际目录。
-
-    接受三种写法：``Caroline_Melanie``（相对 ``data/``）、``data/Caroline_Melanie``、
-    或绝对路径。找不到返回 ``None``（调用方决定是跳过还是报错）。
-    """
-    base = root or DATA_DIR
-    path = Path(target)
-    candidates = [path] if path.is_absolute() else [base / path, PROJECT_ROOT / path]
-    for candidate in candidates:
-        if candidate.is_dir():
-            return candidate
-    return None
-
-
-def default_config_path(name: str) -> Path:
-    """``default_config_path("search")`` -> ``configs/search.yaml``。"""
-    return CONFIG_DIR / f"{name}.yaml"
-
-
 # ---------------------------------------------------------------------------
 # session 记录（session_template.jsonl 的格式）
 # ---------------------------------------------------------------------------
@@ -303,12 +265,6 @@ def msg_id(record: dict[str, Any]) -> str:
     if isinstance(value, str) and value:
         return value
     return memory_id(record)
-
-
-def msg_role(record: dict[str, Any]) -> str:
-    """发言者。原始消息是说话人名字；两层 summary 的产物是 ``"summary"``。"""
-    value = record.get("role")
-    return value if isinstance(value, str) else ""
 
 
 def msg_content(record: dict[str, Any]) -> str:
@@ -331,31 +287,6 @@ def msg_time(record: dict[str, Any]) -> str:
     if isinstance(value, str):
         return value
     return memory_time(record)
-
-
-def msg_kind(record: dict[str, Any]) -> str:
-    """时间种类：``point`` / ``range`` / ``approx``（消解阶段写入；原始消息为空）。"""
-    value = record.get("time_kind")
-    return value if isinstance(value, str) else ""
-
-
-def source_content(record: dict[str, Any]) -> str:
-    """原始措辞（消解前）。未消解过的记录为空 —— 此时 ``content`` 就是原话。"""
-    value = record.get("source_content")
-    return value if isinstance(value, str) else ""
-
-
-def source_time(record: dict[str, Any]) -> str:
-    """原始时间词（会话时间戳）。未消解过的记录为空。"""
-    value = record.get("source_time")
-    return value if isinstance(value, str) else ""
-
-
-def make_session_record(
-    msg_id_value: str, role: str, content: str, time: str = ""
-) -> dict[str, Any]:
-    """建一条 session_template 记录。字段顺序固定，便于 diff 与人工阅读。"""
-    return {"msg_id": msg_id_value, "role": role, "time": time, "content": content}
 
 
 # ---------------------------------------------------------------------------
@@ -393,14 +324,6 @@ def memory_role(item: dict[str, Any]) -> str:
     """``metadata.role``：说话人真名 / ``summary``。"""
     value = (item.get("metadata") or {}).get("role")
     return value if isinstance(value, str) else ""
-
-
-def memory_tags(item: dict[str, Any]) -> list[str]:
-    """``metadata.tag``：字符串标签数组（非法的项丢掉）。"""
-    raw = (item.get("metadata") or {}).get("tag")
-    if not isinstance(raw, list):
-        return []
-    return [tag for tag in raw if isinstance(tag, str) and tag.strip()]
 
 
 def make_memory(
@@ -442,43 +365,9 @@ def memory_text(item: dict[str, Any]) -> str:
     return ""
 
 
-def memory_speaker(item: dict[str, Any]) -> str:
-    """从 tag 里抽 ``speaker:<name>``；没有则 ``"unknown"``。"""
-    tags = (item.get("metadata") or {}).get("tag") or []
-    for tag in tags:
-        if isinstance(tag, str) and tag.startswith("speaker:"):
-            return tag.split(":", 1)[1]
-    return "unknown"
-
-
 def memory_time(item: dict[str, Any]) -> str:
     value = (item.get("metadata") or {}).get("time")
     return value if isinstance(value, str) else ""
-
-
-def dedupe_by_id(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """按 id 去重，保留首次出现。**没有 id 的条目一律保留** —— 它们无法判定重复。"""
-    seen: set[str] = set()
-    result: list[dict[str, Any]] = []
-    for item in items:
-        item_id = memory_id(item)
-        if item_id and item_id in seen:
-            continue
-        if item_id:
-            seen.add(item_id)
-        result.append(item)
-    return result
-
-
-def format_time(value: Any) -> str:
-    """把 time 字段规整成字符串（模型偶尔会给出非字符串）。空值返回空串。"""
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, (int, float)):
-        return str(value)
-    return json.dumps(value, ensure_ascii=False)
 
 
 def now_iso() -> str:

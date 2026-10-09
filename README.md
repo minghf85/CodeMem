@@ -75,21 +75,26 @@ python -m codemem.add --stage atommem       # 只跑某一层
 |---|---|---|---|
 | `msgmem.jsonl` | `msg` | 每条原始消息（原话），`time` 是会话时间戳（锚点） | 纯 CPU，由 dataset 直接转换 |
 | `summem.jsonl` | `summary` | 每个会话一份总结 | LLM，逐 session 一次 |
-| `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **并行 add agent 逐 message 处理** |
+| `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **三阶段 pipeline**（单次 LLM 抽取 + 代码级消解） |
 
 `msgmem` 保留原始措辞与原始时间，是时间/指代的锚点；`atommem` 才是消解后的产物 —— 指代消解成
-真名、时间折算成绝对日期或带绝对锚点的相对时间（`the week before 9 June 2023`），精度严格照源话。
-**并行 add agent**（`atommem_agent_v2.py`）：每条 message 一个独立 agent，看到**此前全部内容**
-（前面所有 session + 本 session 前文），自己 grep `msgmem`/`summem` 消解指代，把原子事实写进各自的
-文件后合并。**代码级兜底**保证质量：时间用 `date -d` 折算（"yesterday" → `2023-05-07`）、memory
-里残留的裸相对时间词由 `_strip_relative_time` 剥掉、tag key 收敛进固定 12 个。模型只填
-`{memory, time, role, tag}` 四个字段，`id/source/type/changelog` 由系统补齐。
+真名、时间**保留成带锚点的相对表述**（`the week before 9 June 2023` / `the Friday before 15 July 2023`），
+粒度严格照源话。**默认走三阶段 pipeline**（`--stage atommem`）：召回（同会话前文）→ 单次 LLM 抽出
+`{memory, time_expr, role, tag}` → **代码级后处理**。后处理把 `time_expr` 结合该消息的会话时间产出
+最终 `time`：`yesterday` → `7 May 2023`、`last Saturday` → **`the Saturday before 25 May 2023`**、
+`last week` → `the week before 9 June 2023` —— **相对表达本身就是完整答案，不折算成算出的日期**
+（折算既丢精度，judge 也未必能复核算术；参考语料的 "when" 答案绝大多数正是这种锚定形态）。
+**整目录并行**：每条 message 的抽取互不依赖（召回只读 `msgmem`、id 按各自 source 分配、去重是收尾的
+一次全局 pass），所以全部 message 并发抽取后一次性去重落盘 —— 419 条 message 从串行 ~45 分钟降到 ~1 分钟。
+另有并行 add agent（`atommem_agent_v2.py`，每条 message 一个 agent、自己 grep 消解）与串行 agent
+（`atommem.py`）用于对比；agent 更灵活但 8B 在 loop 里**不稳定**，故不作默认。
 
 ```bash
-python -m codemem.add --stage atommem                    # 默认并行 agent
-python -m codemem.add --stage atommem --mode pipeline    # 三阶段 pipeline（对比用，已弃用）
+python -m codemem.add --stage atommem                    # 默认：三阶段 pipeline
+python -m codemem.add --stage atommem --mode agent-v2    # 并行 agent（对比用）
 python -m codemem.add --stage atommem --mode agent       # 串行 agent（对比用）
 ```
+
 
 ### 2. 检索证据（search）
 

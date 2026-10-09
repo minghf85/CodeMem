@@ -126,22 +126,6 @@ def atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
-def shrink_notice(path: Path, before: int, after: int) -> str:
-    """文件被大幅缩短时的提示语（**不拒绝**，只提醒）。
-
-    这是**截断检测**：模型输出被 ``max_tokens`` 切断时，典型表现就是重写后的文件比原来
-    短很多。此时既不能静默接受（会丢证据），也不能直接拒绝（agent 可能真的是在精简）——
-    所以把事实摆到观测里，让模型自己判断。空内容则更明确，直接拒绝（见 ``write``）。
-    """
-    if before >= 200 and after < before * 0.5:
-        return (
-            f"\n\n[WARNING: {path} shrank from {format_size(before)} to "
-            f"{format_size(after)}. If your output was truncated, the content is now "
-            f"incomplete -- read the file back and rewrite it in full.]"
-        )
-    return ""
-
-
 @dataclass(frozen=True, slots=True)
 class Truncation:
     """截断结果 + 元信息（``to_details`` 进 JSONL，``note`` 进观测文本）。"""
@@ -391,58 +375,6 @@ def create_read_tool(
         guidelines=(),
         input_schema={},
         executor=execute,
-    )
-
-
-# ---------------------------------------------------------------------------
-# write
-# ---------------------------------------------------------------------------
-
-def create_write_tool(*, cwd: Path, confine: bool = True,
-                      protect_filenames: tuple[str, ...] = ("evidence.jsonl",)) -> ToolDefinition:
-    protected = tuple(protect_filenames)
-
-    async def execute(arguments: Mapping[str, Any]) -> ToolResult:
-        path = _path_arg(arguments, "path", cwd=cwd)
-        content = _str_arg(arguments, "content")
-        if confine:
-            _ensure_inside(path, cwd)
-
-        previous = path.stat().st_size if path.exists() else 0
-        existed = path.exists()
-
-        # 空内容**拒绝**：多轮之间最常见的截断表现，会静默销毁之前写好的证据。
-        # 这里拒绝比接受更安全，而且模型看到错误后会重写。
-        if existed and not content.strip() and path.name in protected:
-            raise ToolError(
-                f"refusing to overwrite {path.name} with empty content -- that would erase "
-                f"{previous} bytes of existing evidence. Write the full list of records, or "
-                f"delete the file first if you really mean to start over."
-            )
-
-        async with _FileLock(path):
-            atomic_write_text(path, content)
-
-        line_count = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
-        return ToolResult(
-            text=(
-                f"Successfully wrote {len(content)} characters ({line_count} lines) to {path}."
-                + shrink_notice(path, previous, len(content.encode()))
-            ),
-            details={
-                "path": str(path),
-                "characters": len(content),
-                "lines": line_count,
-                "existed": existed,
-                "previous_bytes": previous,
-                "shrank": existed and len(content.encode()) < previous * 0.5,
-                "atomic": True,
-            },
-        )
-
-    return ToolDefinition(
-        name="write", description="", guidelines=(), input_schema={},
-        executor=execute, mutating=True,
     )
 
 

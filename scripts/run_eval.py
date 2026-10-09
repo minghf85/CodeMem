@@ -5,9 +5,9 @@
 而完整流程是三步、各自有自己的 CLI 与产物路径。手敲三遍太慢，也容易把中间产物接错
 （比如 answer 默认取"最近一次 search 运行"，而你可能刚跑完一次无关的 dry-run）。
 
-    python scripts/run_eval.py                       # 默认：2 个目录 × 前 5 条 QA，判分
-    python scripts/run_eval.py --limit 20             # 多跑几条
-    python scripts/run_eval.py --dirs Caroline_Melanie
+    python scripts/run_eval.py                       # 默认：全部目录 × 前 5 条 QA，判分
+    python scripts/run_eval.py --limit 0              # 全部目录 × 全部 QA（全量）
+    python scripts/run_eval.py --dirs Caroline_Melanie  # 只跑指定目录
     python scripts/run_eval.py --tag v4-time-rule     # 给这次运行打标记，便于对比
     python scripts/run_eval.py --no-answer            # 只跑 search，看 evidence 产出
     python scripts/run_eval.py --no-judge             # 跑完三步但只算 CPU 指标（省模型调用）
@@ -169,8 +169,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("脚本做三件事")[0].split("存在的理由")[1],
     )
-    parser.add_argument("--dirs", nargs="*", default=["Caroline_Melanie"],
-                        help="交给 search 的 speaker 目录（默认 Caroline_Melanie）")
+    parser.add_argument("--dirs", nargs="*", default=[],
+                        help="交给 search 的 speaker 目录（缺省 = 全部含 msgmem 的目录）")
     parser.add_argument("--limit", type=int, default=5,
                         help="每个目录处理前 N 条 QA（默认 5；0 = 全部）。这是 --max-qa")
     parser.add_argument("--max-steps", type=int, default=12, help="每条 QA 步数上限（默认 12）")

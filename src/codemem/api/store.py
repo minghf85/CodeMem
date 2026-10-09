@@ -344,17 +344,3 @@ def llm_quiet_logger():
     from ..log import Logger
 
     return Logger(level="warn")
-
-
-# ---------------------------------------------------------------------------
-# 排错用
-# ---------------------------------------------------------------------------
-
-def debug_dump(store: UserStore, stream: Any | None = None) -> None:
-    """把该 user 的语料条数打到 stderr（排错用，不影响协议）。"""
-    stream = stream or sys.stderr
-    print(
-        f"[store] user={store.user_id} root={store.root} "
-        f"msg={len(store.sessions())}",
-        file=stream,
-    )

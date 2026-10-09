@@ -16,20 +16,13 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
-from pathlib import Path
 from typing import Any
 
 from .. import llm
-from ..io import memory_id, memory_role, memory_text, now_iso, read_jsonl
+from ..io import memory_id, memory_role, memory_text, now_iso
 from ..log import Logger
 from .atommem import (
-    TAG_KEYS,
-    _TAG_ALIASES,
-    _dedup_atoms,
-    _dedup_key,
     _max_suffix,
-    _merge_ids,
     _normalize_tags,
 )
 
@@ -245,130 +238,22 @@ async def extract_atoms_llm(
 # ============================================================================
 
 def parse_time_expression(time_expr: str, anchor_time: str) -> str:
-    """把 time_expr + 锚点时间 → 绝对时间（用 date -d）。
+    """把 time_expr + 锚点时间 → 最终落盘的 ``metadata.time``。
 
-    返回：
-    - ISO 日期（"2023-05-07"）
-    - 带锚点的相对表述（"the week before 2023-05-08"）
-    - 区间（"2022"、"2023-05-01/2023-05-07"）
-    - 空字符串（无法解析或无时间）
+    **委托给单一事实源** ``atommem_time.parse_time_expression``（与 agent 模式共用同一份
+    逻辑）。本模块曾有一份自己的实现（直接 ``date -d "<anchor> <expr>"``），有两个实测缺陷，
+    都直接造成 temporal 类答错：
+
+    1. ``"last <weekday>"`` 被 GNU date 解析成**锚点本身**：实测
+       ``date -d "25 May 2023 last saturday"`` → ``2023-05-25``（正是会话日期），于是
+       "last Saturday" 被错记成会话当天（qa5 / qa28 / qa29 等一批题错在这）。
+    2. 粗粒度表述（"last week"）被压成**单日绝对日期**，丢掉锚点，下游只能照抄这个日期。
+
+    修正逻辑（保留锚点、星期几用 Python 精确折算、精度只减不增）在 ``atommem_time``。
     """
-    if not time_expr or not time_expr.strip():
-        return ""
+    from .atommem_time import parse_time_expression as _resolve
 
-    expr = time_expr.strip().lower()
-    if not anchor_time or not anchor_time.strip():
-        # 没有锚点，保留原表述
-        return time_expr
-
-    # 提取锚点里的日期部分（"1:56 pm on 8 May, 2023" → "8 May 2023"）
-    anchor_date = _extract_date_from_anchor(anchor_time)
-    if not anchor_date:
-        return f"{time_expr} (anchor: {anchor_time})"
-
-    # 尝试用 date -d 解析
-    # 支持的格式：yesterday, last week, 3 days ago, next month 等
-    normalized = _normalize_expr(expr)
-    try:
-        cmd = ["date", "-d", f"{anchor_date} {normalized}", "+%Y-%m-%d"]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            env={"LC_ALL": "C"},  # 确保英文输出
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-
-    # date 解析失败，尝试模式匹配提取粒度
-    # "last year" → 年份
-    if "last year" in expr:
-        match = re.search(r"(\d{4})", anchor_date)
-        if match:
-            year = int(match.group(1)) - 1
-            return str(year)
-
-    # "N years ago"
-    match = re.search(r"(\d+)\s+years?\s+ago", expr)
-    if match:
-        n = int(match.group(1))
-        try:
-            cmd = ["date", "-d", f"{anchor_date} -{n} year", "+%Y"]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, env={"LC_ALL": "C"})
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except Exception:
-            pass
-
-    # "for N years" → 区间
-    match = re.search(r"for\s+(\d+)\s+years?", expr)
-    if match:
-        n = int(match.group(1))
-        try:
-            cmd = ["date", "-d", f"{anchor_date} -{n} year", "+%Y-%m-%d"]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, env={"LC_ALL": "C"})
-            if result.returncode == 0:
-                start = result.stdout.strip()
-                cmd2 = ["date", "-d", f"{anchor_date}", "+%Y-%m-%d"]
-                result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=5, env={"LC_ALL": "C"})
-                if result2.returncode == 0:
-                    end = result2.stdout.strip()
-                    return f"{start}/{end}"
-        except Exception:
-            pass
-
-    # 无法解析，保留原表述 + 锚点
-    return f"{time_expr} (anchor: {anchor_time})"
-
-
-def _extract_date_from_anchor(anchor_time: str) -> str:
-    """从锚点时间字符串提取 date 命令能识别的日期部分。
-
-    "1:56 pm on 8 May, 2023" → "8 May 2023"
-    "8 May 2023" → "8 May 2023"
-    """
-    # 尝试提取 "on <date>" 格式
-    match = re.search(r"on\s+(.+)$", anchor_time)
-    if match:
-        date_part = match.group(1).strip()
-        # 去掉逗号（date 命令不需要）
-        return date_part.replace(",", "")
-
-    # 尝试直接匹配日期格式 "8 May 2023"
-    match = re.search(r"(\d{1,2}\s+[A-Za-z]+,?\s+\d{4})", anchor_time)
-    if match:
-        return match.group(1).replace(",", "")
-
-    # 尝试 ISO 格式
-    match = re.search(r"(\d{4}-\d{2}-\d{2})", anchor_time)
-    if match:
-        return match.group(1)
-
-    return anchor_time
-
-
-def _normalize_expr(expr: str) -> str:
-    """把口语化表述转成 date -d 能理解的格式。"""
-    # yesterday → -1 day
-    # last week → -1 week
-    # 3 days ago → -3 days
-    # next month → +1 month
-
-    expr = expr.replace("yesterday", "-1 day")
-    expr = expr.replace("last week", "-1 week")
-    expr = expr.replace("last month", "-1 month")
-    expr = expr.replace("last year", "-1 year")
-    expr = expr.replace("next week", "+1 week")
-    expr = expr.replace("next month", "+1 month")
-    expr = expr.replace("next year", "+1 year")
-
-    # N days/weeks/months/years ago → -N days/weeks/months/years
-    expr = re.sub(r"(\d+)\s+(day|week|month|year)s?\s+ago", r"-\1 \2", expr)
-
-    return expr
+    return _resolve(time_expr, anchor_time)
 
 
 def validate_memory_no_time(memory: str) -> bool:

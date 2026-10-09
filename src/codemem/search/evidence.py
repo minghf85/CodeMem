@@ -30,8 +30,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..io import read_jsonl_report_text
-
 VALID_TYPES = ("inner", "outer", "raw")
 REQUIRED_META = ("id", "type", "time", "tag", "source")
 
@@ -392,22 +390,6 @@ def validate_file(path: Path) -> EvidenceReport:
         report.valid.append(memory)
 
     return report
-
-
-def _try_whole_file(text: str) -> list[Any] | None:
-    """把整个文件当一个 JSON 文档解析。返回记录列表，失败返回 None。"""
-    stripped = text.strip()
-    if not stripped or stripped[0] not in "[{":
-        return None
-    try:
-        parsed = json.loads(stripped)
-    except json.JSONDecodeError:
-        return None
-    if isinstance(parsed, list):
-        return parsed
-    if isinstance(parsed, dict):
-        return [parsed]
-    return None
 
 
 def write_normalized(path: Path, report: EvidenceReport) -> None:

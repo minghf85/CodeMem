@@ -267,11 +267,6 @@ class Step:
         }
 
 
-def steps_for_record(records: list[Any], observation_chars: int = 600) -> list[dict[str, Any]]:
-    """把若干 ``Step`` 序列化成可落盘的 dict（统一在这里决定截断长度）。"""
-    return [step.to_dict(observation_chars) for step in records]
-
-
 @dataclass
 class AgentOutcome:
     """agent 在一个 round 里（到它说"我做完了"为止）的完整记录。"""

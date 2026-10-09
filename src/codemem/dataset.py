@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from .io import DATA_DIR, PROJECT_ROOT
+from .io import PROJECT_ROOT
 
 DATA_FILE = PROJECT_ROOT / "data" / "correct_locomo10.json"
 

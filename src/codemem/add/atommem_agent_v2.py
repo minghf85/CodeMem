@@ -14,24 +14,19 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 from pathlib import Path
 from typing import Any
 
 import openai
 
-from .. import llm
 from ..io import memory_id, memory_role, memory_text, now_iso, read_jsonl
 from ..log import Logger
 from ..search import agent as agent_mod
 from ..search import toolcfg, tools as tools_mod
 from .atommem import (
     TAG_KEYS,
-    _TAG_ALIASES,
     _dedup_atoms,
-    _max_suffix,
-    _merge_ids,
     _normalize_tags,
     gen_call_config,
     parse_dir_label,

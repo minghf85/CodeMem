@@ -164,14 +164,20 @@ def test_toolcfg(tmp: Path) -> None:
     ap = _P.ANSWER_PROMPT
     check("answer：会话时间不是事件时间", "WHEN THE CONVERSATION HAPPENED" in ap)
     check("answer：相对表达原样保留 + 加锚点", "COMPLETE answer" in ap)
-    check("answer：禁止把相对表达压成单日", "Do NOT flatten" in ap)
+    check("answer：禁止把相对表达压成单日", "NEVER collapse" in ap)
     check("answer：不许编造更细的精度", "granularity" in ap)
     check("answer：禁止无锚点的相对词", "next month" in ap and "WRONG" in ap)
-    check("answer：不要编造源没有的精度", "do NOT add precision" in ap.lower()
-          or "Do NOT add precision" in ap)
-    check("answer：列表题要枚举成员", "ENUMERATE every member" in ap)
+    check("answer：不要编造源没有的精度", "add precision" in ap)
+    check("answer：列表题要枚举成员", "enumerate every member" in ap)
     check("answer：反事实题要从相关事实推理并表态",
-          "COUNTERFACTUAL" in ap and "Do NOT abstain just because" in ap)
+          "COUNTERFACTUAL" in ap and "commit to" in ap)
+    check("answer：锚定短语不要折成算出的日期", "replace it with the computed date" in ap)
+    check("answer：日期写成 '7 May 2023' 而非 ISO", "7 May 2023" in ap)
+    check("answer：反事实题不得弃答", "abstaining is a wrong answer" in ap)
+    check("answer：先给完整答案（集合题不得缩水）", "COMPLETE answer first" in ap)
+    check("answer：措辞要短（短语而非整句）", "short and direct" in ap)
+    check("answer：短不得以漏成员为代价", "dropping part of it" in ap)
+    check("answer：禁止把 session id 当日期", "session id" in ap)
 
     # --- atom 标准：具体细节不许抽象化 + 一事实一原子 + tag key 固定 ---
     atom_std = _P.ATOM_AGENT_STANDARD
@@ -250,7 +256,9 @@ def test_toolcfg(tmp: Path) -> None:
     # SPECIFICS），都是针对实测最大瓶颈（集合题 recall=0）的有意增长。断言继续防非预期膨胀。
     # 19700 -> 19950："atoms 太抽象时去 msgmem 找具体名"的策略段（针对范式3：wrong entity，
     # 如 "likes classical music" 丢了 "Bach and Mozart"），同样是有意增长。
-    check("system prompt 控制在 19950 字符内", len(rendered) < 19950, str(len(rendered)))
+    # 19950 -> 21000：两条针对实测 bad case 的时间规则（"atom.time == 会话日期 是红旗" +
+    # "不许把 session id 当日期"）与证据标准第 11 条（正文不写 id/占位符），都是有意增长。断言继续防非预期膨胀。
+    check("system prompt 控制在 21000 字符内", len(rendered) < 21000, str(len(rendered)))
 
     # 响应解析
     check("解析裸 JSON", (toolcfg.parse_tool_call('{"tool":"bash","args":{"command":"ls"}}') or
@@ -1386,6 +1394,26 @@ def test_judge_temporal() -> None:
                            ("July 2023", date(2023, 7, 1))]:
         check(f"解析 {text!r}", J._parse_date(text) == expected, str(J._parse_date(text)))
 
+    # anchor-form：add 侧保留相对表达时的**规范形态** "<relative> (anchor: <date>)"。
+    # 实测旧 _parse_date 会只从里面抠出锚点日期，把 "last week (anchor: 27 June 2023)" 当成
+    # 27 June 本身（差一周），逐字正确的答案被判 INCORRECT。
+    check("anchor-form 'last week (anchor: X)' 折算正确",
+          J._parse_date("last week (anchor: 27 June 2023)").isoformat() == "2023-06-20")
+    check("anchor-form 'last weekend (anchor: X)' 折算正确",
+          J._parse_date("last weekend (anchor: 17 July 2023)").isoformat() == "2023-07-15")
+    check("anchor-form 'last Tues (anchor: X)' 折算正确（缩写星期几）",
+          J._parse_date("last Tues (anchor: 20 July 2023)").isoformat() == "2023-07-18")
+    check("anchor-form 'next month (anchor: X)' 折算正确",
+          J._parse_date("next month (anchor: 28 August 2023)") == date(2023, 9, 1))
+    check("anchor-form 'last month (anchor: X)' 折算正确",
+          J._parse_date("last month (anchor: 13 October 2023)") == date(2023, 9, 1))
+    check("anchor-form 与相对参考等价",
+          J._parse_date("last week (anchor: 23 August 2023)")
+          == J.resolve_relative_date("The week before 23 August 2023"))
+    check("裸锚点日期仍不等价（'3 July 2023' != 'the week before 3 July 2023'）",
+          J._parse_date("3 July 2023") != J.resolve_relative_date("The week before 3 July 2023"))
+
+
     # hint：同一天要明确说 SAME DATE
     hint = J.temporal_hint("The week before 6 July 2023", "2023-06-29")
     check("同一天给 SAME DATE 提示", "SAME date" in hint, hint[:140])
@@ -1592,8 +1620,9 @@ def test_add_memory_module(tmp: Path) -> None:
                            "metadata": {"time": "last Friday"}}],
         source_id="session_19_1", default_time="9:55 am on 22 October, 2023", default_role="Caroline",
     )
-    check("finalize：'last Friday' 折算成带锚点且日期正确（22 Oct 2023 之前的周五 = 10/20）",
-          "2023-10-20" in _rel[0]["metadata"]["time"], _rel[0]["metadata"]["time"])
+    check("finalize：'last Friday' 保留成 'the Friday before 22 October 2023'（与参考同形，不折算日期）",
+          _rel[0]["metadata"]["time"] == "the Friday before 22 October 2023",
+          _rel[0]["metadata"]["time"])
     # 抄了会话时间戳当事件时间 -> 留空
     _copied = atommem_mod.finalize_file(
         before={}, after=[{"memory": "Caroline continued her education",
@@ -1603,17 +1632,29 @@ def test_add_memory_module(tmp: Path) -> None:
     check("finalize：抄会话时间戳作事件时间 -> 被识别并留空",
           _copied[0]["metadata"]["time"] == "", repr(_copied[0]["metadata"]["time"]))
 
-    # 场景 1b：parse_time_expression 解析 "last <weekday>"（不带 day 的缩写也要认）
+    # 场景 1b：parse_time_expression —— 相对表达保留成与参考同形的 "the <unit> before <锚点>"，不折算日期
     _P = atommem_time_mod.parse_time_expression
-    check("parse_time：'last Friday' @ 22 Oct 2023(周日) -> 10/20 之前那个周五",
-          "2023-10-20" in _P("last Friday", "9:55 am on 22 October, 2023"), _P("last Friday", "9:55 am on 22 October, 2023"))
-    check("parse_time：'Last Fri' @ 15 Jul 2023(周六) -> 7/14",
-          "2023-07-14" in _P("Last Fri", "1:51 pm on 15 July, 2023"), _P("Last Fri", "1:51 pm on 15 July, 2023"))
-    check("parse_time：'last Saturday' @ 25 May 2023 -> 5/20（完整词形）",
-          "2023-05-20" in _P("last Saturday", "1:14 pm on 25 May, 2023"), _P("last Saturday", "1:14 pm on 25 May, 2023"))
-    check("parse_time：'last week' 保持原样 + 锚点（不折算）",
-          _P("last week", "7:55 pm on 9 June, 2023") == "last week (anchor: 9 June 2023)")
-    check("parse_time：'yesterday' 折成绝对日期", _P("yesterday", "1:56 pm on 8 May, 2023") == "2023-05-07")
+    check("parse_time：'last Friday' @ 22 Oct 2023 -> 'the Friday before 22 October 2023'",
+          _P("last Friday", "9:55 am on 22 October, 2023") == "the Friday before 22 October 2023")
+    check("parse_time：'Last Fri' 缩写也认 -> 'the Friday before 15 July 2023'",
+          _P("Last Fri", "1:51 pm on 15 July, 2023") == "the Friday before 15 July 2023")
+    check("parse_time：'last Saturday' @ 25 May 2023 -> 'the Saturday before 25 May 2023'",
+          _P("last Saturday", "1:14 pm on 25 May, 2023") == "the Saturday before 25 May 2023")
+    check("parse_time：'last week' -> 'the week before 9 June 2023'（不折算）",
+          _P("last week", "7:55 pm on 9 June, 2023") == "the week before 9 June 2023")
+    check("parse_time：'last weekend' -> 'the weekend before 17 July 2023'",
+          _P("last weekend", "1:51 pm on 17 July, 2023") == "the weekend before 17 July 2023")
+    check("parse_time：'yesterday' 折成 '7 May 2023'（非 ISO）",
+          _P("yesterday", "1:56 pm on 8 May, 2023") == "7 May 2023")
+    check("parse_time：'last night' 折成前一天 '13 August 2023'",
+          _P("last night", "2:24 pm on 14 August, 2023") == "13 August 2023")
+    check("parse_time：'last year' -> 年份", _P("last year", "5:00 pm on 8 May, 2023") == "2022")
+    check("parse_time：'next month' -> 月份名 'September 2023'（照参考，别写 'the month after X'）",
+          _P("next month", "1:00 pm on 28 August, 2023") == "September 2023")
+    check("parse_time：'this month' -> 'July 2023'",
+          _P("this month", "1:36 pm on 3 July, 2023") == "July 2023")
+    check("parse_time：'last month' -> 'September 2023'",
+          _P("last month", "1:00 pm on 13 October, 2023") == "September 2023")
 
     # 场景 2：模型带了假 id/source/type —— 作为新行一律被覆盖
     overridden = atommem_mod.finalize_file(
