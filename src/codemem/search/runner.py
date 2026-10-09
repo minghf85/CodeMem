@@ -98,6 +98,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_parse_retries": 2,
     # 同一个工具+参数重复调用几次后**拒绝执行**（实测模型会用 >> 重复追加很多遍）
     "repeat_limit": 1,
+    # 同一工具**连续失败**几次后，在观测里注入"换做法"的纠正提示（0 = 关）。
+    # 实测 gpt-4o-mini 会把一条失败的 edit 连错 6 次到空转，失败路径原本零提示。
+    "tool_failure_notice_after": 2,
     # evidence 里重复行达到这个数量就给一次去重警告
     "duplicate_warn_at": 10,
     # 上下文压缩：messages 总字符超过这个数就把中段坍缩成摘要（0 = 不压缩）
@@ -799,6 +802,7 @@ async def run_phases(
     forget_after_turns = max(0, int(config.get("forget_after_turns", 0)))
     long_observation_chars = max(0, int(config.get("long_observation_chars", 0)))
     forget_keep_recent_turns = max(0, int(config.get("forget_keep_recent_turns", 2)))
+    tool_failure_notice_after = max(0, int(config.get("tool_failure_notice_after", 2)))
 
     outcome = PhaseOutcome()
     step_offset = 0
@@ -839,6 +843,7 @@ async def run_phases(
             forget_after_turns=forget_after_turns,
             long_observation_chars=long_observation_chars,
             forget_keep_recent_turns=forget_keep_recent_turns,
+            tool_failure_notice_after=tool_failure_notice_after,
         )
         step_offset += len(result.steps)
         outcome.steps += len(result.steps)

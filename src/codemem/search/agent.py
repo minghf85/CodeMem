@@ -98,6 +98,34 @@ def repeat_notice(call: ToolCall, count: int) -> str:
     )
 
 
+def tool_failure_notice(call: ToolCall, count: int) -> str:
+    """同一个工具**连续失败** N 次时的纠正提示。
+
+    实测（gpt-4o-mini）：一条 QA 里 ``edit`` 的 replace 模式连错 6 次（``oldText`` 不唯一/不
+    匹配、缺 ``path``），每次只回一句 ``ERROR: ...`` —— 失败路径**不给任何可执行的下一步**，
+    于是模型换个 ``oldText`` 接着错，一直空转到 ``no_progress`` 把这一轮提前收尾。
+
+    这里把"下一步怎么改"说清楚：先 ``read``/``grep`` 出确切那一行；``oldText`` 必须**逐字
+    （含空白）且唯一**；实在修不动就直接 ``append`` 一条更正记录（重复由收尾的规范化去掉），
+    别跟 replace 死磕。非 ``edit`` 工具给一条通用的"换做法"提示。
+    """
+    if call.tool == "edit":
+        return (
+            f"\n\n[Your `edit` has FAILED {count} times in a row. `edit` REPLACE needs `oldText` "
+            f"to match the file BYTE-FOR-BYTE and to appear EXACTLY ONCE. Do this instead:\n"
+            f"- First see the exact current lines: `grep -n . evidence.jsonl` (or `read` it).\n"
+            f"- Copy `oldText` verbatim from what you just read -- including every space.\n"
+            f"- If that text occurs more than once, include more surrounding lines so it is unique.\n"
+            f"- Or skip replace entirely: `append` a corrected record instead (duplicates are "
+            f"cleaned up automatically), or dedup with `sort -u evidence.jsonl -o evidence.jsonl`.]"
+        )
+    return (
+        f"\n\n[Your `{call.tool}` call has FAILED {count} times in a row. Stop repeating it -- "
+        f"change the approach: re-read what you need with `grep -n`/`read`, use a simpler or "
+        f"broader command, or write what you already have and finish.]"
+    )
+
+
 def oversize_notice(records: int, limit: int) -> str:
     """evidence 明显过大时的提醒。
 
@@ -112,8 +140,9 @@ def oversize_notice(records: int, limit: int) -> str:
         f"\n\n[evidence.jsonl has {records} records -- that is far too many (aim for 5-15). "
         f"You are supposed to extract a SMALL set that answers the question, not dump every "
         f"candidate you saw. Keep only the records the answer needs, merge related ones into a "
-        f"single record, and remove the rest (grep evidence.jsonl, then rewrite it with `edit` "
-        f"replace, or just stop adding). If the question asks for a SET of things "
+        f"single record, and drop the rest (dedup with `sort -u evidence.jsonl -o evidence.jsonl`, "
+        f"or just stop adding -- avoid hand-built `edit` replace anchors, they are error-prone). "
+        f"If the question asks for a SET of things "
         f"(activities, hobbies), list them in ONE record rather than one record per member.]"
     )
 
@@ -569,6 +598,8 @@ async def run_agent_round(
     forget_after_turns: int = 0,
     long_observation_chars: int = 0,
     forget_keep_recent_turns: int = 2,
+    # 同一工具连续失败几次后，在观测里注入"换做法"的纠正提示（0 = 关）。见 tool_failure_notice。
+    tool_failure_notice_after: int = 2,
     on_step: Callable[[Step], None] | None = None,
 ) -> tuple[AgentOutcome, list[dict[str, str]]]:
     """跑一个 round：从 ``messages`` 出发，直到模型**明确回复纯文本**或用完步数。
@@ -584,6 +615,7 @@ async def run_agent_round(
     steps_used = 0
     attempts_used = 0
     warned_duplicates = False
+    failure_streak: dict[str, int] = {}    # 每个工具当前连续失败的次数
 
     while steps_used < max_steps:
         # ---- 遗忘：超长且够旧的工具观测 → 一行占位符（在压缩**之前**做定点清理）----
@@ -727,6 +759,15 @@ async def run_agent_round(
         step.state_after = state_after
 
         observation = render_observation(step, max_chars=observation_max_chars)
+        # 连续失败同一工具 → 注入"换做法"的提示。失败路径原本只回一句 `ERROR:`，不给任何下一步，
+        # 模型就换个参数接着错（实测 edit 连错 6 次、直接空转到 no_progress）。
+        if step.error:
+            failure_streak[call.tool] = failure_streak.get(call.tool, 0) + 1
+        else:
+            failure_streak[call.tool] = 0
+        if (step.error and tool_failure_notice_after > 0
+                and failure_streak[call.tool] >= tool_failure_notice_after):
+            observation += tool_failure_notice(call, failure_streak[call.tool])
         # 机制层面的"该动笔了"：只在还没写过东西、且已经烧掉不少步数时插一次。
         # 只插一次（nudged）—— 反复插会挤占上下文，模型也会开始忽略它。
         if (not nudged and write_nudge_after > 0

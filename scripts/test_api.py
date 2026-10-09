@@ -282,6 +282,24 @@ def test_endpoints(tmp: Path) -> None:
     # 协议：data 字段永不被省略
     check("响应含 data 键", "data" in resp.json())
 
+    # 原始请求留痕：requests.jsonl 记下原始 add 报文与 search query（排错/分析用）
+    requests = read_jsonl(store3.requests_path)
+    kinds = [r.get("endpoint") for r in requests]
+    check("requests.jsonl 记录 add + search",
+          "add" in kinds and "search" in kinds, str(kinds))
+    add_req = next((r for r in requests if r.get("endpoint") == "add"), {})
+    check("add 请求留痕含原始 messages 与 request_id",
+          add_req.get("request_id") == add_body["request_id"]
+          and any("LGBTQ support group" in str(m.get("content", ""))
+                  for m in add_req.get("messages", [])),
+          str(add_req)[:200])
+    search_req = next((r for r in requests if r.get("endpoint") == "search"), {})
+    check("search 请求留痕含 query",
+          "LGBTQ support group" in str(search_req.get("query") or ""),
+          str(search_req.get("query"))[:120])
+    check("search 留痕带 run_dir",
+          bool(search_req.get("result", {}).get("run_dir")), str(search_req.get("result")))
+
 
 def test_validation(tmp: Path) -> None:
     from fastapi.testclient import TestClient

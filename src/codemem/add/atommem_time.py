@@ -1,8 +1,8 @@
 """add · 原子记忆的时间处理：相对时间表达 → 带锚点/绝对时间的 metadata.time。
 
-**单一事实源**：``parse_time_expression`` 把 agent 写的相对时间表达（"last week"、"yesterday"、
-"5 years ago"）结合消息自己的会话时间戳（锚点）折算成最终落盘的 ``metadata.time``。被
-``atommem_agent_v2``（并行 add agent 的收尾）与 ``atommem``（旧串行 agent）共用。
+**单一事实源**：``parse_time_expression`` 把模型写的相对时间表达（"last week"、"yesterday"、
+"5 years ago"）结合消息自己的会话时间戳（锚点）折算成最终落盘的 ``metadata.time``。被 add 的
+pipeline（``atommem_pipeline``）与逐消息 agent（``add-agent`` 分支）共用。
 
 **核心口径（与 answer / judge、与参考语料一致）**：相对时间表达**本身就是完整答案**，只要能
 带上锚点，就**保留成与参考同形的句子**，而不是折算成一个绝对日期：

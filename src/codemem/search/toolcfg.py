@@ -37,9 +37,8 @@ DEFAULT_TOOL_CONFIG = PROJECT_ROOT / "configs" / "tool.json"
 
 # system prompt 里的槽位名 -> catalog 属性。渲染时逐一替换。
 #
-# ``validate`` 只检查**模板里实际出现的**槽位（见下）—— 所以 search 的 tool.json 与
-# add agent 的 add_tool.json 可以只声明各自用到的槽位（add 没有 SCHEMA/EVIDENCE_STANDARD，
-# search 没有 ATOM_STANDARD），而共用同一套渲染机制。这里保留这个元组供参考/向后兼容。
+# ``validate`` 只检查**模板里实际出现的**槽位（见下）—— 所以不同的 tool.json 可以只声明
+# 自己用到的槽位，而共用同一套渲染机制。这里保留这个元组供参考/向后兼容。
 PROMPT_SLOTS = ("TOOLS", "COMMANDS", "WORKSPACE", "SCHEMA", "PROTOCOL", "WRITING_POLICY",
                 "TIME_POLICY", "EVIDENCE_STANDARD", "ATOM_STANDARD", "STRATEGY")
 
@@ -197,8 +196,8 @@ class ToolCatalog:
         完全一致 —— 没有"控制工具"例外了（``next`` 已删除，流程回到朴素 loop）。
 
         槽位校验是**动态的**：只检查模板里**实际出现**的槽位能不能渲染出非空值 —— 于是
-        search 的 tool.json 与 add agent 的 add_tool.json 可以只声明各自用到的槽位。拼错
-        槽位名（``{{TOOLZ}}``）会在渲染时留下字面量，这里也要抓出来。
+        不同的 tool.json 可以只声明自己用到的槽位。拼错槽位名（``{{TOOLZ}}``）会在渲染时
+        留下字面量，这里也要抓出来。
         """
         described = set(self.tools)
         missing = [name for name in available if name not in described]
@@ -314,11 +313,11 @@ class ToolCatalog:
         return self.evidence_standard.strip()
 
     def render_atom_standard(self) -> str:
-        """渲染"原子标准"这一段（add agent 专用）。
+        """渲染"原子标准"这一段（``{{ATOM_STANDARD}}`` 槽位）。
 
-        它约束的是**一条 atom 的写法**：自足、一事实一 atom、时间解决、指代解决、抽取隐含
-        持久事实。正文来自 ``codemem.prompts.ATOM_AGENT_STANDARD``，由 ``load_catalog``
-        填进 ``self.atom_standard``。
+        主分支的 add 走 pipeline（prompt 在 ``add/atommem_pipeline.py``），所以缺省为空；
+        逐消息 add agent 的原子标准在 ``add-agent`` 分支。tool.json 仍可自行覆盖
+        ``atom_standard`` 顶层键。
         """
         return self.atom_standard.strip()
 
@@ -408,7 +407,7 @@ def load_catalog(path: str | Path | None = None) -> ToolCatalog:
     if not isinstance(raw, dict):
         raise ToolConfigError(f"{target} 顶层必须是对象")
 
-    # ``schema`` 可选：search 用它说明 evidence 记录字段；add agent 不用它（相应用 atom_standard）。
+    # ``schema`` 可选：search 用它说明 evidence 记录字段。
     for key in ("protocol", "tools", "commands", "workspace", "prompt"):
         if key not in raw:
             raise ToolConfigError(f"{target} 缺少顶层字段 '{key}'")
@@ -426,7 +425,7 @@ def load_catalog(path: str | Path | None = None) -> ToolCatalog:
         time_policy=raw.get("time_policy") or {},
         # 证据标准：优先取 tool.json 里的覆盖，缺省用 prompts.py 的常量（单一事实源）
         evidence_standard=str(raw.get("evidence_standard") or _default_evidence_standard()),
-        # 原子标准（add agent 用）：优先取 add_tool.json 的覆盖，缺省用 prompts.py 的常量
+        # 原子标准（``{{ATOM_STANDARD}}`` 槽位）：缺省为空；tool.json 可自行覆盖
         atom_standard=str(raw.get("atom_standard") or _default_atom_standard()),
         strategy=str(raw.get("strategy") or ""),
         source_path=target,
@@ -446,7 +445,5 @@ def _default_evidence_standard() -> str:
 
 
 def _default_atom_standard() -> str:
-    """原子标准的缺省正文 —— ``codemem.prompts.ATOM_AGENT_STANDARD``（add agent 用）。"""
-    from ..prompts import ATOM_AGENT_STANDARD
-
-    return ATOM_AGENT_STANDARD
+    """原子标准的缺省正文 —— 主分支为**空串**（逐消息 add agent 的原子标准在 ``add-agent`` 分支）。"""
+    return ""

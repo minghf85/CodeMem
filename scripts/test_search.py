@@ -179,23 +179,6 @@ def test_toolcfg(tmp: Path) -> None:
     check("answer：短不得以漏成员为代价", "dropping part of it" in ap)
     check("answer：禁止把 session id 当日期", "session id" in ap)
 
-    # --- atom 标准：具体细节不许抽象化 + 一事实一原子 + tag key 固定 ---
-    atom_std = _P.ATOM_AGENT_STANDARD
-    check("atom 标准：禁止把具体事实抽象成泛泛情感", "CAPTURE THE SPECIFICS" in atom_std)
-    check("atom 标准：给出具体反例（dog and cat）", "has a dog and a cat" in atom_std)
-    check("atom 标准：列表要枚举成员", "names every member" in atom_std)
-    check("atom 标准：主客体不得颠倒", "ATTRIBUTE CORRECTLY" in atom_std)
-    check("atom 标准：一事实一原子、禁止多句", "ONE FACT, ONE SENTENCE" in atom_std)
-    check("atom 标准：时间字段不得是裸相对词", "must never be a bare relative word" in atom_std)
-    check("atom 标准：正文不留裸相对时间", "must NOT keep a bare relative time word" in atom_std)
-    check("atom 标准：tag 用固定 key 集合",
-          "MUST be ONE OF these twelve" in atom_std or "FIXED KEY SET" in atom_std)
-    check("atom 标准：物主代词同句可留、句外须消解",
-          "antecedent is the named subject of the SAME atom" in atom_std)
-    check("atom 标准：已去数据化（无 Caroline/Melanie/9 June）",
-          "Caroline" not in atom_std and "Melanie" not in atom_std
-          and "9 June 2023" not in atom_std and "Bach" not in atom_std)
-
     # 时间精度：这是这一版的核心规则
     check("时间策略：不得编造更细的精度", "granularity" in rendered
           or "not finer" in rendered)
@@ -305,6 +288,13 @@ async def test_tools(tmp: Path) -> None:
     result = await built["edit"].run({"append": "no path record\n"})
     check("append 缺 path 时默认 evidence.jsonl",
           result.ok and (ws / "evidence.jsonl").read_text() == "no path record\n", result.text)
+    # replace 缺 path 也要默认 evidence.jsonl：旧实现只覆盖 append，replace 会报 "path must be
+    # a string, got NoneType"（gpt-4o-mini 实测踩到，然后把同一条调用空转到烧光步数）。
+    result = await built["edit"].run(
+        {"edits": [{"oldText": "no path record", "newText": "fixed record"}]}
+    )
+    check("replace 缺 path 时也默认 evidence.jsonl",
+          result.ok and (ws / "evidence.jsonl").read_text() == "fixed record\n", result.text)
     result = await built["edit"].run({"path": "n.txt", "append": "second\n"})
     check("append 追加到末尾", (ws / "n.txt").read_text() == "first\nsecond\n", result.text)
     check("append 观测说明了行数变化", "->" in result.text or "Appended" in result.text, result.text)
@@ -791,6 +781,24 @@ async def test_agent(tmp: Path) -> None:
     check("一轮跑完 2 步", len(outcome.steps) == 2, str(len(outcome.steps)))
     check("第一次是工具调用", outcome.steps[0].call is not None)
     check("工具调用成功", outcome.steps[0].result.ok)
+
+    # --- 连续失败的 edit 会被注入"换做法"的纠正提示（失败路径原本只回 ERROR，模型会空转）---
+    # 用**不同**的 oldText，绕过"完全相同调用被重复检测拒绝"，逼出真正的失败连击。
+    bad_a = json.dumps({"tool": "edit", "args": {
+        "edits": [{"oldText": "missing anchor A", "newText": "x"}]}})
+    bad_b = json.dumps({"tool": "edit", "args": {
+        "edits": [{"oldText": "missing anchor B", "newText": "x"}]}})
+    # 注意：用**独立变量名**，不要覆盖上面的 outcome/messages —— 下面的 P0 摘要断言用的还是
+    # 正常一轮的 outcome/messages。
+    notice_outcome, notice_messages = await fresh(
+        [bad_a, bad_b], max_steps=6, tool_failure_notice_after=2)
+    edits = [s for s in notice_outcome.steps if s.call is not None and s.call.tool == "edit"]
+    check("失败的 edit 记为工具错误", edits and all(s.error for s in edits),
+          str([s.error for s in edits]))
+    fail_obs = [m.get("content", "") for m in notice_messages if m.get("role") == "user"]
+    check("连续失败后注入'换做法'提示",
+          any("FAILED 2 times in a row" in o for o in fail_obs),
+          (fail_obs[-1][:200] if fail_obs else ""))
     check("检测到唯一 id 增加", outcome.steps[0].progressed)
     check("唯一 id 统计正确", outcome.steps[0].state_after.unique_ids == 1,
           str(vars(outcome.steps[0].state_after)))
@@ -1546,11 +1554,11 @@ def test_eval_metrics() -> None:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# 7b. add：三层记忆（msgmem 转换 / summem 解析 / atommem 补全 + agent）
+# 7b. add：三层记忆（msgmem 转换 / summem 解析 / 共享工具与去重）
 # ---------------------------------------------------------------------------
 
 def test_add_memory_module(tmp: Path) -> None:
-    section("7b. add：msgmem 转换 / summem 解析 / atommem 系统字段补全")
+    section("7b. add：msgmem 转换 / summem 解析 / 时间解析 / 去重")
     from codemem.add import memory as mem_mod
     from codemem.add import msgmem as msgmem_mod
     from codemem.add import summem as summem_mod
@@ -1590,48 +1598,6 @@ def test_add_memory_module(tmp: Path) -> None:
     check("summem 解析：纯文本兜底", summem_mod.parse_summary("just a summary") == "just a summary")
     check("summem 解析：空输入 -> 空", summem_mod.parse_summary("") == "")
 
-    # --- atommem：finalize_file 补系统字段 + 合并/演化 + 去重兜底 ---
-    # 场景 1：全部是新行（before 空）—— 模型只填 4 个字段
-    new_atoms = [
-        {"memory": "Caroline went to a group on 7 May 2023",
-         "metadata": {"time": "7 May 2023", "role": "Caroline", "tag": ["activity:group"]}},
-        {"memory": "Melanie has kids", "metadata": {}},                 # 缺 time/role -> time 留空、role 回落
-        {"memory": "", "metadata": {}},                                 # 空 -> 丢弃
-        {"memory": "Caroline went to a group on 7 May 2023", "metadata": {}},  # 同事实 -> 去重
-    ]
-    atoms = atommem_mod.finalize_file(
-        before={}, after=new_atoms, source_id="session_1_3",
-        default_time="1:56 pm on 8 May, 2023", default_role="Caroline",
-    )
-    check("finalize：空 memory 与同事实重复被丢弃", len(atoms) == 2, str(len(atoms)))
-    check("finalize：id 顺序编号 session_1_3_K",
-          [a["metadata"]["id"] for a in atoms] == ["session_1_3_1", "session_1_3_2"],
-          str([a["metadata"]["id"] for a in atoms]))
-    check("finalize：type 恒为 atom", all(a["metadata"]["type"] == "atom" for a in atoms))
-    check("finalize：source 含本 message 的 id",
-          all("session_1_3" in a["metadata"]["source"] for a in atoms))
-    check("finalize：changelog 被补", all(a["metadata"]["changelog"] for a in atoms))
-    check("finalize：缺 time 时**留空**（绝不回填会话时间戳——那是把'谈话时间'当'事件时间'）",
-          atoms[1]["metadata"]["time"] == "", repr(atoms[1]["metadata"]["time"]))
-    check("finalize：缺 role 时回落到说话人", atoms[1]["metadata"]["role"] == "Caroline")
-    # 归一：agent 把相对表达写进 time -> 代码折算成带锚点的自足表达
-    _rel = atommem_mod.finalize_file(
-        before={}, after=[{"memory": "Caroline passed the interview",
-                           "metadata": {"time": "last Friday"}}],
-        source_id="session_19_1", default_time="9:55 am on 22 October, 2023", default_role="Caroline",
-    )
-    check("finalize：'last Friday' 保留成 'the Friday before 22 October 2023'（与参考同形，不折算日期）",
-          _rel[0]["metadata"]["time"] == "the Friday before 22 October 2023",
-          _rel[0]["metadata"]["time"])
-    # 抄了会话时间戳当事件时间 -> 留空
-    _copied = atommem_mod.finalize_file(
-        before={}, after=[{"memory": "Caroline continued her education",
-                           "metadata": {"time": "2023-05-08T13:56:00Z"}}],
-        source_id="session_1_9", default_time="1:56 pm on 8 May, 2023", default_role="Caroline",
-    )
-    check("finalize：抄会话时间戳作事件时间 -> 被识别并留空",
-          _copied[0]["metadata"]["time"] == "", repr(_copied[0]["metadata"]["time"]))
-
     # 场景 1b：parse_time_expression —— 相对表达保留成与参考同形的 "the <unit> before <锚点>"，不折算日期
     _P = atommem_time_mod.parse_time_expression
     check("parse_time：'last Friday' @ 22 Oct 2023 -> 'the Friday before 22 October 2023'",
@@ -1655,92 +1621,6 @@ def test_add_memory_module(tmp: Path) -> None:
           _P("this month", "1:36 pm on 3 July, 2023") == "July 2023")
     check("parse_time：'last month' -> 'September 2023'",
           _P("last month", "1:00 pm on 13 October, 2023") == "September 2023")
-
-    # 场景 2：模型带了假 id/source/type —— 作为新行一律被覆盖
-    overridden = atommem_mod.finalize_file(
-        before={}, after=[{"memory": "x", "metadata": {"id": "hack", "type": "inner", "source": ["bad"]}}],
-        source_id="session_9_9", default_time="", default_role="R",
-    )
-    check("finalize：覆盖模型带的 id/type/source",
-          overridden[0]["metadata"]["id"] == "session_9_9_1"
-          and overridden[0]["metadata"]["type"] == "atom"
-          and overridden[0]["metadata"]["source"] == ["session_9_9"])
-
-    # 场景 3：合并/演化 —— 已有 atom 被改写（保留 id / 累加 source / changelog 记旧值）；
-    # 另一条被删除（吸收进合并后的那条）；再新增一条续号。
-    before = {
-        "session_3_16_1": {"memory": "Melanie married 5 years ago",
-                           "metadata": {"id": "session_3_16_1", "type": "atom", "time": "2018",
-                                        "role": "Melanie", "tag": [], "source": ["session_3_16"],
-                                        "changelog": [{"time": "t0", "content": "created"}]}},
-        "session_3_16_2": {"memory": "Melanie is married",
-                           "metadata": {"id": "session_3_16_2", "type": "atom", "time": "",
-                                        "role": "Melanie", "tag": [], "source": ["session_3_16"],
-                                        "changelog": [{"time": "t0", "content": "created"}]}},
-    }
-    after = [
-        # 合并：把 _1 改写成更完整的一条，source 收下两个 message id
-        {"memory": "Melanie married her partner in 2018",
-         "metadata": {"id": "session_3_16_1", "time": "2018", "role": "Melanie", "tag": [],
-                      "source": ["session_3_16", "session_8_16"]}},
-        # _2 被删（吸收进 _1）——after 里不再出现；
-        # 新增一条**全新事实**（无 id）-> 续号为 session_3_16_3
-        {"memory": "Melanie's partner is her husband", "metadata": {"time": "", "role": "Melanie", "tag": []}},
-    ]
-    merged = atommem_mod.finalize_file(
-        before=before, after=after, source_id="session_8_16",
-        default_time="1:51 pm on 15 July, 2023", default_role="Melanie",
-    )
-    by_id = {a["metadata"]["id"]: a for a in merged}
-    check("合并：改写保留原 id 且累加 source",
-          by_id["session_3_16_1"]["metadata"]["source"] == ["session_3_16", "session_8_16"],
-          str(by_id.get("session_3_16_1", {}).get("metadata", {}).get("source")))
-    check("合并：changelog 记下改动前的 memory",
-          any(c["content"] == "Melanie married 5 years ago"
-              for c in by_id["session_3_16_1"]["metadata"]["changelog"]))
-    check("合并：新增行续号用**本 message** 的 id（session_8_16_1）",
-          "session_8_16_1" in by_id, str(sorted(by_id)))
-    check("合并：被删的行不再出现（_2 已消失）",
-          all(a["metadata"]["id"] != "session_3_16_2" for a in merged))
-    check("合并：新原子只带本 message 的 source（忽略模型自带）",
-          by_id["session_8_16_1"]["metadata"]["source"] == ["session_8_16"],
-          str(by_id["session_8_16_1"]["metadata"]["source"]))
-
-    # 场景 4：CPU 去重兜底 —— 大小写/标点不同的同事实合并成一条，source 取并集
-    dup = atommem_mod.finalize_file(
-        before={}, after=[
-            {"memory": "Melanie painted a lake sunrise last year.", "metadata": {"source": ["s1"]}},
-            {"memory": "melanie painted a lake sunrise last year", "metadata": {"source": ["s2"]}},
-        ],
-        source_id="session_4_1", default_time="", default_role="Melanie",
-    )
-    check("去重兜底：标点/大小写差异的同事实合成一条", len(dup) == 1, str(len(dup)))
-    check("去重兜底：新原子只带本 message id（模型自带 source 被忽略）",
-          dup[0]["metadata"]["source"] == ["session_4_1"],
-          str(dup[0]["metadata"]["source"]))
-
-    # 场景 5（回归）：**未被改动的旧 atom 不能累积本 message 的 source**。
-    # 旧版把所有 before 里的行都当"被改写"，每处理一条 message 就给全库每个 atom 的
-    # source 追加一个 id —— 20 条 message 后每个 source 涨到 ~20，检索/幂等全乱。
-    untouched = atommem_mod.finalize_file(
-        before={"session_1_1_1": {"memory": "Melanie has kids",
-                                  "metadata": {"id": "session_1_1_1", "type": "atom", "time": "",
-                                               "role": "Melanie", "tag": [], "source": ["session_1_1"],
-                                               "changelog": [{"time": "t0", "content": "created"}]}}},
-        after=[{"memory": "Melanie has kids",
-                "metadata": {"id": "session_1_1_1", "type": "atom", "time": "", "role": "Melanie",
-                             "tag": [], "source": ["session_1_1"],
-                             "changelog": [{"time": "t0", "content": "created"}]}},
-               {"memory": "Melanie adopted a cat", "metadata": {"time": "", "role": "Melanie", "tag": []}}],
-        source_id="session_1_2", default_time="", default_role="Melanie",
-    )
-    untouched_by_id = {a["metadata"]["id"]: a for a in untouched}
-    check("回归：未被改动的旧 atom 不累加本 message source",
-          untouched_by_id["session_1_1_1"]["metadata"]["source"] == ["session_1_1"],
-          str(untouched_by_id["session_1_1_1"]["metadata"]["source"]))
-    check("回归：本 message 的新事实仍正确落 source",
-          untouched_by_id["session_1_2_1"]["metadata"]["source"] == ["session_1_2"],
-          str(untouched_by_id.get("session_1_2_1", {}).get("metadata", {}).get("source")))
 
     # 场景 6：**近义去重兜底** —— 同一事实的不同措辞合并（source 并集）；
     # 主客体颠倒（Caroline 欣赏 Melanie vs Melanie 欣赏 Caroline）**不能**误合并。
@@ -1789,120 +1669,21 @@ def test_add_memory_module(tmp: Path) -> None:
           any(set(a["metadata"]["source"]) >= {"session_2_2"} for a in sv),
           str([a["metadata"]["source"] for a in sv]))
 
-    # 场景 8：**tag key 纪律由 harness 兜底** —— 8B 实测自造 100+ 个自由 key。落盘时
+    # 场景 8：**tag key 纪律由 harness 兜底** —— 模型实测自造 100+ 个自由 key。落盘时
     # key 必须收敛进固定集合：近义词映射到规范 key，其余未知 key 落 other（值保留）。
-    t = atommem_mod.finalize_file(
-        before={}, after=[
-            {"memory": "Melanie paints sunrises", "metadata": {
-                "time": "", "role": "Melanie",
-                "tag": ["hobby:painting", "emotion:joy", "zorp:mental health",
-                        "art:landscape", "nonsense", "activity:swimming", "topic:adoption"]}},
-        ],
-        source_id="session_1_1", default_time="", default_role="Melanie",
-    )
-    tags = t[0]["metadata"]["tag"]
+    tags = atommem_mod._normalize_tags(
+        ["hobby:painting", "emotion:joy", "zorp:mental health",
+         "art:landscape", "nonsense", "activity:swimming", "topic:adoption"])
     check("tag 纪律：近义词映射到规范 key",
           "activity:painting" in tags and "sentiment:joy" in tags, str(tags))
-    check("tag 纪律：未知 key 落 other 且保留值",
-          "other:mental health" in tags, str(tags))
+    check("tag 纪律：未知 key 落 other 且保留值", "other:mental health" in tags, str(tags))
     check("tag 纪律：art 近义词归到 activity（值保留）",
           "activity:landscape" in tags, str(tags))
     check("tag 纪律：规范 key 原样保留",
           "activity:swimming" in tags and "topic:adoption" in tags, str(tags))
-    check("tag 纪律：无 key:value 形状的落 other",
-          "other:nonsense" in tags, str(tags))
-    check("tag 纪律：裸的已知 key 也收敛（art -> activity:art 值保留）",
-          "activity:art" in tags or "other:art" not in tags, str(tags))
+    check("tag 纪律：无 key:value 形状的落 other", "other:nonsense" in tags, str(tags))
     check("tag 纪律：落盘后所有 key 都在固定集合内",
           all(str(x).split(":")[0] in atommem_mod.TAG_KEYS for x in tags), str(tags))
-
-    # 场景 8b：**未被改动的旧 atom 也要收敛 tag** —— 历史文件里可能有规范化前的自由 key，
-    # "原样保留"路径不能把污染带进新文件。
-    leg = atommem_mod.finalize_file(
-        before={"session_1_1_1": {"memory": "Melanie paints", "metadata": {
-            "id": "session_1_1_1", "type": "atom", "time": "", "role": "Melanie",
-            "tag": ["emotion", "art"], "source": ["session_1_1"],
-            "changelog": [{"time": "t0", "content": "created"}]}}},
-        after=[{"memory": "Melanie paints", "metadata": {
-            "id": "session_1_1_1", "type": "atom", "time": "", "role": "Melanie",
-            "tag": ["emotion", "art"], "source": ["session_1_1"],
-            "changelog": [{"time": "t0", "content": "created"}]}}],
-        source_id="session_1_2", default_time="", default_role="Melanie",
-    )
-    leg_tags = leg[0]["metadata"]["tag"]
-    check("tag 纪律：未改动的旧 atom 也被收敛",
-          leg_tags == ["sentiment:emotion", "activity:art"], str(leg_tags))
-    check("tag 纪律：收敛不改 id / source / changelog",
-          leg[0]["metadata"]["id"] == "session_1_1_1"
-          and leg[0]["metadata"]["source"] == ["session_1_1"]
-          and leg[0]["metadata"]["changelog"] == [{"time": "t0", "content": "created"}],
-          str(leg[0]["metadata"]))
-
-
-async def test_atommem_agent(tmp: Path) -> None:
-    section("7c. add.atommem：agent 逐 message 抽 atom（假模型 + 真工具）")
-    import re
-
-    from codemem.add import atommem as atommem_mod
-    from codemem.add import atommem_time as atommem_time_mod
-    from codemem import llm as llm_mod
-
-    sample = tmp / "AtomPair"
-    sample.mkdir(parents=True, exist_ok=True)
-    # msgmem：一个会话两条消息
-    msgs = [
-        {"memory": "Hey Mel! I'm swamped with the kids & work.",
-         "metadata": {"id": "session_1_1", "type": "msg", "time": "1:56 pm on 8 May, 2023",
-                      "role": "Melanie", "tag": [], "source": [], "changelog": []}},
-        {"memory": "I went to a LGBTQ support group yesterday.",
-         "metadata": {"id": "session_1_2", "type": "msg", "time": "1:56 pm on 8 May, 2023",
-                      "role": "Caroline", "tag": [], "source": [], "changelog": []}},
-    ]
-    (sample / "msgmem.jsonl").write_text(
-        "".join(json.dumps(r) + "\n" for r in msgs), encoding="utf-8")
-    (sample / "summem.jsonl").write_text(
-        json.dumps({"memory": "Melanie and Caroline catch up.",
-                    "metadata": {"id": "session_1_summary", "type": "summary",
-                                 "time": "1:56 pm on 8 May, 2023", "role": "summary",
-                                 "tag": [], "source": [], "changelog": []}}) + "\n",
-        encoding="utf-8")
-
-    async def fake_chat_completion(client, config, messages):  # noqa: ANN001
-        """假 agent：第一次 append 一条 atom，之后回纯文本表示完成。"""
-        has_assistant = any(m.get("role") == "assistant" for m in messages)
-        if not has_assistant:
-            body = json.dumps({"memory": "Melanie has kids and a job",
-                               "metadata": {"time": "1:56 pm on 8 May, 2023",
-                                            "role": "Melanie", "tag": ["entity:family"]}}) + "\n"
-            return json.dumps({"tool": "edit", "args": {"append": body}})
-        return "Done."
-
-    saved = llm_mod.chat_completion
-    llm_mod.chat_completion = fake_chat_completion  # type: ignore[assignment]
-    try:
-        import codemem.search.toolcfg as tc
-        from codemem.add.atommem_agent_v2 import run_dir_parallel
-
-        catalog = tc.load_catalog(PROJECT_ROOT / "configs" / "add_tool.json")
-        result = await run_dir_parallel(
-            sample, {"max_steps": 4, "context_window": 4, "concurrency": 1, "bash_timeout": 30},
-            None, catalog, Logger(level="error"),
-        )
-        check("atommem：状态 OK", result["status"] == "OK", str(result))
-        check("atommem：处理了 2 条 message", result["messages"] == 2, str(result))
-        check("atommem：写出了 atom", result["atoms"] >= 1, str(result))
-        content = (sample / "atommem.jsonl").read_text(encoding="utf-8")
-        # 假模型对两条 message **append 同一句** —— 两条产出同一条事实，
-        # 最终按 memory 归一化去重成一条，source 取并集。
-        check("atommem：atom 带系统补的 id/source/type",
-              '"type": "atom"' in content
-              and '"source": ["session_1_1"' in content, content[:300])
-        check("atommem：memory 是 agent 写的 fact",
-              "Melanie has kids" in content, content[:300])
-        check("atommem：相对时间被解析进 time（memory 不含时间词）",
-              "yesterday" not in content.lower(), content[:300])
-    finally:
-        llm_mod.chat_completion = saved
 
 
 # ---------------------------------------------------------------------------
@@ -2089,7 +1870,6 @@ def main() -> int:
             loop.run_until_complete(test_tools(tmp))
             loop.run_until_complete(test_agent(tmp))
             loop.run_until_complete(test_compaction_units(tmp))
-            loop.run_until_complete(test_atommem_agent(tmp))
             loop.run_until_complete(test_end_to_end(tmp))
         finally:
             loop.close()

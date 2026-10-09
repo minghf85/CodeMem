@@ -477,7 +477,7 @@ def create_edit_tool(*, cwd: Path, confine: bool = True,
     - **append**：``append="<新记录>"``，把文本追加到文件末尾（**文件不存在则创建**）。
 
     ``default_write_file`` 是缺 ``path`` 时的默认写目标：search 是 ``evidence.jsonl``，
-    add agent 是 ``atommem.jsonl``（它唯一的产物）。
+    add 侧是 ``atommem.jsonl``（它唯一的产物）。
 
     **为什么要有 append 模式**：这套流程是"每看完一个 session 就记一条"，也就是**逐条追加**。
     早先让模型用替换模式自己造 ``oldText``（拿已有的最后一行当锚点），实测 8B 经常复不出那
@@ -490,11 +490,13 @@ def create_edit_tool(*, cwd: Path, confine: bool = True,
     最后一条**逐字重复** → 拒绝（模型有时会把刚刚写过的又追加一遍）。
     """
     async def execute(arguments: Mapping[str, Any]) -> ToolResult:
-        # 缺 `path` 时默认 ``default_write_file``：这是本流程**唯一**要写的文件，而 8B 实测会
-        # 忘记填 path（只给 append），旧行为是报 "path must be a string, got NoneType" —— 然后
-        # 它把整条一模一样的调用重复 10 次（每次都被重复检测拒掉），12 步全烧光、0 条证据。
-        # 与其为一个显然的默认值判错，不如替它补上。
-        if arguments.get("path") is None and arguments.get("append") is not None:
+        # 缺 `path` 时默认 ``default_write_file``：这是本流程**唯一**要写的文件，而模型实测会
+        # 忘记填 path（无论 append 还是 replace），旧行为是报 "path must be a string, got
+        # NoneType" —— 然后它把整条一模一样的调用重复 10 次，步数全烧光、0 条证据。schema 里
+        # 本就写着"path 省略时默认 evidence.jsonl"，所以两种模式都替它补上（不只是 append）。
+        if arguments.get("path") is None and (
+            arguments.get("append") is not None or arguments.get("edits") is not None
+        ):
             arguments = {**arguments, "path": default_write_file}
         path = _path_arg(arguments, "path", cwd=cwd)
         if confine:
@@ -800,7 +802,7 @@ def build_tools(
     元信息统一管理，执行器在此注册。
 
     ``default_write_file``：``edit`` 缺 ``path`` 时的默认写目标 —— search 用
-    ``evidence.jsonl``，add agent 用 ``atommem.jsonl``。
+    ``evidence.jsonl``，add 侧用 ``atommem.jsonl``。
 
     **只有三个工具**：``read`` / ``edit`` / ``bash``。**``write`` 已删除** —— 这套流程是逐条
     追加证据，``edit`` 的 append 模式覆盖了全部写入需求，保留一个"整份覆盖"入口反而是把

@@ -5,6 +5,18 @@
 
 面向使用者与评测方的**快速入口**见 [`../README.md`](../README.md)。
 
+## 方法总览（读完这一节就能理解整套方法）
+
+一段对话先被 **add** 建成**三层记忆**（`msgmem` 原话 / `summem` 会话总结 / `atommem` 原子事实）；
+**search** 让一个 **code agent**（`grep` / `read` / `edit` 三个工具）在三层记忆里**自己检索与推导**，
+产出一份**能直接回答问题**的证据 `evidence.jsonl`（相对时间折算、指代消解、散落事实合并都在这一步
+完成）；**answer** 只依据证据作答；**eval** 判对错并算各项指标。四个步骤**只通过数据文件耦合**、
+不互相 import，整条链路**零外部依赖**（没有向量索引 / embedding 服务）。
+
+- add 细节 → [`add.md`](add.md)；search 细节 → [`search.md`](search.md)；本文件是**完整技术报告**
+  （架构、设计依据、每一次实测踩坑与量化结论）。
+- **add 的逐 message code agent 变体在 `add-agent` 分支**；本分支（主分支）的 add **只有 pipeline**。
+
 ---
 
 ## 0. 架构总览
@@ -43,8 +55,7 @@ configs/
   answer.yaml   # answer 的模型参数
   eval.yaml     # eval 的 judge 参数
   tool.json     # search 的工具描述/schema/prompt/示例/检索策略引导（检索 agent 上下文的事实源）
-  add_tool.json # add agent 的工具描述/prompt/原子标准（逐消息抽 atommem 用）
-  api.yaml      # 封装 API 的模型/存储/预算参数
+  api.yaml      # 封装 API 的存储/并发/预算参数（模型与行为复用 search.yaml / add.yaml）
 data/
   correct_locomo10.json        # 原始对话数据（含 QA 与 evidence 标注）
   {speaker_a}_{speaker_b}/
@@ -104,9 +115,10 @@ python -m codemem.add --stage msgmem       # 只跑第一层（纯 CPU，不调�
 python -m codemem.add --stage atommem --limit-messages 20   # 只跑前 20 条 message（调试）
 ```
 
-> **atommem 默认走三阶段 pipeline**（单次 LLM 抽取 + 后处理），这是产出 1000+ 条、judge 最高
-> 的那一版。另有并行 code agent（`--mode agent-v2`）与串行 agent（`--mode agent`），用于对比；
-> agent 更灵活但 8B 在 loop 里**不稳定**（同一条消息多次跑产出 0/2/4 不等），故不作默认。
+> **atommem 默认走 pipeline**（单次 LLM 抽取 + 代码级后处理），这是产出 1000+ 条、judge 最高的
+> 那一版。逐 message 的 code agent 变体（`--mode agent` / `agent-v2`）更灵活，但弱模型在 loop 里
+> **不稳定**（同一条消息多次跑产出 0/2/4 不等），故不作默认 —— **其实现已迁至 `add-agent` 分支，
+> 本分支的 add 只有 pipeline**。细节见 [`add.md`](add.md)。
 
 **三层，产出三种记忆文件**（都在 `data/{speaker_a}_{speaker_b}/` 下，JSONL 一行一条）：
 
@@ -114,7 +126,7 @@ python -m codemem.add --stage atommem --limit-messages 20   # 只跑前 20 条 m
 |---|---|---|---|
 | `msgmem.jsonl` | `msg` | 每条原始消息（**原话**）；`time` 是会话时间戳，`role` 是说话人真名 | 纯 CPU，由 dataset 直接转换 |
 | `summem.jsonl` | `summary` | 每个会话一份总结 | LLM，**逐 session 一次** |
-| `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **并行 add agent 逐 message 处理**（每 message 看到此前全部内容） |
+| `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **pipeline 逐 message 抽取**（单次 LLM + 代码级后处理，整目录并行） |
 
 记录格式对齐 `memory_template.jsonl`：
 
@@ -1332,7 +1344,7 @@ uvicorn codemem.api.server:app --port 8000
 - **Add 幂等**。`request_id` 是幂等键 —— 重试时同一个 `request_id` **不会再写一遍**
   （由 `meta.applied_request_ids` 记录）。响应的三个 id 原样回显。
 - **Add 返回即"立即可检索"**。写入原始消息后，**在返回前**同步重建该会话的 `summem`（一次 LLM
-  总结）与 `atommem`（逐 message 的 add agent），所以返回 `success:true` 时消息已消解、可直接检索。
+  总结）与 `atommem`（逐 message 的 **pipeline** 抽取），所以返回 `success:true` 时消息已消解、可直接检索。
 - **Search 的 `data` 永不为缺失**。没有记忆（该 user 从没 Add 过）或没有证据，一律返回
   `{"data": []}`，绝不给 5xx 空响应。
 
@@ -1350,8 +1362,15 @@ meta.json                 session_id -> 会话号、每会话消息数、已应�
 msgmem.jsonl              逐条原始消息（type=msg；会话时间戳是锚点）
 summem.jsonl              每会话一条总结（type=summary）
 atommem.jsonl             逐消息抽出的原子事实（type=atom）
-runs/{ts}/                每次 Search 的运行目录（inputs/ 硬链 + qa/evidence.jsonl，可审计）
+requests.jsonl            **原始请求留痕**：每次 /add 的 messages、每次 /search 的 query（见下）
+runs/{ts}/                每次 Search 的运行目录（inputs/ 硬链 + qa/evidence.jsonl + request.json）
 ```
+
+**原始请求留痕**：`requests.jsonl` 逐行记下每次请求的**原始报文** —— `/add` 的
+`{request_id, session_id, messages}`、`/search` 的 `{query, query_raw, options, top_k}`，
+外加结果小结（写入条数 / `data` 条数 / `run_dir`）。每次 Search 的运行目录里另写一份
+`request.json`（它回答的那个问题），让运行目录**自包含**。排错/复盘能直接看到"这条请求、这条
+QA 到底问了什么"，而不只是推导后的产物。
 
 **沿用离线 add 的三层记忆文件与 `session_1_3` 约定**，于是 search 的 prompt、evidence 的
 `source` 校验、`date -d` 时间锚点全都照常工作。
@@ -1364,12 +1383,13 @@ runs/{ts}/                每次 Search 的运行目录（inputs/ 硬链 + qa/ev
 自测（纯 CPU、零模型成本、零网络 —— 假模型 + 真工具 / 真存储）：
 
 ```bash
-python scripts/test_api.py     # 44 项断言：幂等 / 多 user 隔离 / msg_id 与时间 / data 映射 / 多模态
+python scripts/test_api.py     # 49 项断言：幂等 / 多 user 隔离 / msg_id 与时间 / data 映射 / 请求留痕 / 多模态
 ```
 
-配置在 `configs/api.yaml`：`generator`（search 的 agent+verifier 模型）、`index`（Add 侧
-summem/atommem 模型）、`add_tool_config`（Add agent 的工具配置）、`store_dir`、`concurrency`、
-`top_k`、`add_max_steps` 与 agent 预算。
+配置在 `configs/api.yaml`：它只留 API 自有项（`store_dir` / `concurrency` / `top_k` /
+`tool_config`），**模型与行为直接复用离线配置** —— `search_config: configs/search.yaml`
+（Search，agent loop）与 `add_config: configs/add.yaml`（Add，pipeline），加载时并进来。
+离线改那两份，API 自动跟着改（`server._merge_offline_configs`）。
 
 ### 4.1 实现要点
 
@@ -1377,7 +1397,7 @@ summem/atommem 模型）、`add_tool_config`（Add agent 的工具配置）、`s
   Add 与 Search 共用）。
 - **`store.py`**：每 `user_id` 一个目录；`UserStore.append` 在**写锁**内完成"查幂等键 →
   分配 `msg_id` → 追加消息到 `msgmem.jsonl` → 重建该会话的 `summem`（一次 LLM）与 `atommem`
-  （逐 message 的 add agent）→ 记 request_id"，三层记忆文件原子写回。
+  （逐 message 的 **pipeline**）→ 记 request_id"，三层记忆文件原子写回。
 - **`retriever.py`**：直接调 `search.runner.run_phases`（与离线 search 同一套编排），
   复用现成的 `ModelRunner` / `build_shell_prefix` / `link_dir_or_copy` / `validate_file`。
   **不另写一套**：在线与离线的检索行为必须一致，否则"本地调好的 prompt 上线就不准了"。

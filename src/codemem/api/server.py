@@ -64,7 +64,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
 _SEARCH_TOP_LEVEL_KEYS = (
     "max_steps", "no_progress_patience", "max_verify_rounds", "observation_max_chars",
     "write_nudge_after", "evidence_soft_limit", "context_max_chars", "context_keep_recent",
-    "bash_timeout", "repeat_limit", "max_parse_retries", "timeout", "max_retries",
+    "bash_timeout", "repeat_limit", "max_parse_retries", "tool_failure_notice_after",
+    "timeout", "max_retries",
     "backoff_base", "rate_limit_backoff", "max_backoff", "backoff_jitter",
 )
 #: add.yaml 里属于 add 侧（summem + atommem pipeline）模型/行为的键 —— 放进 API 的 ``index`` 段。
@@ -219,9 +220,17 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             {"role": m.role, "content": normalize_content(m.content), "timestamp": m.timestamp}
             for m in parsed.messages
         ]
+        # 原始请求留痕（排错/分析）：存归一化后的 messages（原话 + role + 毫秒时间戳）。
+        request_record = {
+            "endpoint": "add",
+            "user_id": parsed.user_id,
+            "request_id": parsed.request_id,
+            "session_id": parsed.session_id,
+            "messages": messages,
+        }
         async with state.add_sem:
             try:
-                await store.append(
+                summary = await store.append(
                     request_id=parsed.request_id,
                     session_id=parsed.session_id,
                     messages=messages,
@@ -231,8 +240,13 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                 )
             except Exception as exc:  # noqa: BLE001 - 不让异常穿透成 500 堆栈
                 state.log.error(f"Add 失败：{type(exc).__name__}: {exc}")
+                await store.append_request(
+                    {**request_record, "result": {"success": False,
+                                                  "error": f"{type(exc).__name__}: {exc}"}}
+                )
                 return JSONResponse({"detail": "add failed", "success": False}, status_code=500)
 
+        await store.append_request({**request_record, "result": {"success": True, **summary}})
         return JSONResponse(
             AddResponse(
                 success=True,
@@ -257,11 +271,14 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         query = normalize_content(parsed.query)
         top_k = parsed.top_k if parsed.top_k is not None else int(state.config.get("top_k", 100))
         store = UserStore(parsed.user_id, state.store_root)
+        raw_query = payload.get("query")     # 原始 query（可能是 str 或 ContentPart[]，供留痕）
 
         log = state.log.bind(f"search:{store.user_id}")
+        data: list[Any] = []
+        run_dir: Any = None
         async with state.search_sem:
             try:
-                data = await retriever.search(
+                data, run_dir = await retriever.search(
                     store=store,
                     query=query,
                     config=state.config,
@@ -269,11 +286,26 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                     tool_config=state.tool_config,
                     log=log,
                     top_k=top_k,
+                    options=parsed.options,
+                    raw_query=raw_query,
                 )
             except Exception as exc:  # noqa: BLE001 - 单次检索失败返回空结果，不 500
                 log.error(f"Search 失败：{type(exc).__name__}: {exc}")
                 data = []
 
+        # 原始请求留痕：search 的 query 本身（"连问题是什么都不知道"就是缺它）。无记忆时也记。
+        await store.append_request({
+            "endpoint": "search",
+            "user_id": parsed.user_id,
+            "query": query,
+            "query_raw": raw_query,
+            "options": parsed.options,
+            "top_k": top_k,
+            "result": {
+                "data_count": len(data),
+                "run_dir": str(run_dir) if run_dir else "",
+            },
+        })
         return JSONResponse(SearchResponse(data=data).model_dump())
 
     return app

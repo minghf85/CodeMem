@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..io import now_iso
 from ..log import Logger
 from ..search import evidence as evidence_mod
 from ..search import runner as runner_mod
@@ -136,6 +137,7 @@ def _agent_config(config: dict[str, Any]) -> dict[str, Any]:
         "write_nudge_after", "evidence_soft_limit", "context_max_chars", "context_keep_recent",
         "bash_timeout", "timeout", "max_retries", "backoff_base", "rate_limit_backoff",
         "max_backoff", "backoff_jitter", "repeat_limit", "max_parse_retries",
+        "tool_failure_notice_after",
     ):
         if key in config and config[key] is not None:
             merged[key] = config[key]
@@ -151,17 +153,37 @@ async def search(
     tool_config: str | Path | None = None,
     log: Logger | None = None,
     top_k: int | None = None,
-) -> list[dict[str, Any]]:
-    """对一条 query 跑检索，返回协议 ``data[]``（无记忆/无证据 → 空列表）。
+    options: list[str] | None = None,
+    raw_query: Any = None,
+) -> tuple[list[dict[str, Any]], Path | None]:
+    """对一条 query 跑检索，返回 ``(协议 data[], run_dir)``（无记忆/无证据 → 空列表 + None）。
 
-    ``query`` 已由调用方归一化成字符串（多模态 → 文本）。
+    ``query`` 已由调用方归一化成字符串。``options`` / ``raw_query`` 只用于**留痕**
+    （写进 ``run_dir/request.json``），不参与检索 —— 选择题的 options 不是金标答案。
     """
     log = log or Logger(level="warn")
     if not store.exists():
         log.info("该 user 没有任何记忆，返回空结果")
-        return []
+        return [], None
 
     run_dir = _new_run_dir(store)
+    # 让运行目录**自包含**：它回答的是哪个问题、带的什么选项，都在这里。否则事后只能看到
+    # inputs/ 与 evidence.jsonl，连"这条 QA 问的是什么"都不知道。
+    try:
+        (run_dir / "request.json").write_text(
+            json.dumps({
+                "time": now_iso(),
+                "user_id": store.user_id,
+                "query": query,
+                "query_raw": raw_query,
+                "options": options,
+                "top_k": top_k,
+            }, ensure_ascii=False, default=str, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass    # 留痕失败不阻断检索
+
     inputs_dir = _link_inputs(store, run_dir)
     qa_dir = run_dir / "qa"
     qa_dir.mkdir(parents=True, exist_ok=True)
@@ -214,4 +236,4 @@ async def search(
 
     data = records_to_data(report.valid, top_k=top_k)
     log.info(f"检索完成：evidence {len(report.valid)} 条 -> data {len(data)} 条（{run_dir}）")
-    return data
+    return data, run_dir

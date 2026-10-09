@@ -56,7 +56,8 @@
       "guidelines": [
         "Write a record with APPEND (path defaults to evidence.jsonl): {\"tool\":\"edit\",\"args\":{\"append\":\"<one JSON record>\\n\"}}",
         "Never pass both `append` and `edits` in one call.",
-        "There is NO `write` tool: you cannot overwrite the whole file, so you can never erase earlier records by accident."
+        "There is NO `write` tool: you cannot overwrite the whole file, so you can never erase earlier records by accident.",
+        "REPLACE (`edits`) needs `oldText` to match byte-for-byte AND be unique, else it is rejected; prefer APPENDing a corrected record instead (dupes are auto-removed)."
       ],
       "input_schema": {
         "type": "object",

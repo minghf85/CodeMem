@@ -30,12 +30,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..add import atommem as atommem_mod
 from ..add import summem as summem_mod
 from ..add.memory import (
     ATOMMEM_NAME,
     MSGMEM_NAME,
     SUMMEM_NAME,
+    msg_session_number,
     write_memories,
 )
 from ..io import DATA_DIR, make_memory, memory_id, now_iso, read_jsonl
@@ -158,6 +158,11 @@ class UserStore:
     def atommem_path(self) -> Path:
         return self.root / ATOMMEM_NAME
 
+    @property
+    def requests_path(self) -> Path:
+        """原始请求留痕文件：每次 ``/add`` / ``/search`` 一行（见 ``append_request``）。"""
+        return self.root / "requests.jsonl"
+
     def exists(self) -> bool:
         """该 user 是否已经有落盘语料（Search 据此决定是"没记忆"还是"去检索"）。"""
         return self.msgmem_path.exists() and self.msgmem_path.stat().st_size > 0
@@ -175,11 +180,28 @@ class UserStore:
         """某个会话的全部 msg 记忆。"""
         return [
             r for r in self.sessions()
-            if atommem_mod.msg_session_number((r.get("metadata") or {}).get("id") or "")
+            if msg_session_number((r.get("metadata") or {}).get("id") or "")
             == session_index
         ]
 
     # -- 写 -----------------------------------------------------------------
+
+    async def append_request(self, record: dict[str, Any]) -> None:
+        """把一条原始 API 请求追加到 ``requests.jsonl``（排错/分析用）。
+
+        ``server.py`` 在每次 ``/add`` / ``/search`` 后调用 —— 存的是**原始报文**（add 的
+        messages / search 的 query），不是推导后的产物，所以事后能回答"这条请求/这条 QA 到底
+        说了什么"。留痕是**尽力而为**：写失败绝不影响请求本身。记录自动补 ``time``。
+        """
+        entry = {"time": now_iso(), **record}
+        line = json.dumps(entry, ensure_ascii=False, default=str) + "\n"
+        async with _lock_for(self.user_id):
+            try:
+                self.root.mkdir(parents=True, exist_ok=True)
+                with self.requests_path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+            except OSError:
+                pass    # 留痕失败不阻断请求
 
     async def append(
         self,
