@@ -199,6 +199,23 @@ def normalize(memory: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     return normalized, None
 
 
+@dataclass(frozen=True)
+class EvidenceFact:
+    """一条证据记录的**可比较快照**（进展判定与审计用）。
+
+    为什么不只比"正文哈希"：``_id_of`` 把 ``content`` 当 id，于是 agent 在同一条上来回改
+    措辞（A→B→A）也会改变指纹，被误判成"有进展" —— 实测 qa0 因此烧掉 17 步空转，
+    步数预算全没了，检索时间被挤掉。
+
+    快照只留两样：**cite 了哪些来源**、**正文本身**（正文用来跑 ``similarity.is_same_fact``
+    判断"是不是同一事实的新说法"）。不在这里预先分词 —— 那会给每一步都加上无谓的分词开销，
+    而比较只在少数几条之间做。
+    """
+
+    sources: frozenset[str]
+    body: str = ""
+
+
 @dataclass
 class EvidenceState:
     """``evidence.jsonl`` 的形态统计 —— agent loop 的**进展判定**依据。
@@ -227,9 +244,22 @@ class EvidenceState:
     duplicate_lines: int = 0
     parse_errors: int = 0
     fingerprint: str = ""
+    #: 每条唯一记录的**比较快照**（顺序与文件一致）。进展判定与近重复检测都基于它。
+    #: **不进轨迹** —— 见 ``serializable()``。
+    facts: tuple[EvidenceFact, ...] = ()
 
     def signature(self) -> str:
         return self.fingerprint
+
+    def serializable(self) -> dict[str, Any]:
+        """给轨迹用的字典：**去掉 facts**。
+
+        ``Step.to_dict`` 走 ``vars(state)``；带上 facts 会把每条证据的正文与词集灌进
+        每一步的轨迹（本来 4.8MB 的轨迹文件会再涨一大截），而轨迹只需要形态统计。
+        """
+        data = dict(vars(self))
+        data.pop("facts", None)
+        return data
 
     def summary(self) -> str:
         parts = [f"{self.lines} lines", f"{self.unique_ids} unique ids", f"{self.bytes}B"]
@@ -304,6 +334,7 @@ def read_evidence_state(path: Path) -> EvidenceState:
     state = EvidenceState(bytes=len(data), parse_errors=parsed.bad_lines)
     seen: set[str] = set()
     unique_records: list[tuple[str, str]] = []
+    facts: list[EvidenceFact] = []
     for record in parsed.records:
         state.lines += 1
         memory_id = _id_of(record)
@@ -317,8 +348,16 @@ def read_evidence_state(path: Path) -> EvidenceState:
         body = record.get("content")
         if not isinstance(body, str):
             body = record.get("memory")
-        unique_records.append((memory_id, body if isinstance(body, str) else ""))
+        text = body if isinstance(body, str) else ""
+        unique_records.append((memory_id, text))
+        # 比较快照：只留 cite 的来源与正文本身 —— 措辞改动不影响"cite 了什么"。
+        raw_sources = (record.get("metadata") or {}).get("source") or []
+        facts.append(EvidenceFact(
+            sources=frozenset(s for s in raw_sources if isinstance(s, str) and s),
+            body=text,
+        ))
     state.unique_ids = len(seen)
+    state.facts = tuple(facts)
     if unique_records:
         digest = hashlib.sha256()
         for memory_id, body in sorted(unique_records):

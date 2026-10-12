@@ -87,20 +87,21 @@ def run_stage(stage: str, args: argparse.Namespace) -> None:
                   "（先跑 `python -m codemem.add --stage msgmem`）", file=sys.stderr)
             return
         client = llm.make_client(summem.gen_call_config(config, "summem"))
+        # 目录之间并行（像 atommem 一样），但共享同一个闸门 —— 总并发仍是 concurrency，不随目录数放大。
+        semaphore = asyncio.Semaphore(max(1, int(config.get("concurrency", 8))))
 
         async def run_all() -> list[dict]:
             try:
-                return [await summem.run_dir(d, config, client,
-                                             limit_sessions=args.limit_sessions)
-                        for d in targets]
+                return list(await asyncio.gather(*(
+                    summem.run_dir(d, config, client, limit_sessions=args.limit_sessions,
+                                   semaphore=semaphore)
+                    for d in targets
+                )))
             finally:
                 await client.close()
 
         for item in asyncio.run(run_all()):
-            if item.get("status") == "OK":
-                print(f"summem    {item['dir']}: {item['sessions']} 个 session 总结")
-            else:
-                print(f"summem    {item['dir']}: {item.get('status')} — {item.get('reason', '')}")
+            summem.report_result(item)
         return
 
     if stage == "atommem":

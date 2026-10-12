@@ -1,6 +1,6 @@
 """add · 第一步：原始对话 → ``msgmem.jsonl``（纯 CPU，不调模型）。
 
-**这是整条链路的输入层。** 把 ``data/correct_locomo10.json`` 的每个 session 摊平成一条条
+**这是整条链路的输入层。** 把 ``data/locomo_refined.json`` 的每个 session 摊平成一条条
 raw message memory，写到 ``data/{speaker_a}_{speaker_b}/msgmem.jsonl``。一行一条::
 
     {"memory": "Hey Mel! Good to see you!",

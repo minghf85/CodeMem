@@ -53,6 +53,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
               "temperature": 0.2, "max_tokens": 4096, "enable_thinking": False},
     "add_max_steps": 8,
     "timeout": 300,
+    "connect_timeout": 10.0,
     "max_retries": 3,
     "backoff_base": 2.0,
     "rate_limit_backoff": 10.0,
@@ -64,14 +65,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
 _SEARCH_TOP_LEVEL_KEYS = (
     "max_steps", "no_progress_patience", "max_verify_rounds", "observation_max_chars",
     "write_nudge_after", "evidence_soft_limit", "context_max_chars", "context_keep_recent",
-    "bash_timeout", "repeat_limit", "max_parse_retries", "timeout", "max_retries",
-    "backoff_base", "rate_limit_backoff", "max_backoff", "backoff_jitter",
+    "bash_timeout", "repeat_limit", "max_parse_retries", "timeout", "connect_timeout",
+    "max_retries", "backoff_base", "rate_limit_backoff", "max_backoff", "backoff_jitter",
 )
 #: add.yaml 里属于 add 侧（summem + atommem pipeline）模型/行为的键 —— 放进 API 的 ``index`` 段。
 _ADD_INDEX_KEYS = (
     "model", "base_url", "api_key", "temperature", "max_tokens", "enable_thinking",
-    "context_window", "timeout", "max_retries", "backoff_base", "rate_limit_backoff",
-    "max_backoff", "backoff_jitter",
+    "context_window", "timeout", "connect_timeout", "max_retries", "backoff_base",
+    "rate_limit_backoff", "max_backoff", "backoff_jitter",
 )
 
 

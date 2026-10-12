@@ -41,6 +41,8 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
+from ..similarity import is_same_fact
+
 # 输出截断上限（与 reference/tools.py 一致）
 DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 DEFAULT_MAX_OUTPUT_LINES = 2_000
@@ -467,8 +469,76 @@ def apply_edits(normalized: str, edits: list[dict[str, str]], path: str) -> tupl
     return normalized, new_content
 
 
+def _record_text(record: Any) -> str:
+    """一条记录的正文字段（新版 ``content``，兼容旧版 ``memory``）。"""
+    if not isinstance(record, dict):
+        return ""
+    value = record.get("content")
+    if not isinstance(value, str):
+        value = record.get("memory")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _record_sources(record: Any) -> set[str]:
+    """一条记录 cite 的 source id 集合。"""
+    if not isinstance(record, dict):
+        return set()
+    raw = (record.get("metadata") or {}).get("source") or []
+    return {s for s in raw if isinstance(s, str) and s}
+
+
+def near_duplicate_of(appended: str, previous: str) -> tuple[int, str] | None:
+    """追加内容里是否含有"**同一事实、且没带新 source**"的记录。
+
+    返回 ``(已有行号, 已有正文片段)``，没有则 ``None``。
+
+    实测背景：agent 会反复追加同一个事实的换说法（31% 的 QA 结束时存在近重复对），
+    既不加信息，又让 evidence 膨胀、稀释下游 answer 的注意力。判据复用
+    ``similarity.is_same_fact``（带主语/专有名词护栏，不会把 "pet named pup" 与
+    "pet named Luna" 并掉）。
+
+    **带了新 source 的重复一律放行** —— 那是"给同一条事实补来源"或"把两条并成一条"，
+    是正当操作（``is_same_fact`` 判的是正文，来源是新信息）。
+    """
+    existing: list[tuple[int, Any]] = []
+    for lineno, line in enumerate(previous.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(record, dict):
+            existing.append((lineno, record))
+    if not existing:
+        return None
+
+    for line in appended.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        text = _record_text(record)
+        if not text:
+            continue
+        new_sources = _record_sources(record)
+        for lineno, old in existing:
+            old_text = _record_text(old)
+            if not old_text or not is_same_fact(text, old_text):
+                continue
+            if new_sources - _record_sources(old):
+                continue        # 带了新来源 → 补来源/合并，放行
+            return lineno, old_text
+    return None
+
+
 def create_edit_tool(*, cwd: Path, confine: bool = True,
-                     default_write_file: str = "evidence.jsonl") -> ToolDefinition:
+                     default_write_file: str = "evidence.jsonl",
+                     reject_near_duplicates: bool = True) -> ToolDefinition:
     """``edit`` —— **唯一的写文件工具**（覆盖写已删除）。
 
     两种模式，靠参数二选一：
@@ -487,7 +557,9 @@ def create_edit_tool(*, cwd: Path, confine: bool = True,
     edit 直接报 File not found"这个 bug —— 反复出现的 edit 失败里，第一个 session 那次必然踩到。
 
     追加的防护：``append`` 文本为空 → 拒绝（空写只可能是截断）；追加内容与文件末尾已有的
-    最后一条**逐字重复** → 拒绝（模型有时会把刚刚写过的又追加一遍）。
+    最后一条**逐字重复** → 拒绝（模型有时会把刚刚写过的又追加一遍）；追加内容与**任意一条**
+    已有记录是**同一事实、且没带新 source** → 也拒绝（``reject_near_duplicates``，换措辞的
+    重复追加只涨体积不涨信息）。
     """
     async def execute(arguments: Mapping[str, Any]) -> ToolResult:
         # 缺 `path` 时默认 ``default_write_file``：这是本流程**唯一**要写的文件，而 8B 实测会
@@ -525,6 +597,20 @@ def create_edit_tool(*, cwd: Path, confine: bool = True,
                         f"That record is already the LAST line in {path.name} -- the file did "
                         f"not change. Append a DIFFERENT record, or reply with plain text if "
                         f"you are done."
+                    )
+            # 近重复防护：与已有记录"同一事实、且没带新 source" → 拒绝。换措辞的重复追加
+            # 不加信息，还稀释下游 answer 的注意力（实测 31% 的 QA 出现近重复对）。
+            if existed and stripped and reject_near_duplicates:
+                duplicate = near_duplicate_of(appended, previous)
+                if duplicate is not None:
+                    lineno, old_text = duplicate
+                    snippet = old_text[:140] + ("…" if len(old_text) > 140 else "")
+                    raise ToolError(
+                        f"You already recorded this fact at line {lineno} of {path.name}:\n"
+                        f"  {snippet}\n"
+                        f"Re-appending it in different words does not add evidence. If you found "
+                        f"additional provenance, EDIT that line to add the new source id; "
+                        f"otherwise search for a DIFFERENT fact."
                     )
             new_content = previous + appended + ("" if appended.endswith("\n") else "\n")
             async with _FileLock(path):
@@ -793,6 +879,7 @@ def build_tools(
     default_write_file: str = "evidence.jsonl",
     max_lines: int = DEFAULT_MAX_OUTPUT_LINES,
     max_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+    reject_near_duplicates: bool = True,
 ) -> dict[str, ToolDefinition]:
     """建出这一套工具。返回 ``{name: ToolDefinition}``。
 
@@ -808,7 +895,8 @@ def build_tools(
     """
     tools = [
         create_read_tool(cwd=cwd, max_lines=max_lines, max_bytes=max_bytes),
-        create_edit_tool(cwd=cwd, confine=confine, default_write_file=default_write_file),
+        create_edit_tool(cwd=cwd, confine=confine, default_write_file=default_write_file,
+                         reject_near_duplicates=reject_near_duplicates),
         create_bash_tool(
             cwd=cwd,
             shell_command_prefix=shell_command_prefix,

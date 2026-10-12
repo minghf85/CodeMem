@@ -11,8 +11,9 @@
 型看不见自己刚写了什么    → ``_evidence_digest``
 60/60 步没有一次完成信号  **重复检测**：同样的工具+参数再来一次就直接拒绝并警告     重复工具调用检测
 → 12~24 步全烧在重复追加  → ``_RepeatTracker``
-空转被算作"有进展"       **进展改成"唯一 id 数"变化**，不是行数变化                —
-（往文件里追加重复行）    → ``EvidenceState.fingerprint``
+空转被算作"有进展"       **进展 = cite 的 source 集合或实体词集合增长了**，不是            —
+（重复追加 / 原地换措辞）  指纹变了就算；纯换同义词不再算进展
+                          → ``_ProgressTracker``
 prompt 随历史无限涨       **上下文压缩**：超出预算即把中段坍缩成摘要，保留           auto-compaction
 （3.3k→4.5k tok / 12 步） system + 最近 N 条 + 工具用过的 id 集合
 ======================  =====================================================  ==========
@@ -39,8 +40,10 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from . import toolcfg
+from ..audit import CorpusIndex, audit_facts, audit_notice
 from ..log import Logger, block
-from .evidence import EvidenceState, read_evidence_state
+from ..similarity import is_same_fact
+from .evidence import EvidenceFact, EvidenceState, read_evidence_state
 from .toolcfg import ToolCall
 from .tools import ToolError, ToolResult
 
@@ -184,6 +187,26 @@ def no_output_notice(call: ToolCall) -> str:
     )
 
 
+def broad_grep_notice(lines: int, shown_chars: int) -> str:
+    """grep 打得太宽时的提示 —— 这是实测里最费步数的一个习惯。
+
+    轨迹统计：3 次多跳运行、293 条 bash 里 **76 条**是 ``grep -rin "Caroline" inputs/`` /
+    ``"Melanie"`` 这类拿**说话人名字**当关键词的搜索 —— 名字几乎出现在每条记录里，于是
+    命中几百行、观测被截到 8000 字符，模型只能看到一个片段，还照样据此作答。
+
+    观测里本来就有 "[observation truncated, N chars total]"，但模型不会自己推出"我搜太宽了"。
+    所以这里把**行数**摆出来，并给出三个具体的收窄动作（换更稀有的词 / 限定到一个文件 /
+    改用 tag 索引）—— 这是"把纪律下沉到 harness"，不是再写一段 prompt 说教。
+    """
+    return (
+        f"\n\n[TOO BROAD: that matched about {lines} lines and only the first {shown_chars} "
+        f"characters were shown -- you are reading a small slice and will miss the rest. Narrow "
+        f"it before writing evidence: grep a RARER word (not the speaker's name), restrict to one "
+        f"file (`inputs/atommem.jsonl` is the distilled one), or grep a tag from the index, e.g. "
+        f"`grep 'activity:camping' inputs/atommem.jsonl`.]"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 步 / 结果
 # ---------------------------------------------------------------------------
@@ -206,10 +229,19 @@ class Step:
     parse_retry: bool = False
     repeat_rejected: bool = False
     mutated: bool = False
+    #: 由 ``_ProgressTracker`` 给出的"是否真的前进了"。``None`` = 用旧指纹比较兜底。
+    progressed_override: bool | None = None
 
     @property
     def progressed(self) -> bool:
-        """这一步有没有可能推进任务：唯一 id 数或字节数变化了。"""
+        """这一步有没有真正推进任务。
+
+        判据由 ``_ProgressTracker.advanced`` 给出（看 cite 的 source 集合与实体词是否增长），
+        它比"指纹变了"严格得多 —— 纯换措辞不再算进展。只有在 tracker 无法判断时
+        （文件解析出错、没有可比快照）才回退到指纹比较。
+        """
+        if self.progressed_override is not None:
+            return self.progressed_override
         return self.state_before.signature() != self.state_after.signature()
 
     @property
@@ -257,8 +289,8 @@ class Step:
             "result_text": clip(result.text) if result else "",
             "result_text_chars": len(result.text) if result else 0,
             "result_details": result.details if result else {},
-            "evidence_before": vars(self.state_before),
-            "evidence_after": vars(self.state_after),
+            "evidence_before": self.state_before.serializable(),
+            "evidence_after": self.state_after.serializable(),
             "progressed": self.progressed,
             "mutated": self.mutated,
             "duration_seconds": self.duration_seconds,
@@ -281,6 +313,7 @@ class AgentOutcome:
     no_progress_steps: int = 0
     compactions: int = 0
     forgotten_observations: int = 0
+    broad_greps: int = 0
 
     @property
     def tool_calls(self) -> int:
@@ -304,6 +337,7 @@ class AgentOutcome:
             + (f" 工具错误 {self.tool_errors}" if self.tool_errors else "")
             + (f" 压缩 {self.compactions}" if self.compactions else "")
             + (f" 遗忘 {self.forgotten_observations}" if self.forgotten_observations else "")
+            + (f" 过宽grep {self.broad_greps}" if self.broad_greps else "")
             + f" 结束={self.done_reason}"
         )
 
@@ -336,6 +370,55 @@ class _RepeatTracker:
         key = (self.key(call), state_key)
         self.counts[key] = self.counts.get(key, 0) + 1
         return self.counts[key]
+
+
+class _ProgressTracker:
+    """这一轮有没有**真正**往前走 —— 对"换措辞"免疫的进展判定。
+
+    背景（实测）：agent 会在同一条 evidence 上来回改措辞（A→B→A→B…），qa0 的轨迹里
+    从 step 9 一直刷到 step 25。旧的判据是"唯一记录指纹变了"（``EvidenceState.fingerprint``），
+    而 ``_id_of`` **拿 content 当 id**，于是**任何改写都让指纹变**，空转被当成进展，
+    ``no_progress_patience`` 永远不触发 —— 步数预算被吃光，检索时间没了。
+
+    判据只有三条，都问"信息量有没有增加"：
+
+    1. **cite 了新的 source id** → 读了新东西（或把两条并成一条），进展；
+    2. **出现了一条 before 里没有的"新事实"**（用 ``similarity.is_same_fact`` 判断）→ 进展；
+    3. **行数变少** → 删除/合并，也算进展（否则"删掉写错的证据"会被当成空转）。
+
+    实测这组判据能正确区分两类：真正的改写（"attended … transformative experience" ↔
+    "attendance … marked a significant turning point"）会被 ``is_same_fact`` 认成同一事实
+    → **不算进展**；而无关事实之间 token 重合度为 0 → 一定算新事实。纯 Jaccard 做不到这一点
+    （同一事实的两种说法 Jaccard 只有 0.45，调阈值会两头不讨好）。
+
+    返回 ``True``/``False``；**无法判断时返回 ``None``**（没有可比快照），让调用方回退到
+    旧的指纹比较 —— 坏文件不该被误判成"没进展"而提前收尾。
+    """
+
+    def _sources(self, facts: tuple[EvidenceFact, ...]) -> set[str]:
+        out: set[str] = set()
+        for fact in facts:
+            out |= fact.sources
+        return out
+
+    def advanced(
+        self,
+        before: tuple[EvidenceFact, ...],
+        after: tuple[EvidenceFact, ...],
+    ) -> bool | None:
+        if not before and not after:
+            return None
+        # 1) 新 cite 了 source —— 最硬的进展信号。
+        if self._sources(after) - self._sources(before):
+            return True
+        # 3) 纯删除（行数变少）：算一次进展，否则"删掉写错的证据"会被当成空转。
+        if len(after) < len(before):
+            return True
+        # 2) 有没有 before 里不存在的**新事实**。
+        for fact in after:
+            if not any(is_same_fact(fact.body, old.body) for old in before):
+                return True
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +652,9 @@ async def run_agent_round(
     forget_after_turns: int = 0,
     long_observation_chars: int = 0,
     forget_keep_recent_turns: int = 2,
+    corpus_index: CorpusIndex | None = None,
+    audit_max_notices: int = 3,
+    broad_grep_lines: int = 0,
     on_step: Callable[[Step], None] | None = None,
 ) -> tuple[AgentOutcome, list[dict[str, str]]]:
     """跑一个 round：从 ``messages`` 出发，直到模型**明确回复纯文本**或用完步数。
@@ -578,12 +664,14 @@ async def run_agent_round(
     """
     outcome = AgentOutcome(messages=messages)
     repeats = _RepeatTracker()
+    progress = _ProgressTracker()
     nudged = False
     oversize_warned = False
     consecutive_no_progress = 0
     steps_used = 0
     attempts_used = 0
     warned_duplicates = False
+    seen_audit: set[tuple[str, ...]] = set()
 
     while steps_used < max_steps:
         # ---- 遗忘：超长且够旧的工具观测 → 一行占位符（在压缩**之前**做定点清理）----
@@ -725,6 +813,12 @@ async def run_agent_round(
 
         state_after = read_evidence_state(evidence_path)
         step.state_after = state_after
+        # 进展判据：看 cite 的 source 与实体词有没有增长（对"换措辞"免疫）。
+        # 解析出错时 advanced 返回 None，Step.progressed 回退到旧的指纹比较。
+        if state_before.parse_errors or state_after.parse_errors:
+            step.progressed_override = None
+        else:
+            step.progressed_override = progress.advanced(state_before.facts, state_after.facts)
 
         observation = render_observation(step, max_chars=observation_max_chars)
         # 机制层面的"该动笔了"：只在还没写过东西、且已经烧掉不少步数时插一次。
@@ -756,9 +850,31 @@ async def run_agent_round(
         elif (step.result is not None and step.result.ok and not step.error
                 and not step.result.text.strip()):
             observation += no_output_notice(call)
+        # grep 打得太宽（拿说话人名字当关键词是重灾区）：命中几百行、观测被截断，模型只看到
+        # 一个片段还照样据此作答。单独一条提示，把行数与收窄动作摆出来。
+        if (step.result is not None and step.result.ok and not step.error
+                and broad_grep_lines > 0 and "grep" in str(call.args.get("command") or "")):
+            matched = step.result.text.count("\n") + 1
+            if matched >= broad_grep_lines or len(step.result.text) > observation_max_chars:
+                observation += broad_grep_notice(matched, observation_max_chars)
+                outcome.broad_greps += 1
         # P0 修复：变更型调用之后**主动告诉模型文件现在长什么样**（重定向让 stdout 为空）
         if step.mutated and not step.error:
             observation += _evidence_digest(evidence_path, state_after)
+        # 确定性审计：本步**新写/改写**的记录里，有没有"名字在语料里根本不存在"的声明。
+        # 只提示、不删改；同一个问题只提示一次（`seen_audit`）。
+        if corpus_index is not None and len(seen_audit) < audit_max_notices:
+            before_bodies = {fact.body for fact in state_before.facts}
+            changed = [(fact.body, sorted(fact.sources))
+                       for fact in state_after.facts
+                       if fact.body and fact.body not in before_bodies]
+            if changed:
+                report = audit_facts(changed, corpus_index)
+                key = tuple(sorted(f.describe() for f in report.findings))
+                if key and key not in seen_audit:
+                    seen_audit.add(key)
+                    observation += audit_notice(report)
+                    log.warn(f"step {global_step} 证据审计：{report.count()} 条引用了来源中没有的实体")
         if state_after.duplicate_lines >= duplicate_warn_at and not warned_duplicates:
             warned_duplicates = True
             observation += (

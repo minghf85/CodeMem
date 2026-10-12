@@ -119,8 +119,8 @@ def _add_config(config: dict[str, Any]) -> dict[str, Any]:
     一份模型配置，两个模块都用它，避免"读完发现模型配置不在顶层、悄悄退回本地模型"。
     """
     merged = dict(config.get("index") or {})
-    for key in ("timeout", "max_retries", "backoff_base", "rate_limit_backoff",
-                "max_backoff", "backoff_jitter"):
+    for key in ("timeout", "connect_timeout", "max_retries", "backoff_base",
+                "rate_limit_backoff", "max_backoff", "backoff_jitter"):
         if key in config:
             merged.setdefault(key, config[key])
     merged.setdefault("concurrency", config.get("add_concurrency", 8))

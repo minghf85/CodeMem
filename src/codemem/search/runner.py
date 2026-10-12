@@ -45,8 +45,10 @@ import re
 import shutil
 import stat
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -58,12 +60,13 @@ from . import agent as agent_mod
 from . import evidence as evidence_mod
 from . import toolcfg
 from . import verifier as verifier_mod
+from .. import audit
 from .. import dataset
 from ..log import Logger, block
 
 # 从 io 导入**唯一**的 PROJECT_ROOT，不要自己 parents[N] 推 ——
 # 本文件在子包里深度不同，重算会落到 src/ 而不是项目根。
-from ..io import PROJECT_ROOT
+from ..io import PROJECT_ROOT, read_jsonl
 DATA_DIR = PROJECT_ROOT / "data"
 CONFIG_FILE = PROJECT_ROOT / "configs" / "search.yaml"
 TOOL_CONFIG_FILE = PROJECT_ROOT / "configs" / "tool.json"
@@ -100,6 +103,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "repeat_limit": 1,
     # evidence 里重复行达到这个数量就给一次去重警告
     "duplicate_warn_at": 10,
+    # append 一条与已有记录"同一事实、且没带新 source"的 evidence → 拒绝（换措辞的重复
+    # 追加只涨体积不涨信息）。判据见 similarity.is_same_fact。
+    "reject_near_duplicates": True,
+    # 确定性证据审计（见 codemem/audit.py）：核对正文里的专名在不在被引来源的原文里。
+    # 只提示、不删改。
+    "evidence_audit": True,
+    # 每条 QA 最多注入几条审计提示（0 = 不注入，审计结论仍进日志）。
+    "audit_max_notices": 3,
+    # 一次 grep 命中多少行就算"打得太宽"→ 注入收窄提示（0 = 关）。实测 26% 的 bash 命令是
+    # `grep -rin "<说话人名>" inputs/`，命中几百行、观测被截到 8000 字符，模型只看片段。
+    "broad_grep_lines": 80,
     # 上下文压缩：messages 总字符超过这个数就把中段坍缩成摘要（0 = 不压缩）
     "context_max_chars": 160000,
     "context_keep_recent": 8,
@@ -115,6 +129,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_qa": 0,
     "skip_category5": True,
     "timeout": 300,
+    "connect_timeout": 10.0,
     "max_retries": 3,
     "backoff_base": 2.0,
     "rate_limit_backoff": 10.0,
@@ -162,8 +177,8 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 # ``llm.chat_completion`` 需要的键。**重试参数在顶层**（timeout / max_retries /
 # backoff_*），模型参数在 ``generator`` 段里 —— 所以要把两处合起来给它，否则 KeyError。
 CALL_KEYS = (
-    "timeout", "max_retries", "backoff_base", "rate_limit_backoff", "max_backoff",
-    "backoff_jitter",
+    "timeout", "connect_timeout", "max_retries", "backoff_base", "rate_limit_backoff",
+    "max_backoff", "backoff_jitter",
 )
 
 
@@ -587,6 +602,7 @@ async def run_qa(
             cwd=workspace_root,
             shell_command_prefix=shell_prefix,
             bash_timeout=float(config.get("bash_timeout", 60)),
+            reject_near_duplicates=bool(config.get("reject_near_duplicates", True)),
         )
         catalog.apply(tools)
         scripted_prompt = catalog.render_prompt(question)
@@ -741,6 +757,65 @@ def render_session_index(roster: dict[int, str]) -> str:
     return "\n".join(lines)
 
 
+def render_tag_index(inputs_dir: Path, per_key: int = 3, max_atoms: int = 20,
+                     skip_keys: tuple[str, ...] = ("other", "time", "action", "sentiment",
+                                                   "state")) -> str:
+    """把**这份语料里真实存在**的 tag 渲染成一份小索引，放进 prompt 当检索入口。
+
+    为什么给数据而不是给说明：策略里写了"atom 带 tag 索引、可以按 tag 枚举"之后，实测
+    3 次多跳运行、290 条 bash 命令里**只有 4 条**真的用了 tag（1.4%）。小模型不会因为
+    被**描述**就采用一个它没见过的东西 —— 但把这份语料里真实存在的 tag（带出现次数）
+    直接摆出来，它就会用。这是"纪律/信息下沉到 harness"，而不是再写一段 prompt 说教。
+
+    只列**够短、可以枚举**的 tag（出现次数 <= ``max_atoms``）：``sentiment:love`` 这类
+    出现几百次的 tag，grep 出来就是刷屏，对"枚举出一类事实"没有价值。
+    """
+    path = inputs_dir / "atommem.jsonl"
+    if not path.exists():
+        return "(no tag index -- inputs/atommem.jsonl not found)"
+    counts: dict[str, Counter[str]] = {}
+    for record in read_jsonl(path):
+        for tag in (record.get("metadata") or {}).get("tag") or []:
+            if not isinstance(tag, str) or ":" not in tag:
+                continue
+            key, _, value = tag.partition(":")
+            counts.setdefault(key, Counter())[value] += 1
+
+    lines: list[str] = []
+    for key in sorted(counts):
+        if key in skip_keys:
+            continue
+        items = [(value, n) for value, n in counts[key].items() if n <= max_atoms]
+        if not items:
+            continue
+        items.sort(key=lambda item: (-item[1], item[0]))
+        shown = "  ".join(f"{key}:{value}({n})" for value, n in items[:per_key])
+        lines.append(f"  {key:<11} {shown}")
+    if not lines:
+        return "(no tags found in inputs/atommem.jsonl)"
+    header = (
+        "Atom tags in this corpus (metadata.tag; n = how many atoms carry it). For a SET or a COUNT\n"
+        "question, grep the tag instead of guessing a keyword -- `grep 'activity:camping'\n"
+        "inputs/atommem.jsonl` pulls EVERY fact of that kind. An atom's `source` is its message, so\n"
+        "`grep 'session_7_18' inputs/atommem.jsonl` hops to the rest of that turn:"
+    )
+    return header + "\n" + "\n".join(lines)
+
+
+@lru_cache(maxsize=8)
+def _cached_tag_index(inputs_dir_str: str) -> str:
+    return render_tag_index(Path(inputs_dir_str))
+
+
+def tag_index_for(inputs_dir: Path) -> str:
+    """带缓存的入口（``inputs`` 是软链接，先 resolve 再当键，138 条 QA 只建一次）。"""
+    try:
+        key = str(Path(inputs_dir).resolve())
+    except OSError:
+        key = str(inputs_dir)
+    return _cached_tag_index(key)
+
+
 @dataclass
 class PhaseOutcome:
     """``run_phases`` 的产出：跑完一条 QA 的全部结论。"""
@@ -799,6 +874,13 @@ async def run_phases(
     forget_after_turns = max(0, int(config.get("forget_after_turns", 0)))
     long_observation_chars = max(0, int(config.get("long_observation_chars", 0)))
     forget_keep_recent_turns = max(0, int(config.get("forget_keep_recent_turns", 2)))
+    # 确定性证据审计：核对"正文里的专名在不在被引来源里"。默认开；关掉它只影响提示，
+    # 不影响产物（见 codemem/audit.py）。
+    corpus_index = (
+        audit.corpus_index_for(inputs_dir) if config.get("evidence_audit", True) else None
+    )
+    audit_max_notices = max(0, int(config.get("audit_max_notices", 3)))
+    broad_grep_lines = max(0, int(config.get("broad_grep_lines", 80)))
 
     outcome = PhaseOutcome()
     step_offset = 0
@@ -806,7 +888,7 @@ async def run_phases(
     messages: list[dict[str, str]] = [
         {"role": "system", "content": scripted_prompt},
         {"role": "user", "content": catalog.prompt_text(
-            "user_begin", sessions=session_index,
+            "user_begin", sessions=session_index, tags=tag_index_for(inputs_dir),
         )},
     ]
 
@@ -839,6 +921,9 @@ async def run_phases(
             forget_after_turns=forget_after_turns,
             long_observation_chars=long_observation_chars,
             forget_keep_recent_turns=forget_keep_recent_turns,
+            corpus_index=corpus_index,
+            audit_max_notices=audit_max_notices,
+            broad_grep_lines=broad_grep_lines,
         )
         step_offset += len(result.steps)
         outcome.steps += len(result.steps)
