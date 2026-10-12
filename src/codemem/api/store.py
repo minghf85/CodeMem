@@ -3,7 +3,7 @@
 **一个 user 一个目录**，结构对齐离线管线（add 的三层记忆文件）：
 
     data/api_store/{slug(user_id)}/
-      meta.json                 session_id -> 会话号、每会话消息数、已应用的 request_id
+      meta.json                 session_id -> 会话号、每会话消息数、已应用的 request_id、pending（写前日志）
       msgmem.jsonl              原始消息（type=msg；会话时间戳是锚点）
       summem.jsonl              每个会话一份总结（type=summary）
       atommem.jsonl             逐 message 抽出的原子事实（type=atom）
@@ -14,6 +14,12 @@
 
 **幂等**是协议硬要求：Add 重试时 ``request_id`` 不变，同一条不能写入两次。所以每次 Add 先查
 ``meta.applied_request_ids`` —— 命中就直接返回成功，连语料都不碰。
+
+**崩溃一致 / 中断续跑**：Add 不是"一次性写完"，而是**写前日志（WAL）**—— 先把意图
+（`request_id` + 待写 msg 记录）记进 ``meta.pending``，再落 ``msgmem``、再刷新记忆，最后把
+``request_id`` 从 ``pending`` 移进 ``applied_request_ids`` 落定。任意时刻被 kill（SIGKILL/OOM/
+重启），重启后都能凭 ``pending`` 把这次 Add **补完**（``recover`` / ``recover_all``，也由
+``append`` 顶部懒执行），且重发同一 ``request_id`` 不会重复写消息。
 
 **写锁**：同一 user 的并发 Add 会交错读改写同一份语料，故按 user_id 分桶一把 ``asyncio.Lock``。
 不同 user 互不影响（各自的目录）。
@@ -107,8 +113,10 @@ def _read_meta(path: Path, user_id: str) -> dict[str, Any]:
             raw.setdefault("sessions", {})
             raw.setdefault("next_index", 1)
             raw.setdefault("applied_request_ids", [])
+            raw.setdefault("pending", {})
             return raw
-    return {"user_id": user_id, "sessions": {}, "next_index": 1, "applied_request_ids": []}
+    return {"user_id": user_id, "sessions": {}, "next_index": 1,
+            "applied_request_ids": [], "pending": {}}
 
 
 def _add_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -193,26 +201,40 @@ class UserStore:
     ) -> dict[str, Any]:
         """把一个 Add 请求写成三层记忆，返回小结 dict。
 
-        ``messages`` 是已归一化的 ``[{"role", "content", "timestamp"}]``。步骤：
+        ``messages`` 是已归一化的 ``[{"role", "content", "timestamp"}]``。**崩溃一致**：先把
+        "意图"写进 ``meta.pending``（写前日志，WAL），再落 ``msgmem``、再刷新记忆、最后落定。
+        任意时刻被 kill，重启后都能凭 ``pending`` 把这次 Add 补完（见 ``recover``），且重发同一
+        ``request_id`` 不会重复写。
 
-        1. 取该 user 的写锁；
-        2. **幂等**：``request_id`` 已应用 → 直接返回（不碰语料）；
-        3. 分配 ``id`` / 转时间，把新消息**以原始措辞**追加到 ``msgmem.jsonl``；
-        4. **在返回前**重算该会话的 ``summem``（一次 LLM 总结）与该会话的 ``atommem``
-           （逐 message 的 **pipeline** 抽取，只处理本会话）—— 兑现"持久化后立即可检索"；
-        5. 原子写回语料 + meta。
+        步骤：
 
-        只重算**本会话**：其它会话的记忆原样保留（增量），所以重复 Add 不会重跑其它会话的抽取。
+        1. 取该 user 的写锁；**先补完遗留的 pending**（``_recover_locked``）；
+        2. **幂等**：``request_id`` 已应用 / 已待续跑 → 直接返回（不重复写）；
+        3. 分配会话号与 msg_id，构建本批 msg 记录；
+        4. **WAL**：把 ``{session_id, session_index, start, records}`` 写进 ``meta.pending`` 并
+           **预留 id 空间**（``sessions[..].count += len``），原子写 meta —— **在碰 msgmem 之前**；
+        5. 追加 msg 记录到 ``msgmem.jsonl``（原子整文件重写）；
+        6. 重算本会话的 ``summem`` 与 ``atommem``；成功则把 ``request_id`` 落定（pending → applied）；
+           刷新失败则**保留 pending**，下次启动 / 下次同 user 请求时自动重试刷新。
         """
         lock = _lock_for(self.user_id)
         async with lock:
             self.root.mkdir(parents=True, exist_ok=True)
             meta = self.meta()
 
+            # ---- 先补完上一个被中断的 Add（幂等；pending 为空时零成本）----
+            await self._recover_locked(meta, config=config, client=client, log=log)
+
             if request_id in meta["applied_request_ids"]:
                 if log is not None:
                     log.info(f"Add 幂等命中：request_id={request_id!r} 已应用，跳过写入")
                 return {"written": 0, "duplicate": True, "session_index": None}
+            if request_id in meta["pending"]:
+                # 上一次同 id 的 Add 已落盘消息、只是记忆刷新没跑完（见 _recover_locked）。消息此时
+                # 已由上面的恢复落盘，这里不再重复写；刷新留待下次续跑。
+                if log is not None:
+                    log.info(f"Add 续跑命中：request_id={request_id!r} 待补刷新，消息已落盘")
+                return {"written": 0, "duplicate": True, "pending": True, "session_index": None}
 
             # ---- 该 session 在本地语料里的会话号 ----
             sessions_map: dict[str, Any] = meta["sessions"]
@@ -222,14 +244,12 @@ class UserStore:
                 sessions_map[session_id] = entry
                 meta["next_index"] = int(entry["index"]) + 1
             session_index = int(entry["index"])
-
-            # ---- 追加消息到 msgmem.jsonl（序号接在已有条数之后）----
-            records = read_jsonl(self.msgmem_path)
             start = int(entry.get("count", 0))
-            for offset, message in enumerate(messages, start=1):
-                content = normalize_content(message.get("content"))
-                records.append(make_memory(
-                    memory=content,
+
+            # ---- 构建本批 msg 记录（msg_id 接在已预留条数之后）----
+            records = [
+                make_memory(
+                    memory=normalize_content(message.get("content")),
                     memory_type="msg",
                     mem_id=f"session_{session_index}_{start + offset}",
                     time=_iso_from_ms(message.get("timestamp")),
@@ -237,25 +257,140 @@ class UserStore:
                     tag=[],
                     source=[],
                     changelog=[{"time": now_iso(), "content": "created"}],
-                ))
-            entry["count"] = start + len(messages)
-            write_memories(self.msgmem_path, records)
+                )
+                for offset, message in enumerate(messages, start=1)
+            ]
 
-            # ---- 重算本会话的 summem 与 atommem ----
+            # ---- WAL：先记意图并预留 id 空间，原子写 meta（在碰 msgmem 之前）----
+            meta["pending"][request_id] = {
+                "session_id": session_id,
+                "session_index": session_index,
+                "start": start,
+                "records": records,
+                "created": now_iso(),
+            }
+            entry["count"] = start + len(records)
+            _atomic_write_json(self.meta_path, meta)
+
+            # ---- 落 msgmem（原子整文件重写）----
+            existing = read_jsonl(self.msgmem_path)
+            write_memories(self.msgmem_path, existing + records)
+
+            # ---- 刷新本会话的 summem / atommem；成功才落定 ----
             refreshed = await self._refresh_memories(
                 session_index=session_index, config=config, client=client, log=log,
             )
-
-            # ---- meta：记下这个 request_id（幂等键）----
-            meta["applied_request_ids"] = [*meta["applied_request_ids"], request_id]
-            _atomic_write_json(self.meta_path, meta)
+            if refreshed:
+                meta["pending"].pop(request_id, None)
+                meta["applied_request_ids"] = [*meta["applied_request_ids"], request_id]
+                _atomic_write_json(self.meta_path, meta)
 
             if log is not None:
                 log.info(
-                    f"Add 写入 {len(messages)} 条 -> session {session_index}"
-                    f"（共 {entry['count']} 条）记忆刷新={'成功' if refreshed else '未变'}"
+                    f"Add 写入 {len(records)} 条 -> session {session_index}"
+                    f"（共 {entry['count']} 条）记忆刷新={'成功' if refreshed else '待续跑'}"
                 )
-            return {"written": len(messages), "duplicate": False, "session_index": session_index}
+            return {
+                "written": len(records),
+                "duplicate": False,
+                "session_index": session_index,
+                "refreshed": refreshed,
+            }
+
+    # -- 中断续跑（恢复）---------------------------------------------------
+
+    async def _apply_pending(
+        self,
+        meta: dict[str, Any],
+        request_id: str,
+        config: dict[str, Any],
+        client: Any,
+        log: Any | None,
+    ) -> bool:
+        """把一个 pending 的 Add 补完（幂等）。True=已落定，False=刷新未成（留待下次）。
+
+        崩溃点都吃得下：``msgmem`` 已写则按 ``memory_id`` 跳过补写；刷新是"整会话重建"故可重入。
+        只在本方法**成功**时改 ``meta``（弹 pending、记 applied）；失败时不动 meta，保持 pending。
+        """
+        entry = meta.get("pending", {}).get(request_id)
+        if not isinstance(entry, dict):
+            meta.get("pending", {}).pop(request_id, None)
+            return False
+
+        session_id = str(entry.get("session_id") or "")
+        session_index = int(entry.get("session_index") or 0)
+        start = int(entry.get("start") or 0)
+        records = [r for r in (entry.get("records") or []) if isinstance(r, dict)]
+
+        # 1. 确保 msgmem 含这些记录（按 id 去重 —— 崩在 msgmem 写之后时不重复补）
+        existing = read_jsonl(self.msgmem_path)
+        have = {memory_id(r) for r in existing}
+        missing = [r for r in records if memory_id(r) not in have]
+        if missing:
+            write_memories(self.msgmem_path, existing + missing)
+
+        # 2. 补回（可能缺失/损坏的）会话条目；count 取最大（预留语义，避免 msg_id 撞车）
+        sessions_map: dict[str, Any] = meta["sessions"]
+        item = sessions_map.get(session_id)
+        if not isinstance(item, dict):
+            item = {"index": session_index, "count": 0}
+            sessions_map[session_id] = item
+        item["count"] = max(int(item.get("count", 0)), start + len(records))
+
+        # 3. 刷新本会话记忆；失败则保留 pending，下次再续
+        refreshed = await self._refresh_memories(
+            session_index=session_index, config=config, client=client, log=log,
+        )
+        if not refreshed:
+            return False
+
+        # 4. 落定：pending -> applied（成功后才动 meta）
+        meta["pending"].pop(request_id, None)
+        meta["applied_request_ids"] = [*meta["applied_request_ids"], request_id]
+        return True
+
+    async def _recover_locked(
+        self,
+        meta: dict[str, Any],
+        *,
+        config: dict[str, Any],
+        client: Any,
+        log: Any | None,
+    ) -> int:
+        """补完 ``meta.pending`` 里的全部 Add，返回落定条数。单条失败只 warn、不中断。
+
+        每个 entry 每次调用只处理一遍，故刷新持续失败时不会在此处空转（下次启动 / 下次同 user
+        请求再重试一次）。有落定才写一次 meta。
+        """
+        pending = meta.get("pending") or {}
+        if not pending:
+            return 0
+        finalized = 0
+        for request_id in list(pending):
+            try:
+                if await self._apply_pending(meta, request_id, config, client, log):
+                    finalized += 1
+            except Exception as exc:  # noqa: BLE001 - 单条恢复失败不该影响其它
+                if log is not None:
+                    log.warn(f"恢复 pending 失败 {request_id!r}：{type(exc).__name__}: {exc}")
+        if finalized:
+            _atomic_write_json(self.meta_path, meta)
+            if log is not None:
+                log.info(f"续跑完成：{finalized}/{len(pending)} 个被中断的 Add 已落定")
+        return finalized
+
+    async def recover(
+        self,
+        *,
+        config: dict[str, Any],
+        client: Any,
+        log: Any | None = None,
+    ) -> int:
+        """补完该 user 遗留的 pending Add（幂等、可重入）。无 pending 时零成本。返回落定条数。"""
+        lock = _lock_for(self.user_id)
+        async with lock:
+            meta = self.meta()
+            return await self._recover_locked(meta, config=config, client=client, log=log)
 
     async def _refresh_memories(
         self,
@@ -352,3 +487,56 @@ def llm_quiet_logger():
     from ..log import Logger
 
     return Logger(level="warn")
+
+
+# ---------------------------------------------------------------------------
+# 启动自愈：把 store 根下所有 user 遗留的 pending Add 补完
+# ---------------------------------------------------------------------------
+
+def iter_user_ids(root: Path) -> list[str]:
+    """扫描 ``root`` 下所有 user 目录，取 ``meta.json`` 里的 ``user_id``（缺 meta 的目录跳过）。
+
+    目录名是 ``slug(user_id)``，故读回 ``user_id`` 才能重建 ``UserStore``（它能算出同一个目录）。
+    """
+    user_ids: list[str] = []
+    if not root.exists():
+        return user_ids
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        meta_path = child / META_NAME
+        if not meta_path.exists():
+            continue
+        try:
+            raw = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        user_id = raw.get("user_id") if isinstance(raw, dict) else None
+        if isinstance(user_id, str) and user_id:
+            user_ids.append(user_id)
+    return user_ids
+
+
+async def recover_all(
+    root: Path,
+    *,
+    config: dict[str, Any],
+    client: Any,
+    log: Any | None = None,
+) -> int:
+    """启动自愈：补完 ``root`` 下每个 user 遗留的 pending Add，返回落定总数。
+
+    ``pending`` 常态为空 —— 此时只是读一遍各 user 的小 ``meta.json``，几乎零成本；只有真被中断
+    过的 Add 才会触发 LLM 重跑刷新。单个 user 出错只 warn，不影响其它。
+    """
+    total = 0
+    for user_id in iter_user_ids(root):
+        store = UserStore(user_id, root)
+        try:
+            total += await store.recover(config=config, client=client, log=log)
+        except Exception as exc:  # noqa: BLE001 - 单个 user 出错不影响其它
+            if log is not None:
+                log.warn(f"恢复 user {user_id!r} 失败：{type(exc).__name__}: {exc}")
+    if total and log is not None:
+        log.info(f"启动续跑：共落定 {total} 个被中断的 Add")
+    return total

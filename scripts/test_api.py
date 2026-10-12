@@ -9,6 +9,9 @@
 4. **Search 产物映射**：evidence 记录 → 协议 ``data[]``（字段齐全、按 score 降序、top_k 截断、
    无证据 → ``[]``）。
 5. **多模态归一化**：有序 ``ContentPart[]`` → 可 grep 的文本（图片降级成 ``[image: ...]``）。
+6. **中断续跑**：写前日志（WAL）保证"被 kill 后不丢不重" —— 刷新失败/硬中断的 Add 留在
+   ``meta.pending``，重发同一 ``request_id`` 不重复写，重启（新 ``UserStore`` 实例）或
+   ``recover_all`` 能独立补完。
 
 做法：把 ``codemem.llm.chat_completion`` 换成一个**脚本化**的假实现 —— 它按 system prompt 判断
 这次调用是 agent / verifier / index，返回预先写好的回复。工具、存储、agent loop、verifier
@@ -19,6 +22,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import tempfile
@@ -297,6 +301,112 @@ def test_validation(tmp: Path) -> None:
     check("Add 缺 messages -> 422", resp.status_code == 422, str(resp.status_code))
 
 
+def test_resume(tmp: Path) -> None:
+    """中断续跑：写前日志（WAL）+ 恢复。证明「被 kill 后不丢不重、能补完」。
+
+    做法：把 ``_refresh_memories`` 换成"失败/抛异常"，模拟"消息已落 msgmem、但记忆刷新没跑完
+    就被中断"。随后（a）重试同一 ``request_id`` 不重复写；（b）用一个**新的** ``UserStore`` 实例
+    （= 模拟进程重启）``recover`` 独立补完，无需客户端重发。
+    """
+    print("\n[7] 中断续跑（WAL + 恢复）")
+
+    app = _app_with_temp_store(tmp)
+    config = app.state.api.config
+    client = app.state.api.add_client
+    root = Path(app.state.api.store_root)
+
+    user_id, session_id = "eval:run2:locomo:conv-0", "eval:run2:sample:0"
+    req_id = "eval:run2:locomo:conv-0:chunk-0"
+    messages = [
+        {"role": "user", "content": "I went to a LGBTQ support group yesterday",
+         "timestamp": 1683561600000},
+        {"role": "assistant", "content": "That sounds meaningful."},
+    ]
+    store = store_mod.UserStore(user_id, root)
+
+    original = store_mod.UserStore._refresh_memories
+
+    async def fail_refresh(self, **kwargs):  # noqa: ANN001
+        return False   # 刷新失败：append 应保留 pending 并仍返回成功
+
+    # --- (a) 刷新失败 → 消息已落盘，请求留在 pending，不记为 applied ---
+    store_mod.UserStore._refresh_memories = fail_refresh
+    try:
+        res = asyncio.run(store.append(
+            request_id=req_id, session_id=session_id, messages=messages,
+            config=config, client=client,
+        ))
+        check("刷新失败仍返回成功（不抛）",
+              res["duplicate"] is False and res.get("refreshed") is False, str(res))
+        check("消息已落 msgmem（2 条）", len(store.sessions()) == 2, str(len(store.sessions())))
+        meta = store.meta()
+        check("meta.pending 记下该 request_id", req_id in meta["pending"])
+        check("尚未记为 applied", req_id not in meta["applied_request_ids"])
+        check("summem 尚未生成（刷新没跑完）", not store.summem_path.exists())
+
+        # --- 重试同一 request_id（仍失败）→ 不重复写 ---
+        res2 = asyncio.run(store.append(
+            request_id=req_id, session_id=session_id, messages=messages,
+            config=config, client=client,
+        ))
+        check("重试幂等：msgmem 仍 2 条", len(store.sessions()) == 2, str(len(store.sessions())))
+        check("重试返回 duplicate+pending",
+              res2.get("duplicate") is True and res2.get("pending") is True, str(res2))
+    finally:
+        store_mod.UserStore._refresh_memories = original
+
+    # --- (b) 模拟进程重启：新 UserStore 实例 recover，独立补完 ---
+    fresh = store_mod.UserStore(user_id, root)
+    finalized = asyncio.run(fresh.recover(config=config, client=client))
+    check("恢复落定 1 个 pending", finalized == 1, str(finalized))
+    meta2 = fresh.meta()
+    check("pending 已清空", meta2["pending"] == {}, str(meta2["pending"]))
+    check("恢复后记为 applied", req_id in meta2["applied_request_ids"])
+    check("恢复未重复写消息", len(fresh.sessions()) == 2, str(len(fresh.sessions())))
+    check("恢复后 summem 已生成", fresh.summem_path.exists())
+    check("恢复后 summem 是该会话总结",
+          any((r.get("metadata") or {}).get("type") == "summary"
+              for r in read_jsonl(fresh.summem_path)))
+    atoms = read_jsonl(fresh.atommem_path)
+    check("恢复后 atommem 已生成且时间已解析",
+          bool(atoms) and atoms[0]["metadata"]["time"] == "7 May 2023", str(atoms[:1]))
+
+    # --- (c) 恢复后序号接续（预留 count 未错位）---
+    asyncio.run(fresh.append(
+        request_id="eval:run2:locomo:conv-0:chunk-1", session_id=session_id,
+        messages=[{"role": "user", "content": "Another message"}],
+        config=config, client=client,
+    ))
+    ids = [r["metadata"]["id"] for r in fresh.sessions()]
+    check("恢复后追加序号接续", ids == ["session_1_1", "session_1_2", "session_1_3"], str(ids))
+
+    # --- (d) 硬中断（刷新抛异常，append 不返回）→ recover_all 无需重发即补完 ---
+    user2, sess2 = "eval:run3:locomo:conv-0", "eval:run3:sample:0"
+    store2 = store_mod.UserStore(user2, root)
+
+    async def boom(self, **kwargs):  # noqa: ANN001
+        raise RuntimeError("simulated kill during refresh")
+
+    store_mod.UserStore._refresh_memories = boom
+    try:
+        asyncio.run(store2.append(
+            request_id="r-crash", session_id=sess2,
+            messages=[{"role": "user", "content": "hi", "timestamp": 1683561600000}],
+            config=config, client=client,
+        ))
+    except RuntimeError:
+        pass
+    finally:
+        store_mod.UserStore._refresh_memories = original
+
+    check("硬中断后消息已落 msgmem", len(store2.sessions()) == 1, str(len(store2.sessions())))
+    check("硬中断后 meta.pending 留存", "r-crash" in store2.meta()["pending"])
+    total = asyncio.run(store_mod.recover_all(root, config=config, client=client))
+    check("recover_all 无需重发即补完", total >= 1, str(total))
+    check("硬中断 Add 恢复后 applied", "r-crash" in store2.meta()["applied_request_ids"])
+    check("硬中断 Add 恢复后未重复", len(store2.sessions()) == 1, str(len(store2.sessions())))
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -311,6 +421,7 @@ def main() -> int:
         tmp = Path(tmpdir)
         test_endpoints(tmp)
         test_validation(tmp)
+        test_resume(tmp)
 
     print(f"\n{'=' * 60}\n通过 {PASS} / 失败 {FAIL}")
     return 1 if FAIL else 0

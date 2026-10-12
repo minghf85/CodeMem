@@ -9,10 +9,11 @@
 模块分工：
 
     models.py     协议模型（pydantic）+ ContentPart 归一化
-    store.py      每 user_id 一个目录：追加消息、request_id 去重、生成三层记忆（msgmem/summem/atommem）
+    store.py      每 user_id 一个目录：写前日志（WAL）+ request_id 去重 + 生成三层记忆
+                  （msgmem/summem/atommem）；中断续跑（recover / recover_all）
     retriever.py  复用 search 的 code-agent 管线：query -> evidence.jsonl -> data[]
-    server.py     FastAPI app：POST /add、POST /search、GET /health
-    __main__.py   python -m codemem.api 启动 uvicorn
+    server.py     FastAPI app：POST /add、POST /search、GET /health（启动时自愈补完被中断的 Add）
+    __main__.py   python -m codemem.api 启动 uvicorn（--recover 只跑一次续跑）
 
 设计上**复用离线 add/search 的产物与约定**：存储生成与离线 add 相同的三层记忆文件、沿用
 `session_1_3` 这套 msg_id 约定，于是 agent 的 prompt、evidence 的 `source` 校验、`date -d`

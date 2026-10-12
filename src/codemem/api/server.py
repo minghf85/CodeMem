@@ -1,9 +1,11 @@
 """FastAPI 封装：``POST /add`` 与 ``POST /search``（挑战赛协议）。
 
-端点契约见 README「封装 API」一节。三条贯穿全局的约定：
+端点契约见 README「封装 API」一节。四条贯穿全局的约定：
 
 - **Add 幂等**：``request_id`` 是幂等键。重试时同一个 id 不能再写一次 —— 由
   ``store.UserStore.append`` 里的 applied_request_ids 保证。
+- **Add 可中断续跑**：写前日志（``meta.pending``）保证**任意时刻被 kill 都不会丢/重**——
+  启动时（lifespan）与每次同 user 请求都会把被中断的 Add 补完（``store.recover_all``）。
 - **Search 的 ``data`` 永不为缺失**：无记忆 / 无证据一律返回 ``{"data": []}``。
 - **id 原样回显**：Add 的响应把 ``request_id`` / ``user_id`` / ``session_id`` 原样送回。
 
@@ -30,6 +32,7 @@ from .. import llm
 from ..io import PROJECT_ROOT
 from ..log import Logger
 from . import retriever
+from . import store as store_mod
 from .models import AddRequest, AddResponse, SearchRequest, SearchResponse, normalize_content
 from .store import UserStore
 
@@ -187,7 +190,15 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app_: FastAPI):
-        """进程关闭时清理模型客户端（连接池要关干净）。"""
+        """启动时补完被中断的 Add（中断续跑）；关闭时清理模型客户端（连接池要关干净）。"""
+        # 启动自愈：pending 常态为空 → 只读一遍各 user 的小 meta.json；只有真被 kill 过的 Add
+        # 才会触发 LLM 重跑刷新。整段兜住异常，恢复失败绝不能挡住启动。
+        try:
+            await store_mod.recover_all(
+                state.store_root, config=state.config, client=state.add_client, log=state.log,
+            )
+        except Exception as exc:  # noqa: BLE001
+            state.log.warn(f"启动续跑失败：{type(exc).__name__}: {exc}")
         try:
             yield
         finally:

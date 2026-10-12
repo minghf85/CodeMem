@@ -51,7 +51,7 @@ eval ────────────────► eval.jsonl          （
 | **search** | question + 三层记忆 → `evidence.jsonl`（朴素 agent loop：检索 → 取证 → 验证） | `python -m codemem.search` |
 | **answer** | question + `evidence.jsonl` → 答案（只用证据，不检索） | `python -m codemem.answer` |
 | **eval** | 答案正确性 + 指标（judge / token F1 / evidence recall / 失败归类） | `python -m codemem.eval` |
-| **api** | Add / Search 的 HTTP 封装（多用户隔离、request_id 幂等） | `python -m codemem.api` |
+| **api** | Add / Search 的 HTTP 封装（多用户隔离、request_id 幂等、崩溃续跑） | `python -m codemem.api` |
 
 ---
 
@@ -127,6 +127,7 @@ python scripts/run_eval.py --quick          # search → answer → eval，打�
 
 ```bash
 python -m codemem.api                       # 默认 0.0.0.0:8000
+python -m codemem.api --recover             # 只跑一次启动自愈（补完被中断的 Add）后退出
 ```
 
 ---
@@ -186,7 +187,8 @@ python scripts/test_api.py          # 封装 API 自测：幂等 / 多用户隔�
 python -m codemem.api --host 0.0.0.0 --port 8000 --config configs/api.yaml
 ```
 
-三条契约保证：**Add 幂等**（同一 `request_id` 重试不重复写入）；**Add 返回即"立即可检索"**
+四条契约保证：**Add 幂等**（同一 `request_id` 重试不重复写入）；**Add 返回即"立即可检索"**
 （返回前已同步重建该会话的 `summem` 与 `atommem`：会话总结 + 逐消息原子事实）；
-**Search 的 `data` 永不为缺失**（无记忆或无证据一律返回 `{"data": []}`）。详细设计与存储
-布局见 [`docs/core.md` §4](docs/core.md)。
+**Add 可中断续跑**（写前日志保证任意时刻被 kill 都不丢不重，重启后服务自己把被中断的 Add
+补完，见 `docs/core.md` §4）；**Search 的 `data` 永不为缺失**（无记忆或无证据一律返回
+`{"data": []}`）。详细设计与存储布局见 [`docs/core.md` §4](docs/core.md)。

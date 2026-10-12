@@ -1327,12 +1327,18 @@ uvicorn codemem.api.server:app --port 8000
 | `POST /search` | `{query, options?, user_id, top_k?}` | `{data:[{id, content, score, created_at}]}` |
 | `GET /health` | —— | `{status:"ok"}` |
 
-三条贯穿全局的约定：
+四条贯穿全局的约定：
 
 - **Add 幂等**。`request_id` 是幂等键 —— 重试时同一个 `request_id` **不会再写一遍**
   （由 `meta.applied_request_ids` 记录）。响应的三个 id 原样回显。
 - **Add 返回即"立即可检索"**。写入原始消息后，**在返回前**同步重建该会话的 `summem`（一次 LLM
   总结）与 `atommem`（逐 message 的 add agent），所以返回 `success:true` 时消息已消解、可直接检索。
+- **Add 可中断续跑**。写入走**写前日志（WAL）**：先把意图（`request_id` + 待写 msg 记录）记进
+  `meta.pending`，再落 `msgmem`、再刷新记忆，最后才把 `request_id` 移进 `applied_request_ids`
+  落定。所以进程在**任意时刻**被 kill（SIGKILL / OOM / 重启），重启后都能凭 `pending` 把这次 Add
+  **补完**（启动时 lifespan 调 `store.recover_all`，以及每次同 user 请求在 `append` 顶部懒执行），
+  且重发同一 `request_id` 不会重复写；记忆刷新（LLM）失败也留在 `pending`，下次自动重试刷新。
+  也可手动触发：`python -m codemem.api --recover`。
 - **Search 的 `data` 永不为缺失**。没有记忆（该 user 从没 Add 过）或没有证据，一律返回
   `{"data": []}`，绝不给 5xx 空响应。
 
@@ -1346,7 +1352,7 @@ uvicorn codemem.api.server:app --port 8000
 **存储布局**（按 `user_id` 一目录，`data/api_store/{slug(user_id)}/`）：
 
 ```
-meta.json                 session_id -> 会话号、每会话消息数、已应用的 request_id
+meta.json                 session_id -> 会话号、每会话消息数、已应用的 request_id、pending（写前日志）
 msgmem.jsonl              逐条原始消息（type=msg；会话时间戳是锚点）
 summem.jsonl              每会话一条总结（type=summary）
 atommem.jsonl             逐消息抽出的原子事实（type=atom）
@@ -1375,9 +1381,12 @@ summem/atommem 模型）、`add_tool_config`（Add agent 的工具配置）、`s
 
 - **`models.py`**：协议模型（pydantic）+ `ContentPart[]` → 文本的归一化（唯一实现，
   Add 与 Search 共用）。
-- **`store.py`**：每 `user_id` 一个目录；`UserStore.append` 在**写锁**内完成"查幂等键 →
-  分配 `msg_id` → 追加消息到 `msgmem.jsonl` → 重建该会话的 `summem`（一次 LLM）与 `atommem`
-  （逐 message 的 add agent）→ 记 request_id"，三层记忆文件原子写回。
+- **`store.py`**：每 `user_id` 一个目录；`UserStore.append` 在**写锁**内按**写前日志**顺序完成
+  崩溃一致的写入 —— "先补完遗留 pending → 查幂等键 → 分配 `msg_id` → **WAL** 记意图到
+  `meta.pending`（并预留 id 空间）→ 追加消息到 `msgmem.jsonl` → 重建该会话的 `summem`（一次 LLM）
+  与 `atommem`（逐 message 的 add agent）→ 成功才移进 `applied_request_ids` 落定"，各文件原子写回。
+  恢复入口 `UserStore.recover` / 模块级 `recover_all`：按 `memory_id` 幂等补齐 msgmem、重跑刷新、
+  落定；刷新失败则保留 pending 待下次续跑。
 - **`retriever.py`**：直接调 `search.runner.run_phases`（与离线 search 同一套编排），
   复用现成的 `ModelRunner` / `build_shell_prefix` / `link_dir_or_copy` / `validate_file`。
   **不另写一套**：在线与离线的检索行为必须一致，否则"本地调好的 prompt 上线就不准了"。
