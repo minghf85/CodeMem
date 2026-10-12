@@ -1,6 +1,6 @@
 import json
 
-with open(r'data\correct_locomo10.json', 'r', encoding='utf-8') as f:
+with open(r'data\locomo_refined.json', 'r', encoding='utf-8') as f:
     data = json.load(f) # List
     # 一对speakers的数据的基本结构
     print(data[0].keys())

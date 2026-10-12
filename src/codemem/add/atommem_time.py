@@ -187,6 +187,10 @@ def parse_time_expression(time_expr: str, anchor_time: str) -> str:
 
     anchor_date = _extract_date_from_anchor(anchor_time)
     if not anchor_date:
+        # 表达式自身已含绝对年份时，锚点无关紧要 —— 别拼一个 "(anchor: …)" 尾巴上去
+        # （"the week before 9 June 2023" 本来就是完整答案）。
+        if re.search(r"\d{4}", expr):
+            return time_expr
         return f"{time_expr} (anchor: {anchor_time})"
 
     # 精确单点：算术平凡且精确，折算成 "7 May 2023" 形态（照参考风格，不写 ISO）。
@@ -230,8 +234,15 @@ def parse_time_expression(time_expr: str, anchor_time: str) -> str:
     if n_ago:
         return f"{n_ago.group(1)} {n_ago.group(2)} before {anchor_date}"
 
-    # 只有年份：精度只减不增 → 给年份。
-    if re.fullmatch(r"last\s+year", expr) or re.fullmatch(r"\d+\s+years?\s+ago", expr):
+    # "N years ago"：**按 N 回退 N 年**。曾经这里和 "last year" 共用一个分支，一律返回
+    # ``anchor_year - 1`` —— 于是 "ten years ago" 被算成去年（2023 → 2022），"5 years ago"
+    # 也是 2022。年龄/年限类事实全错。精度只减不增，所以只给年份。
+    n_years = re.fullmatch(r"(\d+)\s+years?\s+ago", expr)
+    if n_years:
+        year = re.search(r"(\d{4})", anchor_date)
+        if year:
+            return str(int(year.group(1)) - int(n_years.group(1)))
+    if re.fullmatch(r"last\s+year", expr):
         year = re.search(r"(\d{4})", anchor_date)
         if year:
             return str(int(year.group(1)) - 1)

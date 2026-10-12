@@ -11,6 +11,8 @@ add（抽取原子记忆）、answer（依证据作答）、eval（judge）、se
   "截断了"和"真挂了"。
 - **qwen3 关思考** —— 只有模型名含 ``qwen3`` 才发 ``chat_template_kwargs``；
   其它端点会因未知参数直接 400。
+- **连接建立超时单独设短** —— 远程端点在高并发下会丢一部分**新建**连接；``connect_timeout``
+  比读超时短得多，好让失败快速发生、把重试预算花在重试而不是等内核超时（见 ``make_client``）。
 
 放在顶层而不是藏进 add/：这些都是**端点行为**，与"抽取记忆"这个业务无关。
 """
@@ -32,6 +34,7 @@ DEFAULT_CALL_CONFIG: dict[str, Any] = {
     "temperature": 0.2,
     "max_tokens": 4096,
     "timeout": 300,
+    "connect_timeout": 10.0,
     "max_retries": 3,
     "backoff_base": 2.0,
     "rate_limit_backoff": 10.0,
@@ -43,8 +46,8 @@ DEFAULT_CALL_CONFIG: dict[str, Any] = {
 # ``chat_completion`` 真正会读的键。配置里的其它键（业务参数）原样忽略。
 CALL_KEYS = (
     "base_url", "api_key", "model", "temperature", "max_tokens", "enable_thinking",
-    "timeout", "max_retries", "backoff_base", "rate_limit_backoff", "max_backoff",
-    "backoff_jitter",
+    "timeout", "connect_timeout", "max_retries", "backoff_base", "rate_limit_backoff",
+    "max_backoff", "backoff_jitter",
 )
 
 
@@ -67,12 +70,26 @@ def merge_call_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def make_client(config: dict[str, Any]) -> openai.AsyncOpenAI:
-    """按配置建一个异步客户端。"""
+    """按配置建一个异步客户端。
+
+    ``timeout`` 是**读超时**（一次生成可能很慢，要留足）；``connect_timeout`` 单独设、
+    且**明显更短**。原因：远程端点在高并发下会丢掉一部分**新建**连接（SYN 被丢，实测
+    16 并发时约一半失败，而串行复用连接几乎不失败）。若不单独限时，一次连接失败要等内核
+    SYN 重传超时（~60s）才轮到重试 —— 既慢，又把重试预算耗在"等超时"上。短 connect
+    超时让失败**快速**发生，退避后重试才有意义。
+    """
     merged = merge_call_config(config)
+    read_timeout = float(merged.get("timeout", 300))
+    connect_timeout = float(merged.get("connect_timeout", 10.0))
     return openai.AsyncOpenAI(
         base_url=merged["base_url"],
         api_key=merged.get("api_key") or "not-needed",
-        timeout=float(merged.get("timeout", 300)),
+        timeout=openai.Timeout(
+            connect=connect_timeout,
+            read=read_timeout,
+            write=read_timeout,
+            pool=read_timeout,
+        ),
         max_retries=0,          # 重试由 chat_completion 自己管，避免两层退避相乘
     )
 
@@ -216,7 +233,27 @@ async def _complete_choice(
 
     if isinstance(last_error, TruncatedCompletion):
         raise TruncatedCompletion(f"chat completion failed after retries: {last_error}")
-    raise RuntimeError(f"chat completion failed after retries: {last_error}")
+    raise RuntimeError(f"chat completion failed after retries: {describe_error(last_error)}")
+
+
+def describe_error(exc: Exception | None) -> str:
+    """把异常写成带**底层原因**的一行。
+
+    OpenAI SDK 的连接失败只把顶层异常写成 ``APIConnectionError: Connection error.``
+    —— 真正有用的信息（``ConnectError`` / ``ConnectTimeout``）在 ``__cause__`` 里，不打出来
+    就完全没法判断"是超时、被重置、还是连不上"。
+    """
+    if exc is None:
+        return "unknown error"
+    text = f"{type(exc).__name__}: {exc}"
+    cause: BaseException | None = exc
+    seen = set()
+    while getattr(cause, "__cause__", None) is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        cause = cause.__cause__
+    if cause is not None and cause is not exc:
+        text += f" (cause: {type(cause).__name__}: {cause!r})"
+    return text
 
 
 async def chat_completion(

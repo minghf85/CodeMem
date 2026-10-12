@@ -4,7 +4,8 @@
 定位"哪次会话谈过这件事"。它写进 ``data/{dir}/summem.jsonl``，``id`` = ``session_{s}_summary``。
 
 三条硬约束与消解/atommem 一致：**自足**（时间绝对或带锚点、指代消解）、**精度只减不增**、
-不编造。会话之间**并行**（各自独立）。
+不编造。**会话之间并行**（各自独立），**目录之间也并行**（共享同一个并发闸门，总量不随目录数
+放大，见 ``run_dir`` 的 ``semaphore``）；每个目录内跑完还有空的 session 会**串行补跑**。
 
 用法::
 
@@ -32,6 +33,10 @@ from .memory import MSGMEM_NAME, SUMMEM_NAME, group_by_session, parse_dir_label,
 
 CONFIG_FILE = PROJECT_ROOT / "configs" / "add.yaml"
 
+# 收尾补跑空总结：最多几轮、每轮之间停多久。见 ``run_dir`` 里的说明。
+REPAIR_ROUNDS = 3
+REPAIR_PAUSE = 5.0
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "local",
     "base_url": "http://127.0.0.1:30000/v1",
@@ -40,6 +45,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_tokens": 4096,
     "concurrency": 8,
     "timeout": 300,
+    "connect_timeout": 10.0,
     "max_retries": 3,
     "backoff_base": 2.0,
     "rate_limit_backoff": 10.0,
@@ -49,8 +55,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 CALL_KEYS = (
-    "timeout", "max_retries", "backoff_base", "rate_limit_backoff", "max_backoff",
-    "backoff_jitter",
+    "timeout", "connect_timeout", "max_retries", "backoff_base", "rate_limit_backoff",
+    "max_backoff", "backoff_jitter",
 )
 
 
@@ -139,7 +145,7 @@ async def summarize_session(
         raw = await llm.chat_completion(client, gen_call_config(config, "summem"), messages)
         summary = parse_summary(raw)
     except Exception as exc:  # noqa: BLE001 - 一个 session 失败不该让整目录没有输出
-        print(f"  [summem] session {session_index} 总结失败：{type(exc).__name__}: {exc}",
+        print(f"  [summem] session {session_index} 总结失败：{llm.describe_error(exc)}",
               file=sys.stderr)
     source = [memory_id(record) for record in records if memory_id(record)]
     return {
@@ -162,8 +168,14 @@ async def run_dir(
     client: openai.AsyncOpenAI,
     *,
     limit_sessions: int = 0,
+    semaphore: "asyncio.Semaphore | None" = None,
 ) -> dict[str, Any]:
-    """对一个目录的全部 session 并行做总结，写 summem.jsonl。"""
+    """对一个目录的全部 session 并行做总结，写 summem.jsonl。
+
+    ``semaphore``：多目录一起跑时，调用方传入一个**全局**闸门，让所有目录的 session 任务
+    共享同一个并发上限（否则每个目录各开 ``concurrency`` 个请求，N 个目录就是 N×并发，
+    会把模型端点打爆）。缺省（``None``）时自己建一个 —— 单目录直接调用时行为不变。
+    """
     from ..io import read_jsonl
 
     label = directory.name
@@ -177,20 +189,51 @@ async def run_dir(
     if limit_sessions:
         numbers = numbers[:limit_sessions]
     speaker_a, speaker_b = parse_dir_label(label)
-    semaphore = asyncio.Semaphore(max(1, int(config.get("concurrency", 8))))
+    # 并发闸门：多目录一起跑时共用调用方传进来的**全局** semaphore；否则本目录自建一个。
+    gate = semaphore or asyncio.Semaphore(max(1, int(config.get("concurrency", 8))))
 
     async def one(number: int) -> dict[str, Any]:
         records = grouped[number]
         session_time = str((records[0].get("metadata") or {}).get("time") or "") if records else ""
-        async with semaphore:
+        async with gate:
             return await summarize_session(
                 session_index=number, session_time=session_time, records=records,
                 client=client, config=config, speaker_a=speaker_a, speaker_b=speaker_b,
             )
 
     summaries = list(await asyncio.gather(*(one(n) for n in numbers)))
+
+    # 补跑：并发下远程端点会丢一部分**新建**连接，个别 session 用光重试次数后 memory 为空。
+    # 收尾把空的挑出来**串行**重跑 —— 串行几乎复用同一条连接（实测并发 16 时约一半失败、
+    # 串行 20 次 0 失败），成本可忽略。端点偶尔会有持续几十秒的抽风窗口（那时串行也会失败），
+    # 所以隔几秒重跑，最多 ``REPAIR_ROUNDS`` 轮；没有空的了就提前收手。
+    repaired = 0
+    for round_index in range(REPAIR_ROUNDS):
+        pending = [p for p, s in enumerate(summaries) if not (s.get("memory") or "").strip()]
+        if not pending:
+            break
+        if round_index:
+            await asyncio.sleep(REPAIR_PAUSE)
+        for position in pending:
+            records = grouped[numbers[position]]
+            session_time = str((records[0].get("metadata") or {}).get("time") or "") if records else ""
+            retry = await summarize_session(
+                session_index=numbers[position], session_time=session_time, records=records,
+                client=client, config=config, speaker_a=speaker_a, speaker_b=speaker_b,
+            )
+            if (retry.get("memory") or "").strip():
+                summaries[position] = retry
+                repaired += 1
+
     write_memories(directory / SUMMEM_NAME, summaries)
-    return {"dir": label, "status": "OK", "sessions": len(summaries)}
+    # 补跑后仍为空的：明确报出来，别让它以"19 个 session 总结"的口气悄悄过去。
+    still_empty = [s["metadata"]["id"] for s in summaries if not (s.get("memory") or "").strip()]
+    result: dict[str, Any] = {"dir": label, "status": "OK", "sessions": len(summaries)}
+    if repaired:
+        result["repaired"] = repaired
+    if still_empty:
+        result["empty"] = still_empty
+    return result
 
 
 def targets_with_msgmem(dirs: list[str]) -> list[Path]:
@@ -219,6 +262,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def report_result(item: dict[str, Any]) -> None:
+    """打印一个目录的结果。
+
+    ``python -m codemem.add --stage summem``（走 ``add/__main__.py``）和
+    ``python -m codemem.add.summem``（走 ``async_main``）是两条入口，都必须报出
+    "补跑了几个"和"还有几个是空的" —— 共用这一份，避免两处逻辑漂移（曾经就是两处各写各的，
+    补跑/警告只加在了一处，另一条入口静悄悄）。
+    """
+    if item.get("status") != "OK":
+        print(f"summem    {item['dir']}: {item.get('status')} — {item.get('reason', '')}")
+        return
+    note = f"（补跑 {item['repaired']} 个）" if item.get("repaired") else ""
+    print(f"summem    {item['dir']}: {item['sessions']} 个 session 总结{note}")
+    if item.get("empty"):
+        print(f"  [summem] 警告：{len(item['empty'])} 个 session 补跑后仍为空："
+              f"{', '.join(item['empty'])}", file=sys.stderr)
+
+
 async def async_main(args: argparse.Namespace) -> None:
     config = load_config(Path(args.config))
     if args.concurrency is not None:
@@ -230,16 +291,17 @@ async def async_main(args: argparse.Namespace) -> None:
         return
     log = Logger(level="info")
     client = llm.make_client(gen_call_config(config, "summem"))
+    # 目录之间也并行，但共享同一个闸门 —— 总并发仍是 config 的 concurrency，不随目录数放大。
+    semaphore = asyncio.Semaphore(max(1, int(config.get("concurrency", 8))))
     try:
-        results = [await run_dir(d, config, client, limit_sessions=args.limit_sessions)
-                   for d in targets]
+        results = list(await asyncio.gather(*(
+            run_dir(d, config, client, limit_sessions=args.limit_sessions, semaphore=semaphore)
+            for d in targets
+        )))
     finally:
         await client.close()
     for item in results:
-        if item.get("status") == "OK":
-            print(f"summem    {item['dir']}: {item['sessions']} 个 session 总结")
-        else:
-            print(f"summem    {item['dir']}: {item.get('status')} — {item.get('reason', '')}")
+        report_result(item)
 
 
 def main(argv: list[str] | None = None) -> None:

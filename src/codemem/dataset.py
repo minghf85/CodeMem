@@ -5,7 +5,7 @@ answer 要拿 question + reference，eval 要算 evidence recall。四者都需�
 同一套 id 约定"，所以数据模型必须共享 —— 否则 evidence 映射在四个地方各写一遍，
 迟早不一致（``D1:3`` → ``session_1_3`` 这条规则就是靠这里唯一实现的）。
 
-数据文件：``data/correct_locomo10.json``，一个 sample 数组，每个 sample 形如::
+数据文件：``data/locomo_refined.json``，一个 sample 数组，每个 sample 形如::
 
     {
       "conversation": {
@@ -27,7 +27,7 @@ from typing import Any, Iterable, Iterator
 
 from .io import PROJECT_ROOT
 
-DATA_FILE = PROJECT_ROOT / "data" / "correct_locomo10.json"
+DATA_FILE = PROJECT_ROOT / "data" / "locomo_refined.json"
 
 
 # ---------------------------------------------------------------------------

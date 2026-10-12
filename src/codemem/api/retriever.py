@@ -135,9 +135,9 @@ def _agent_config(config: dict[str, Any]) -> dict[str, Any]:
     for key in (
         "max_steps", "no_progress_patience", "max_verify_rounds", "observation_max_chars",
         "write_nudge_after", "evidence_soft_limit", "context_max_chars", "context_keep_recent",
-        "bash_timeout", "timeout", "max_retries", "backoff_base", "rate_limit_backoff",
-        "max_backoff", "backoff_jitter", "repeat_limit", "max_parse_retries",
-        "tool_failure_notice_after",
+        "bash_timeout", "timeout", "connect_timeout", "max_retries", "backoff_base",
+        "rate_limit_backoff", "max_backoff", "backoff_jitter", "repeat_limit",
+        "max_parse_retries", "tool_failure_notice_after",
     ):
         if key in config and config[key] is not None:
             merged[key] = config[key]
