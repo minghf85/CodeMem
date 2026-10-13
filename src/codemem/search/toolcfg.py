@@ -19,7 +19,8 @@
     catalog.render_time_policy()  渲染"时间精度"规则段
     catalog.render_prompt(question)  渲染完整 system prompt（替换 {{TOOLS}} 等槽位）
     catalog.prompt_text(key)      取 user_begin / user_gaps / ... 文案
-    parse_tool_call(text)         解析模型输出为一次工具调用
+    parse_tool_call(text)         解析模型输出为一次工具调用（认文本协议 / Qwen3 文本形态）
+    parse_tool_calls(text)        同上，但返回全部调用（原生文本形态可能有多个）
 """
 
 from __future__ import annotations
@@ -79,6 +80,11 @@ def _short_args(args: dict[str, Any], limit: int = 120) -> str:
 _FENCE_RE = re.compile(r"^\s*```[a-zA-Z0-9_-]*\s*|\s*```\s*$")
 _JSON_OBJECT_RE = re.compile(r"\{(?:[^{}]|\{[^{}]*\})*\}", re.DOTALL)
 
+# Qwen3 / Hermes 的工具调用文本形态。**端点没配 tool-call parser 时（sglang 缺
+# ``--tool-call-parser``）模型的调用就这样原样返回**：``message.tool_calls`` 为空、
+# 正文是这段文本。实测症状即"一步工具都不调、evidence 恒 0"（见 parse_tool_calls）。
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+
 
 def _strip_fences(text: str) -> str:
     stripped = text.strip()
@@ -117,34 +123,111 @@ def _first_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _arguments_dict(value: Any) -> dict[str, Any] | None:
+    """把 ``arguments`` 归一成 dict。原生函数调用的 ``arguments`` 是 **JSON 字符串**。
+
+    取不到 dict 就返回 ``None`` —— 上层据此判为"不是一次可执行的调用"，而不是执行一个
+    猜出来的空参数调用。
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _normalize_call(parsed: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """从一个 JSON 对象里取出 ``(工具名, 参数)``；不是工具调用则 ``None``。
+
+    认三种形状 —— 它们在**同一个服务的不同配置**下都会出现，解析层必须全认，否则症状是
+    "模型一步工具都不调、evidence 恒为 0"（判定退化成"完成信号"，整轮静默作废）：
+
+    1. ``{"tool": "bash", "args": {...}}`` —— 本项目 tool.json 里的文本协议。
+       参数也允许平铺在顶层：``{"tool": "bash", "command": "..."}``。
+    2. ``{"name": "bash", "arguments": {...}}`` —— **Qwen3 / Hermes 的文本形态**。
+       sglang 没配 ``--tool-call-parser`` 时，模型明明按训练格式发了调用，却以纯文本
+       （通常裹在 ``<tool_call>`` 里）返回，``message.tool_calls`` 为空。
+    3. ``{"type": "function", "function": {"name": ..., "arguments": "..."}}`` ——
+       OpenAI 原生函数调用的对象形状。
+
+    第 2 种要求 ``name`` 与参数键**同时**出现：evidence 记录是 ``content``/``metadata``，
+    绝不会长成这样，所以不会把"模型吐了一条记忆记录"误判成工具调用。
+    """
+    tool = parsed.get("tool")
+    if isinstance(tool, str) and tool.strip():
+        args = parsed.get("args")
+        if not isinstance(args, dict):
+            # 参数平铺在顶层（{"tool":"bash","command":"..."}）
+            args = {
+                key: value
+                for key, value in parsed.items()
+                if key not in ("tool", "args")
+            }
+        return tool.strip(), args
+
+    function = parsed.get("function")
+    if isinstance(function, dict):
+        name = function.get("name")
+        if isinstance(name, str) and name.strip():
+            args = _arguments_dict(function.get("arguments"))
+            if args is not None:
+                return name.strip(), args
+
+    name = parsed.get("name")
+    if isinstance(name, str) and name.strip():
+        for key in ("arguments", "args"):
+            if key in parsed:
+                args = _arguments_dict(parsed.get(key))
+                if args is not None:
+                    return name.strip(), args
+    return None
+
+
+def parse_tool_calls(text: str) -> list[ToolCall]:
+    """解析出文本里**全部**工具调用（模型一步可能给多个）。
+
+    ``<tool_call>`` 块里的内容**优先**：端点没配 tool-call parser 时，调用就藏在里面，
+    而块外的正文可能还有什么都解析不出的解释文字。块内一个都没解析出来才回退到整段文本
+    （文本协议模式下模型就是把裸 JSON 直接吐出来的）。
+    """
+    if not text or not text.strip():
+        return []
+    calls: list[ToolCall] = []
+    for block in _TOOL_CALL_BLOCK_RE.findall(text):
+        parsed = _first_json_object(block)
+        if parsed is None:
+            continue
+        found = _normalize_call(parsed)
+        if found is not None:
+            calls.append(ToolCall(tool=found[0], args=found[1]))
+    if calls:
+        return calls
+    parsed = _first_json_object(text)
+    if parsed is None:
+        return []
+    found = _normalize_call(parsed)
+    return [ToolCall(tool=found[0], args=found[1])] if found is not None else []
+
+
 def parse_tool_call(text: str) -> ToolCall | None:
-    """把模型输出解析成 ``ToolCall``；返回 ``None`` 表示**模型说自己做完了**。
+    """把模型输出解析成**一次** ``ToolCall``；返回 ``None`` 表示**模型说自己做完了**。
 
     判定顺序（每一步失败都退化为"没有工具调用"= 当作完成信号，交 verifier 判断）：
 
     1. 空输出 → 完成信号。
-    2. 能解析出 ``{"tool": ..., "args": {...}}`` → 工具调用。
-    3. 能解析出对象但没有 ``tool`` 键（例如模型直接吐了一条 base_mem 记录）→ 记为
-       "格式错"，仍按完成信号处理（由 verifier 兜底），并把原文留在轨迹里。
+    2. 能解析出 ``{"tool": ..., "args": {...}}``（或 ``{"name": ..., "arguments": ...}``
+       ／ ``<tool_call>`` 包裹）→ 工具调用。
+    3. 能解析出对象但不是任何已知的工具调用形状（例如模型直接吐了一条 base_mem 记录）→
+       记为"格式错"，仍按完成信号处理（由 verifier 兜底），并把原文留在轨迹里。
     4. 完全解析不出对象 → 完成信号。
     """
-    if not text or not text.strip():
-        return None
-    parsed = _first_json_object(text)
-    if parsed is None:
-        return None
-    tool = parsed.get("tool")
-    if not isinstance(tool, str) or not tool.strip():
-        return None
-    args = parsed.get("args")
-    if not isinstance(args, dict):
-        # 允许把参数平铺在顶层（{"tool":"bash","command":"..."}）
-        args = {
-            key: value
-            for key, value in parsed.items()
-            if key not in ("tool", "args")
-        }
-    return ToolCall(tool=tool.strip(), args=args)
+    calls = parse_tool_calls(text)
+    return calls[0] if calls else None
 
 
 # ---------------------------------------------------------------------------

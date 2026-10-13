@@ -228,7 +228,12 @@ def message_to_reply(message: Any) -> tuple[str, int]:
     - 有原生 ``tool_calls`` → 取第一次调用，序列化成 ``{"tool": ..., "args": {...}}``
       （就是 ``toolcfg.parse_tool_call`` 认的形状）。**文本协议和原生函数调用因此走同一条
       解析路径 —— agent loop 一个字都不用改。**
-    - 没有 ``tool_calls`` → 原样返回正文（在 agent 协议里这是"做完了"信号）。
+    - 没有 ``tool_calls``，但正文里**就是**一段工具调用文本 → 同样折成上面的形状。
+      这是**端点没开 tool-call parser** 时的兜底：sglang 缺 ``--tool-call-parser`` 时，
+      Qwen3 按训练格式发的 ``<tool_call>{"name": ..., "arguments": {...}}</tool_call>``
+      会作为普通正文返回（``tool_calls`` 为空）。不兜底的话正文按"做完了"处理，
+      整条 QA 一步工具都不调、evidence 恒为 0（实测 138/138 全中，充分率 0%）。
+    - 都没有 → 原样返回正文（在 agent 协议里这才是"做完了"信号）。
 
     ``dropped_tool_calls`` 是本次被丢弃的并行调用数（>0 说明模型一次给了多个）。本 loop 一步
     只执行一个调用，所以只取第一个并让调用方记账 —— 观测结果会让模型下一轮自然重发其余调用，
@@ -240,7 +245,15 @@ def message_to_reply(message: Any) -> tuple[str, int]:
     """
     calls = getattr(message, "tool_calls", None) or []
     if not calls:
-        return message.content or "", 0
+        content = message.content or ""
+        parsed = toolcfg.parse_tool_calls(content)
+        if not parsed:
+            return content, 0
+        first = parsed[0]
+        return (
+            json.dumps({"tool": first.tool, "args": first.args}, ensure_ascii=False),
+            len(parsed) - 1,
+        )
     call = calls[0]
     function = getattr(call, "function", None)
     name = str(getattr(function, "name", "") or "")
@@ -288,6 +301,8 @@ class ModelRunner:
         self.calls = 0
         self.failures = 0
         self.dropped_tool_calls = 0
+        # 端点没解析工具调用、正文里却是工具调用文本的次数（见 message_to_reply）。
+        self.text_tool_calls = 0
         self._raw_handle = raw_log_path.open("w", encoding="utf-8") if raw_log_path else None
         self._lock = asyncio.Lock()
 
@@ -306,6 +321,22 @@ class ModelRunner:
                     self.client, self.config, messages, tools=use_tools
                 )
                 raw, dropped = message_to_reply(message)
+                if not getattr(message, "tool_calls", None):
+                    # 端点在 tools= 模式下**没**返回 tool_calls，正文里却是工具调用文本 ——
+                    # 说明它没配 tool-call parser。我们已在客户端兜底解析（loop 因此照常跑），
+                    # 但这是端点配置问题，值得说一声：否则下一次有人换端点又会踩同一个坑。
+                    text_calls = toolcfg.parse_tool_calls(getattr(message, "content", "") or "")
+                    if text_calls:
+                        async with self._lock:
+                            first_time = self.text_tool_calls == 0
+                            self.text_tool_calls += len(text_calls)
+                        if first_time:
+                            self.log.warn(
+                                f"端点未解析工具调用：模型的 <tool_call> 以纯文本返回"
+                                f"（tool_calls 为空），已在客户端兜底解析 —— 本次调用 "
+                                f"{len(text_calls)} 个。Qwen 系端点建议加 "
+                                f"--tool-call-parser qwen25（或 hermes）"
+                            )
                 if dropped:
                     async with self._lock:
                         self.dropped_tool_calls += dropped
@@ -345,7 +376,8 @@ class ModelRunner:
 
     def stats(self) -> dict[str, Any]:
         return {"calls": self.calls, "failures": self.failures,
-                "dropped_tool_calls": self.dropped_tool_calls}
+                "dropped_tool_calls": self.dropped_tool_calls,
+                "text_tool_calls": self.text_tool_calls}
 
     def close(self) -> None:
         if self._raw_handle is not None:

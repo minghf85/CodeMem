@@ -399,6 +399,30 @@ agent 越不检索**：那套版本里 150/152 条 QA 一次 grep 都没做。�
 reference 当闸门就是 oracle 泄漏（RL 会学会猜答案，推理时也拿不到答案键）—— 闸门检验的是
 **可回答性**，正确性只在评测/奖励时用 judge 算。
 
+#### 工具调用的三种形态：解析层必须全认（2026-10-13 修）
+
+换端点/换模型时最容易整条 QA 静默作废的一处：**模型的工具调用没被解析出来，被当成"我做完了"**。
+症状是一眼可辨的 —— `步 1 工具 0 结束=no_tool_call`、`evidence 0 条`、`充分 0%`，
+138/138 全中（本地 Qwen3-8B 那次就是这个）。
+
+同一个模型在不同端点配置下会吐出**三种形状**，`toolcfg.parse_tool_call` 现在三种都认：
+
+| 形状 | 什么时候出现 |
+|---|---|
+| `{"tool": "bash", "args": {...}}` | tool.json 的文本协议（微调过的模型按 prompt 走） |
+| `{"name": "bash", "arguments": {...}}`，通常裹在 `<tool_call>…</tool_call>` 里 | **Qwen3 / Hermes 的文本形态**。sglang 没配 `--tool-call-parser` 时，模型明明按训练格式发了调用，`message.tool_calls` 却是空的，正文里是这段原文 |
+| `{"type":"function","function":{"name":…,"arguments":"…"}}` | OpenAI 原生 `tool_calls` 的对象形状（`arguments` 是 JSON **字符串**，要再解一层） |
+
+第二条是这次踩的坑：`configs/search.yaml` 的 `native_tools: true` 走 `tools=` 下发了 schema，
+模型也照着训练格式回了 `<tool_call>`，但端点没把它解析成 `tool_calls`。**解析层不认这个形状，
+整轮就一步工具都不调。** 所以兜底做在客户端：`runner.message_to_reply` 在"没拿到 `tool_calls`
+但正文里就是一段调用"时照样折成文本协议（并在日志里 WARN 一次，提示端点该加
+`--tool-call-parser qwen25`）。这样 **4o-mini（真 `tool_calls`）与 Qwen3-8B（文本形态）走的是
+同一条解析路径**，agent loop 一个字都不用改。
+
+第三条（只有 `name` 没有参数键）**不认** —— evidence 记录是 `content`/`metadata`，但记忆类
+JSON 里出现 `{"name": …}` 并不稀奇，宁可判"格式错"交给 verifier，也不要执行一个猜出来的空调用。
+
 
 ### 2.3 检索就是 `grep`，时间算术就是 `date -d`
 

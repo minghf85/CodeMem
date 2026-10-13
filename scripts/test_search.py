@@ -268,6 +268,50 @@ def test_toolcfg(tmp: Path) -> None:
     check("空输出 -> None", toolcfg.parse_tool_call("") is None)
     check("对象但没有 tool 键 -> None", toolcfg.parse_tool_call('{"memory":"x"}') is None)
     check("坏 JSON -> None", toolcfg.parse_tool_call('{"tool": "bash", "args": {') is None)
+    check("evidence 记录不会被误判成工具调用",
+          toolcfg.parse_tool_call('{"content":"x","metadata":{"source":["session_1_9"]}}') is None)
+
+    # Qwen3 / Hermes 文本形态：端点没配 --tool-call-parser 时，模型发的调用会原样出现在正文里
+    # （tool_calls 为空）。不认这个形状，整条 QA 会"一步工具都不调"、evidence 恒 0。
+    qwen = '<tool_call>\n{"name": "bash", "arguments": {"command": "grep -rin x inputs/"}}\n</tool_call>'
+    check("解析 Qwen3 <tool_call> 文本形态",
+          (toolcfg.parse_tool_call(qwen) or type("x", (), {"tool": "", "args": {}})()).tool == "bash")
+    check("Qwen3 调用带上了 arguments",
+          (toolcfg.parse_tool_call(qwen) or type("x", (), {"args": {}})).args.get("command")
+          == "grep -rin x inputs/")
+    check("Qwen3 正文里夹 <tool_call> 也能解析",
+          (toolcfg.parse_tool_call("Let me search.\n" + qwen + "\n")
+           or type("x", (), {"tool": ""})()).tool == "bash")
+    check("解析 OpenAI 原生对象形状",
+          (toolcfg.parse_tool_call('{"type":"function","function":{"name":"read",'
+                                   '"arguments":"{\\"path\\": \\"a\\"}"}}')
+           or type("x", (), {"tool": "", "args": {}})()).args.get("path") == "a")
+    multiple = (qwen + '\n<tool_call>{"name":"read","arguments":{"path":"a"}}</tool_call>')
+    check("一步多个 <tool_call> 全部解析出来（其余由调用方丢弃并记账）",
+          [c.tool for c in toolcfg.parse_tool_calls(multiple)] == ["bash", "read"])
+    check("只有 name 没有参数键 -> None（不误伤记录形状）",
+          toolcfg.parse_tool_call('{"name":"Melanie"}') is None)
+
+    # --- 原生函数调用路径的折叠（runner.message_to_reply）---
+    # 端点返回真正的 tool_calls（4o-mini / 配了 parser 的 sglang）与"返回纯文本"（没配
+    # parser 的 sglang）两条路都必须折成同一个形状，agent loop 才不需要分支。
+    from types import SimpleNamespace as _NS
+    from codemem.search import runner as _R
+
+    def _native_message(name: str, arguments: str):
+        return _NS(content=None, tool_calls=[
+            _NS(function=_NS(name=name, arguments=arguments))])
+
+    reply, dropped = _R.message_to_reply(_native_message("bash", '{"command": "ls"}'))
+    check("原生 tool_calls 折成文本协议", json.loads(reply)["args"]["command"] == "ls",
+          reply)
+    check("原生单次调用不记账丢弃", dropped == 0)
+    reply, dropped = _R.message_to_reply(_NS(content=qwen, tool_calls=None))
+    check("端点返回纯文本 <tool_call> 时兜底解析", json.loads(reply)["tool"] == "bash", reply)
+    _, dropped = _R.message_to_reply(_NS(content=multiple, tool_calls=None))
+    check("正文兜底解析：多出来的调用记账为丢弃", dropped == 1, str(dropped))
+    reply, dropped = _R.message_to_reply(_NS(content="I am done.", tool_calls=None))
+    check("纯文本完成信号原样返回", (reply, dropped) == ("I am done.", 0), reply)
 
     # 校验：描述与执行层不一致要报错
     bad = toolcfg.ToolCatalog(protocol={}, tools={"read": {}}, commands={}, workspace={},
