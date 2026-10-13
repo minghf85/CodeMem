@@ -5,8 +5,9 @@
 消解指代、把散落事实合并后的**推导型证据**。
 
 > **想快速理解整套方法**：读完本文件即可。想深入某一步，看
-> [`docs/add.md`](docs/add.md) / [`docs/search.md`](docs/search.md)；完整设计依据、每一次实测
-> 踩坑与量化结论在 [`docs/core.md`](docs/core.md)。
+> [`docs/add.md`](docs/add.md) / [`docs/search.md`](docs/search.md)；系统设计与契约在
+> [`docs/core.md`](docs/core.md)；每一轮的实测数字、失败归因与运行手册在
+> [`docs/log.md`](docs/log.md)。
 
 ---
 
@@ -112,13 +113,17 @@ python -m codemem.api --recover             # 只跑一次启动自愈（补完�
 ```
 configs/            add / search / answer / eval / api 的配置 + tool.json（search agent 上下文的事实源）
 data/               原始数据 + 各步骤的产物（三层记忆、证据、运行轨迹）
-docs/               文档：add.md / search.md / core.md
+docs/               文档：add.md / search.md（分步骤）· core.md（设计）· log.md（实验与手册）
 src/codemem/
   io.py llm.py log.py dataset.py    共享层
   prompts.py                        所有 prompt 常量
   add/ search/ answer/ eval/        四个步骤
   api/                              Add / Search 的 HTTP 封装
-scripts/            run_eval.py（端到端）、test_search.py / test_api.py（纯 CPU 自测）
+scripts/
+  run_eval.py                       一条命令跑通 search → answer → eval
+  test_search.py test_api.py        纯 CPU 自测（假模型 + 真工具）
+  eval_baseline.py eval_rag.py      历史对照链路：全上下文 baseline / embedding RAG
+  eval_atommem.py analyze_atommem_results.py   同上，原子记忆检索对照
 ```
 
 ---
@@ -140,7 +145,8 @@ python scripts/test_api.py          # 封装 API 自测：幂等 / 多用户隔�
 |---|---|
 | [`docs/add.md`](docs/add.md) | **add 步骤**：三层记忆、pipeline（默认）、时间/指代消解 |
 | [`docs/search.md`](docs/search.md) | **search 步骤**：code-agent 取证、`grep`/`date -d` 工具契约、verifier |
-| [`docs/core.md`](docs/core.md) | **技术报告**：完整设计依据、全部实测踩坑与量化评测结论 |
+| [`docs/core.md`](docs/core.md) | **技术设计**：架构、每一步的设计依据、契约与不变量 |
+| [`docs/log.md`](docs/log.md) | **实验日志与运行手册**：逐轮实测数字与失败归因、被取代过的设计、里程碑与待办 |
 | 本文件 | 快速上手与项目导航 |
 
 ---

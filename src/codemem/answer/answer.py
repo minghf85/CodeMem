@@ -320,10 +320,15 @@ def collect_jobs(
         for qa_dir in sorted(
             directory.glob("qa_*"), key=lambda p: int(p.name.split("_")[1]) if p.name.split("_")[1].isdigit() else 0
         ):
+            index = int(qa_dir.name.split("_")[1])
             path = resolve_evidence_path(qa_dir)
             if path is None:
-                continue
-            index = int(qa_dir.name.split("_")[1])
+                # **没有 evidence.jsonl 不等于是"这条 QA 不存在"。** 它通常是 agent 烧完步数
+                # 一个字都没写 —— 那是最严重的一种失败，必须进分母并按"证据为空"计分。
+                # 这里原来 `continue`，于是 18/138 条 QA 当场消失：分母从 138 变成 120，
+                # 准确率被虚高（Qwen3-8B 实测 0.675@120，补回分母后约 0.587@138）。
+                # 评测里**静默改变分母**比答错危险得多，因为它让两个模型不能比。
+                path = qa_dir / "evidence.jsonl"
             qa = by_index.get(index, {})
             jobs.append(
                 AnswerJob(

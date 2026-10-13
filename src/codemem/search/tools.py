@@ -17,14 +17,14 @@
 2. **``write`` / ``edit`` 加路径约束**（``confine_to``）：目标路径 ``resolve()`` 后必须落在
    工作目录内，否则报错。软链指向外部时也会被拦下 —— 所以 ``qa_{idx}/inputs`` 这个软链
    只能读、不能写。这是**第一道**防线；绕过它的写入由 harness 的 sha256 校验兜底
-   （见 ``evomem_v3.run_qa``）——检测而非防御，因为 bash 原则上能写任何地方。
+   （见 ``search.runner``）——检测而非防御，因为 bash 原则上能写任何地方。
 3. **返回 ``ToolResult``**（自带给模型看的 ``text`` + 给日志/轨迹用的 ``details`` + ``ok``），
    而不是 ``tau_agent`` 的 ``AgentToolResult``。
 
 本模块是**纯 CPU、纯 stdlib** 的：不打模型、不碰网络。所有输入错误都抛 ``ToolError``，
 由调用方渲染成一次"失败的观测"返回给模型（模型自己修），不中断循环。
 
-自测：``python scripts/test_evomem_v3.py``。
+自测：``python scripts/test_search.py``。
 """
 
 from __future__ import annotations

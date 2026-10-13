@@ -59,11 +59,6 @@ class ParseResult:
     mode: str = "linewise"
 
     @property
-    def needs_rewrite(self) -> bool:
-        """文件形态是否偏离"一行一条"的约定（偏离就必须规范化写回）。"""
-        return self.mode != "linewise" or self.multi_record_lines > 0
-
-    @property
     def multi_record_lines(self) -> int:
         """有多少行装了多条记录（``jq -s`` 的紧凑数组）；这类也要展开成逐行。"""
         return self._multi

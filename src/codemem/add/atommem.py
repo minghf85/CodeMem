@@ -36,16 +36,10 @@ from .. import llm
 from ..io import DATA_DIR, PROJECT_ROOT, memory_id, memory_text, read_jsonl
 from ..log import Logger
 # 相似度判据统一在 ``codemem.similarity``（search 侧也要用同一套 —— 见该模块说明）。
-# 这里保留原来的私有别名，函数体与调用点都不用改。
 from ..similarity import (
     NEAR_DUP_JACCARD,
-    core_tokens as _core_tokens,
     dedup_key as _dedup_key,
-    has_sentiment_verb as _has_sentiment_verb,
     is_same_fact as _is_same_fact,
-    proper_nouns as _proper_nouns,
-    subject as _subject,
-    tokens as _tokens,
 )
 from .memory import (
     ATOMMEM_NAME,

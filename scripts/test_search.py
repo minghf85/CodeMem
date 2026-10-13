@@ -4,7 +4,7 @@
 覆盖：
 
 1. ``toolcfg``：catalog 加载与校验、prompt 渲染（槽位全部替换）、响应解析的稳健性。
-2. ``tools``：read/write/edit/bash 的正常路径 + 全部失败路径 + 路径约束。
+2. ``tools``：read/edit/bash 的正常路径 + 全部失败路径 + 路径约束。
 3. ``evidence``：逐行校验、补全 changelog、拒绝缺 source / 重复 id / 坏类型。
 4. ``verifier``：解析稳健性 + 解析失败**保守判不足**。
 5. ``agent``：用假模型脚本驱动一轮 agent loop，验证无进展检测与失败不中断。
@@ -167,20 +167,33 @@ def test_toolcfg(tmp: Path) -> None:
     ap = _P.ANSWER_PROMPT
     check("answer：会话时间不是事件时间", "WHEN THE CONVERSATION HAPPENED" in ap)
     check("answer：相对表达原样保留 + 加锚点", "COMPLETE answer" in ap)
-    check("answer：禁止把相对表达压成单日", "NEVER collapse" in ap)
+    check("answer：禁止把相对表达压成单日", "never collapse the bare anchor" in ap)
     check("answer：不许编造更细的精度", "granularity" in ap)
     check("answer：禁止无锚点的相对词", "next month" in ap and "WRONG" in ap)
     check("answer：不要编造源没有的精度", "add precision" in ap)
-    check("answer：列表题要枚举成员", "enumerate every member" in ap)
+    check("answer：列表题要枚举成员", "EVERY member" in ap)
     check("answer：反事实题要从相关事实推理并表态",
           "COUNTERFACTUAL" in ap and "commit to" in ap)
     check("answer：锚定短语不要折成算出的日期", "replace it with the computed date" in ap)
     check("answer：日期写成 '7 May 2023' 而非 ISO", "7 May 2023" in ap)
     check("answer：反事实题不得弃答", "abstaining is a wrong answer" in ap)
-    check("answer：先给完整答案（集合题不得缩水）", "COMPLETE answer first" in ap)
+    check("answer：先给完整答案（集合题不得缩水）", "COMPLETE answer FIRST" in ap)
     check("answer：措辞要短（短语而非整句）", "short and direct" in ap)
-    check("answer：短不得以漏成员为代价", "dropping part of it" in ap)
+    check("answer：短不得以漏成员为代价", "must not drop members" in ap)
     check("answer：禁止把 session id 当日期", "session id" in ap)
+    # --- 针对实测 bad case 的三条新规则（见 README「本轮优化」）---
+    # ① 具体 > 类别：实测"a cup with a dog face on it"被答成 "pottery"、
+    #    "Bach and Mozart" 被答成 "classical music"，single_hop 因此丢分最多。
+    check("answer：具体细节不得抽象成类别", "Never replace a concrete detail with a category" in ap)
+    check("answer：给出正反例", '"pottery"' in ap and '"classical music"' in ap)
+    # ② 答问题问的那件事：实测问"在会议上看到什么"却答了会议的日期。
+    check("answer：答问题问的那件事（别拿日期顶替）", "Answer the fact the question ASKS FOR" in ap)
+    # ③ 最后才弃答：实测 5 条 recall=1.0 的 QA 被 answer 判成 unsupported。
+    check("answer：最后才弃答", "Abstain LAST, not first" in ap)
+    # ④ 问题里的前提不必在证据里出现：实测 qa67 证据原文就是答案（"Melanie realized that
+    #    self-care is important."），模型却因为证据没提问题里的 "charity race" 而弃答。
+    check("answer：前提缺失不等于答案缺失",
+          "do not have to echo the question" in ap and "*premise* is not a missing *answer*" in ap)
 
     # 时间精度：这是这一版的核心规则
     check("时间策略：不得编造更细的精度", "granularity" in rendered
@@ -235,23 +248,14 @@ def test_toolcfg(tmp: Path) -> None:
     check("提示里没有已废弃的 sessions/ 目录", "inputs/sessions/" not in rendered)
     check("提示不提 index/nodes/edges/graph", "index.jsonl" not in rendered
           and "nodes.jsonl" not in rendered and "edges.jsonl" not in rendered)
-    # 上下文预算：system prompt 每个 round 都整体注入一次，涨回去就等于白做这次简化。
-    # 阈值从 18000 抬到 19500：变更 C 刻意加入了两种策略的标准流程 + 特例处理（约 +0.9k），
-    # 这是用户明确要求的内容，属于有意增长；断言仍用于防止非预期膨胀。
-    # 19500 -> 19700：策略选择规则（集合题强制 Strategy 2）+ 具体内容保留规则（PRESERVE THE
-    # SPECIFICS），都是针对实测最大瓶颈（集合题 recall=0）的有意增长。断言继续防非预期膨胀。
-    # 19700 -> 19950："atoms 太抽象时去 msgmem 找具体名"的策略段（针对范式3：wrong entity，
-    # 如 "likes classical music" 丢了 "Bach and Mozart"），同样是有意增长。
-    # 19950 -> 21000：两条针对实测 bad case 的时间规则（"atom.time == 会话日期 是红旗" +
-    # "不许把 session id 当日期"）与证据标准第 11 条（正文不写 id/占位符），都是有意增长。断言继续防非预期膨胀。
-    # 21000 -> 22800：三条针对 Deborah_Jolene 全量 165 QA 逐条归因的策略规则（见 docs/core.md S20）——
-    # ① 关键词要取问题里**最稀有**的实词、**不许拿说话人名字当关键词**（实测 90/165 条 QA 的第一步
-    #    就是 `grep "<说话人>"`，命中几百行、被截断、白烧一步）；② **疑问句 atom 是路标不是答案**
-    #    （原子层含 6.4% 的 `"X asks about Y"`，按主题 grep 常先命中它）；③ 停下前要确认命中的是
-    #    **问题问的那个**实体（同域名实体并列时只找到"一个"匹配）。同时把 TIME_POLICY 的
-    #    "atom 的 time 要照用、别自己重算" 与 "next <weekday> = 消息之后第一个该星期几" 写进去。
-    # 这些全部来自逐条 bad case，属有意增长；断言继续防非预期膨胀。
-    check("system prompt 控制在 22800 字符内", len(rendered) < 22800, str(len(rendered)))
+    # 上下文预算：system prompt 每个 round 都整体注入一次。这个上限是硬约束 —— 新增一条规则
+    # 之前先想想能不能删掉一条旧的；涨回去就等于白做这次简化。
+    check("system prompt 控制在 21500 字符内", len(rendered) < 21500, str(len(rendered)))
+    # 证据：每条记录必须带来**新**事实 —— 实测最贵的浪费是把同一条事实换着措辞写十几遍
+    # （一次 QA 写出 16 条，真正回答问题的记录被埋在中间）。
+    check("证据标准：不许换措辞重复同一条事实", "NEW INFORMATION ONLY" in rendered)
+    # 检索：写具体值，不写类别 —— 与证据标准第 8 条同源，在策略段再强调一次。
+    check("检索策略：写具体值而不是类别", "Write the SPECIFIC, never the category" in rendered)
 
     # 响应解析
     check("解析裸 JSON", (toolcfg.parse_tool_call('{"tool":"bash","args":{"command":"ls"}}') or
@@ -261,6 +265,24 @@ def test_toolcfg(tmp: Path) -> None:
     check("解析前后有说明文字",
           (toolcfg.parse_tool_call('Sure!\n{"tool":"bash","args":{"command":"ls"}}\nDone.')
            or type("x", (), {"tool": ""})()).tool == "bash")
+    # 实测：Qwen3-8B 会在一个**完整合法**的 {"tool":..,"args":..} 后面多吐一个 `}`。
+    # 严格解析报 Extra data，整条调用被丢掉 —— fixB 那轮里有 31 步栽在这，其中 28 步是
+    # edit append，也就是本该写进 evidence 的记录被无声扔掉。raw_decode 只吃第一个
+    # 完整文档、忽略尾巴，且**不会**把非法 JSON 修成合法（下面两条一起守住这条边界）。
+    trailing = (
+        '{"tool": "edit", "args": {"append": "{\\"content\\": \\"x\\", '
+        '\\"metadata\\": {\\"source\\": [\\"session_1_1\\"]}}\\n"}}}'
+    )
+    _trail = toolcfg.parse_tool_call(trailing)
+    check("结尾多一个 } 仍能解析出工具调用", _trail is not None and _trail.tool == "edit",
+          repr(trailing[-16:]))
+    check("多 } 的 append 参数完整取回",
+          _trail is not None and "session_1_1" in (_trail.args.get("append") or ""))
+    check("未转义引号（真·非法）仍被拒",
+          toolcfg.parse_tool_call('{"tool": "bash", "args": {"command": "he said "hi""}}') is None)
+    check("截断的 JSON 仍被拒（不误修）",
+          toolcfg.parse_tool_call('{"tool": "edit", "args": {"append": "x') is None)
+
     check("参数平铺在顶层",
           (toolcfg.parse_tool_call('{"tool":"bash","command":"ls"}') or
            type("x", (), {"args": {}})).args.get("command") == "ls")
@@ -329,7 +351,7 @@ def test_toolcfg(tmp: Path) -> None:
 # ---------------------------------------------------------------------------
 
 async def test_tools(tmp: Path) -> None:
-    section("2. tools：read / write / edit / bash + 路径约束")
+    section("2. tools：read / edit / bash + 路径约束")
     ws = tmp / "ws"
     ws.mkdir(parents=True, exist_ok=True)
     built = tools_mod.build_tools(cwd=ws, bash_timeout=20)
@@ -835,7 +857,6 @@ async def test_agent(tmp: Path) -> None:
     check("一轮跑完 2 步", len(outcome.steps) == 2, str(len(outcome.steps)))
     check("第一次是工具调用", outcome.steps[0].call is not None)
     check("工具调用成功", outcome.steps[0].result.ok)
-
     # --- 连续失败的 edit 会被注入"换做法"的纠正提示（失败路径原本只回 ERROR，模型会空转）---
     # 用**不同**的 oldText，绕过"完全相同调用被重复检测拒绝"，逼出真正的失败连击。
     bad_a = json.dumps({"tool": "edit", "args": {
@@ -1052,6 +1073,68 @@ async def test_agent(tmp: Path) -> None:
     check("压缩摘要提到压缩", any("context compacted" in m["content"] for m in messages))
     check("压缩后仍能继续到步数用尽", outcome.done_reason == "steps_exhausted",
           outcome.done_reason)
+
+
+async def test_empty_finish_guard(tmp: Path) -> None:
+    """空产物不许收工（纯 CPU）：拒绝完成信号 N 次，然后放行。
+
+    实测 Qwen3-8B 在 Caroline_Melanie 全量上 138 条里 **18 条**跑完两轮 verifier、
+    每轮都在 grep、一个字没写就回复纯文本收工 —— 那 18 条是最严重的失败，
+    而 prompt 里的"必须写"完全拦不住。所以拦在机制层。
+    """
+    section("6c. 空产物不许收工（empty finish guard）")
+    ws = tmp / "empty_finish_ws"
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "lib.jsonl").write_text('{"content": "x"}\n')
+    evidence_path = ws / "evidence.jsonl"
+    log = Logger(level="error")
+    built = tools_mod.build_tools(cwd=ws)
+
+    async def run(script: list[str], **kwargs):
+        model = FakeModel(script)
+        outcome, messages = await agent_mod.run_agent_round(
+            messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "go"}],
+            tools=built, model_call=model, evidence_path=evidence_path, cwd=ws,
+            max_steps=10, no_progress_patience=99, step_offset=0, round_index=1, log=log,
+            **kwargs,
+        )
+        return model, outcome, messages
+
+    def clear():
+        if evidence_path.exists():
+            evidence_path.unlink()
+
+    # 产物为空 + 想收工 → 连拦 2 次，第 3 次放行
+    clear()
+    model, outcome, messages = await run(["Nothing to write."] * 3, max_empty_finish_refusals=2)
+    check("空产物时拒绝收工（模型被多调了 2 次）", len(model.calls) == 3, str(len(model.calls)))
+    refusals = [m for m in messages if "is still EMPTY" in str(m.get("content", ""))]
+    check("拒绝提示注入了 2 次", len(refusals) == 2, str(len(refusals)))
+    check("拒绝提示点名了产物文件名", refusals and "evidence.jsonl" in refusals[0]["content"])
+    check("拒绝提示给了可直接照抄的 edit append",
+          refusals and '"tool":"edit"' in refusals[0]["content"])
+    check("拦满后放行（不卡死）", outcome.done_reason == "no_tool_call", outcome.done_reason)
+    check("空产物也能收尾，不抛异常", len(outcome.steps) == 1, str(len(outcome.steps)))
+
+    # 开关关掉 → 立即放行（旧行为）
+    clear()
+    model, outcome, _ = await run(["Done.", "Done."], max_empty_finish_refusals=0)
+    check("开关关掉后空产物直接放行", len(model.calls) == 1, str(len(model.calls)))
+
+    # 产物非空 → 不拦
+    clear()
+    evidence_path.write_text(
+        '{"content": "x", "metadata": {"source": ["session_1_1"], "score": 0.5}}\n')
+    model, outcome, messages = await run(["Done."])
+    check("产物非空时不拦收工", len(model.calls) == 1, str(len(model.calls)))
+    check("非空产物正常收尾", outcome.done_reason == "no_tool_call", outcome.done_reason)
+    clear()
+
+    # 通知文案本身
+    notice = agent_mod.empty_finish_notice("evidence.jsonl", 1, 2)
+    check("通知说明了不许收工", "cannot finish" in notice)
+    check("通知说明了空文件=零分", "scores zero" in notice.lower() or "empty file" in notice.lower())
+    check("通知带进度 (1/2)", "(1/2)" in notice)
 
 
 async def test_compaction_units(tmp: Path) -> None:
@@ -1895,12 +1978,12 @@ def test_add_memory_module(tmp: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. evomem_v3 端到端（假模型）
+# 8. search runner 端到端（假模型）
 # ---------------------------------------------------------------------------
 
 async def test_end_to_end(tmp: Path) -> None:
     section("8. search runner：端到端（假模型 + 真工具）")
-    from codemem.search import runner as evomem_v3
+    from codemem.search import runner as search_runner
 
     data_dir = tmp / "data"
     sample_dir = data_dir / "Test_Pair"
@@ -1931,7 +2014,7 @@ async def test_end_to_end(tmp: Path) -> None:
         encoding="utf-8")
 
     run_dir = tmp / "runs"
-    config = evomem_v3.load_config(None)
+    config = search_runner.load_config(None)
     config["max_steps"] = 12
     config["max_verify_rounds"] = 2
     config["concurrency"] = 1
@@ -1939,7 +2022,7 @@ async def test_end_to_end(tmp: Path) -> None:
     catalog = toolcfg.load_catalog(PROJECT_ROOT / "configs/tool.json")
     log = Logger(level="error")
 
-    inputs_dir = await evomem_v3.build_inputs(sample_dir, run_dir, config, log=log)
+    inputs_dir = await search_runner.build_inputs(sample_dir, run_dir, config, log=log)
     check("输入已建立", (inputs_dir / "msgmem.jsonl").exists())
     check("三个记忆文件都硬链进 inputs/",
           all((inputs_dir / name).exists()
@@ -1952,8 +2035,8 @@ async def test_end_to_end(tmp: Path) -> None:
           == ["atommem.jsonl", "msgmem.jsonl", "summem.jsonl"],
           str(sorted(p.name for p in inputs_dir.iterdir())))
     # 会话清单：只列会话号与时间，不含任何事实内容（从会话文件推）
-    _roster = evomem_v3.load_session_roster(inputs_dir)
-    idx = evomem_v3.render_session_index(_roster)
+    _roster = search_runner.load_session_roster(inputs_dir)
+    idx = search_runner.render_session_index(_roster)
     check("会话清单列出 session 号", "session_1" in idx)
     check("会话清单不含事实内容", "support group" not in idx)
 
@@ -1990,7 +2073,7 @@ async def test_end_to_end(tmp: Path) -> None:
 
     model = ScriptedModel()
     # 直接跑 run_qa（绕开 QA 数据源，注入一条假问题）
-    record = await evomem_v3.run_qa(
+    record = await search_runner.run_qa(
         qa_index=0, qa={"question": "When did Caroline join the group?", "category": 2,
                         "reference": "June 2023"},
         directory=sample_dir, run_dir=run_dir, inputs_dir=inputs_dir,
@@ -2027,7 +2110,7 @@ async def test_end_to_end(tmp: Path) -> None:
                     "path": "inputs/msgmem.jsonl", "append": "{}"}})
             return "done"
 
-    record2 = await evomem_v3.run_qa(
+    record2 = await search_runner.run_qa(
         qa_index=1, qa={"question": "Anything?", "category": 2, "reference": ""},
         directory=sample_dir, run_dir=run_dir, inputs_dir=inputs_dir,
         config=config, catalog=catalog, model=TamperingModel(),
@@ -2040,7 +2123,7 @@ async def test_end_to_end(tmp: Path) -> None:
           or not record2.rounds[0]["steps"][0]["result_text"] == "")
 
     # --- summary 生成 ---
-    summary = evomem_v3.summarize_dir(
+    summary = search_runner.summarize_dir(
         "Test_Pair", [record, record2], type("M", (), {"stats": staticmethod(
             lambda: {"calls": 9, "failures": 0})})(), 2, 0
     )
@@ -2079,6 +2162,7 @@ def main() -> int:
             loop.run_until_complete(test_verifier())
             loop.run_until_complete(test_tools(tmp))
             loop.run_until_complete(test_agent(tmp))
+            loop.run_until_complete(test_empty_finish_guard(tmp))
             loop.run_until_complete(test_compaction_units(tmp))
             loop.run_until_complete(test_end_to_end(tmp))
         finally:

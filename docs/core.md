@@ -1,7 +1,11 @@
 # CodeMem 技术报告
 
-本文件是 CodeMem 的**技术报告**：完整记录系统的架构、各步骤的设计依据、每一次实测踩坑与
-修正，以及量化的评测结论。它是本项目所有设计决策的单一事实源。
+本文件是 CodeMem 的**技术设计文档**：系统现在**是什么**、每个步骤**怎么工作**、为什么这样设计、
+以及各步骤之间的**契约与不变量**。它是本项目设计决策的单一事实源。
+
+**过程记录不在这里。** 每一轮的实测数字、失败归因、被取代过的设计、里程碑与待办、运行与调试手册
+在 [`log.md`](log.md)。当你想查"当时为什么这么改""上一轮的数字是多少""这个坑是怎么踩的"，
+去那份；本文只保留**仍然成立**的设计。
 
 面向使用者与评测方的**快速入口**见 [`../README.md`](../README.md)。
 
@@ -13,8 +17,8 @@
 完成）；**answer** 只依据证据作答；**eval** 判对错并算各项指标。四个步骤**只通过数据文件耦合**、
 不互相 import，整条链路**零外部依赖**（没有向量索引 / embedding 服务）。
 
-- add 细节 → [`add.md`](add.md)；search 细节 → [`search.md`](search.md)；本文件是**完整技术报告**
-  （架构、设计依据、每一次实测踩坑与量化结论）。
+- add 细节 → [`add.md`](add.md)；search 细节 → [`search.md`](search.md)；
+  过程与实测 → [`log.md`](log.md)。
 - **add 的逐 message code agent 变体在 `add-agent` 分支**；本分支（主分支）的 add **只有 pipeline**。
 
 ---
@@ -71,7 +75,7 @@ data/
   api_store/{slug(user_id)}/   # 封装 API 的多用户语料（见 §4）
 src/codemem/
   io.py llm.py log.py dataset.py    # 共享层：四个步骤都依赖，自身不依赖任何步骤
-  prompts.py                        # 所有 prompt 常量（search 的 EVIDENCE_STANDARD、add 的 ATOM_AGENT_STANDARD）
+  prompts.py                        # 所有 prompt 常量（answer / judge / verifier / EVIDENCE_STANDARD / summem）
   add/    msgmem.py summem.py atommem.py memory.py __main__.py
   search/ runner.py agent.py tools.py toolcfg.py verifier.py evidence.py
           prune.py __main__.py
@@ -83,7 +87,6 @@ scripts/
   test_search.py                     # 纯 CPU 自测（假模型 + 真工具，零模型成本）
   test_api.py                        # 封装 API 的纯 CPU 自测（幂等 / 隔离 / data 映射）
   eval_baseline.py eval_rag.py eval_atommem.py analyze_atommem_results.py  # baseline 对照（见 §6）
-  regenerate_rejected.py transfer_data_to_msswift_standard.py locomo_data_loader.py
 ```
 
 **共享层（`codemem/` 顶层四个模块）** —— 放在任何一个步骤里都会造成反向依赖，所以提出来：
@@ -94,7 +97,7 @@ scripts/
 | `llm.py` | chat completion：退避/重试/截断检测/qwen3 关思考 |
 | `log.py` | 分级日志（终端 + 落盘，支持 `bind` 加前缀） |
 | `dataset.py` | LoCoMo 数据模型：sample/QA/evidence 映射（`D1:3` → `session_1_3` 的唯一实现） |
-| `prompts.py` | 各步骤的 prompt 常量。search 的**证据标准**（`EVIDENCE_STANDARD`）与 add 的**原子标准**（`ATOM_AGENT_STANDARD`）都在这里 |
+| `prompts.py` | 各步骤的 prompt 常量。search 的**证据标准**（`EVIDENCE_STANDARD`）、answer / judge / verifier / summem 的 prompt 都在这里 |
 
 ### 环境
 
@@ -195,7 +198,7 @@ python -m codemem.add --stage atommem --limit-messages 20   # 只跑前 20 条 m
 3. **tag key**：`_normalize_tags` 收敛，落盘后 key 恒 ≤ 12 个。
 4. **工具调用顺畅**：`enable_thinking=false`（否则 8B 输出 `<think>` 不走工具）、prompt 里给
    完整 JSON 调用示例、缺 `path` 默认 `evidence.jsonl`、`grep "a|b"` 自动补 `-E` —— 这些都是
-   实测"8B 会踩"的地方，逐条在 harness 里堵掉（见 §2.16）。
+   实测"8B 会踩"的地方，逐条在 harness 里堵掉（来历见 [`log.md`](log.md) 的原 §2.16）。
 
 **实测（Caroline_Melanie 全量，412 条 atom）**：
 
@@ -246,7 +249,10 @@ possession / time / other`。由 `_normalize_tags` 在后处理时强制收敛�
 **⑤ 具体内容不得抽象化。** 可枚举的具名/带数字内容本身就是事实（`CAPTURE THE SPECIFICS`）——
 不许换成一句笼统的情感或类别。
 
-#### 并行 add agent 怎么跑（`src/codemem/add/atommem_agent_v2.py`）
+#### 并行 add agent 怎么跑（**已迁至 `add-agent` 分支**）
+
+> 下面记的是**那个变体**的设计。主分支的 add 只有 pipeline，`--mode` 开关与
+> `atommem_agent_v2.py` 都已随变体一起移出本分支。
 
 ```bash
 # 每条 message 一个独立 agent，全部并行（受 concurrency 限流）
@@ -266,7 +272,6 @@ possession / time / other`。由 `_normalize_tags` 在后处理时强制收敛�
 互不依赖，全部并行。
 
 - **并行**：每条 message 独立跑，写进各自的 `{msg_id}_atoms.jsonl`（无写冲突），最后合并。
-  **串行 agent**（`--mode agent`）与**三阶段 pipeline**（`--mode pipeline`）保留用于对比。
 - **agent 只填内存里的 `memory` + `metadata.{time, role, tag}`**；`id` / `source` / `type` /
   `changelog` 由系统在收尾时补上 —— 省了模型的力气，也保证这些字段永远正确。
 - **时间解析在收尾**：`parse_time_expression` 用 `date -d` 把相对时间 + 锚点 → 绝对时间，
@@ -317,19 +322,7 @@ python -m codemem.search --sample Caroline_Melanie --max-qa 3 --max-steps 8 --lo
 python -m codemem.search --experiment search
 ```
 
-| 参数 | 说明 |
-|---|---|
-| `dirs` / `--sample NAME` | speaker 目录名或路径；缺省处理全部含 `msgmem.jsonl` 的目录 |
-| `--config PATH` / `--tool-config PATH` | 配置（默认 `configs/search.yaml` / `configs/tool.json`） |
-| `--qa 3,7,12` | **只跑指定的 QA 原始下标**（逗号/空格分隔）。优先于 `--max-qa` 与步数预算：点名了就一定跑完。配 `--list-qa` 查下标 |
-| `--repeat N` | 每条 QA 重复跑 N 次（默认 1）。用来反复测同一条 QA 看结果稳不稳、定位偶发问题 |
-| `--list-qa` | 只列出该目录的 QA 下标就退出，不跑演化 |
-| `--tag NAME` | 给这次运行打标记，写进输出目录名与 summary（如 `--tag promptA`） |
-| `--max-qa N` | **调试闸门**：每目录最多处理前 N 条 QA（0=全部） |
-| `--max-steps N` / `--max-verify-rounds N` | 覆盖步数上限 / verifier 轮数 |
-| `--concurrency N` | 覆盖 QA 级并发 |
-| `--dry-run` | 只渲染 prompt 后打印，不调模型 |
-| `--log-level` / `--log-output` | 覆盖 `log.level` / `log.output` |
+> 完整参数表（含 `--qa` / `--repeat` / `--list-qa` 等调试开关）见 [`log.md`](log.md) 的 **A.4 search 的 CLI 用法**。
 
 **为什么不是 v2 那套流程**：v2 实测（5 QA / 164 次调用）动作分布 `UPDATE 146 / NOOP 18 /
 ADD 0 / DELETE 0`，库净变化 `+0 ~81 -0` —— 只会原地改写、从不新增、81 次无效改写。三条根因：
@@ -341,7 +334,7 @@ ADD 0 / DELETE 0`，库净变化 `+0 ~81 -0` —— 只会原地改写、从不�
 `jq` 吐出的**原始 JSONL 行**，从来没有"展示串"这个概念 —— v2 把
 `[id] (time) Speaker | type |` 抄进正文的格式 bug 从根上不可能发生。
 
-### 2.2 核心抽象：一个朴素的 agent loop
+### 2.1 核心抽象：一个朴素的 agent loop
 
 整个 search 就是**一个 loop**：给定问题和一份库，agent 反复「检索 → 读 → 把结论写进
 `evidence.jsonl`」，直到它认为证据够了、回一句纯文本。跑完由独立 verifier 判一次"能否回答"，
@@ -361,7 +354,7 @@ ADD 0 / DELETE 0`，库净变化 `+0 ~81 -0` —— 只会原地改写、从不�
       ↓ 不再调用工具 = "我做完了"
   verifier（只看 question + evidence，看不到检索过程，**不看 reference**）
       ↓ 不足 → 把 missing[] 作为新一轮 user 消息喂回去，再跑一轮（≤ max_verify_rounds）
-  校验 evidence.jsonl（§2.13）+ 校验 inputs/ 未被篡改
+  校验 evidence.jsonl（§2.11）+ 校验 inputs/ 未被篡改
 ```
 
 **为什么砍到这么简单**：之前试过更"结构化"的版本 —— 先读一层整体印象判答、再由 harness
@@ -380,7 +373,7 @@ agent 越不检索**：那套版本里 150/152 条 QA 一次 grep 都没做。�
 "这题该 grep 什么词"或"这几次会话得通篇读"。**"路标"就是三层记忆文件本身**（见 §1.1）：
 `atommem.jsonl` 的原子已经自足（时间绝对、指代消解），`summem.jsonl` 的会话总结给定位，
 但**两者都只让 agent 自己 grep**，**不把总结正文塞进 prompt**。它**不会**在 prompt 里拿到任何
-"浓缩成品"（整体印象、逐会话摘要）—— 因为实测那两种都会让 agent 跳过检索（见 §2.16）。
+"浓缩成品"（整体印象、逐会话摘要）—— 因为实测那两种都会让 agent 跳过检索（见 [`log.md`](log.md) 的原 §2.16）。
 
 **两种检索策略集成在一个 loop 里，agent 运行中自己切换**（写进 system prompt 但只给判据、
 不给流程）—— 因为一条 question 不一定一开始就能判定该用哪种，可能先试关键词、不行再转通读：
@@ -424,7 +417,7 @@ reference 当闸门就是 oracle 泄漏（RL 会学会猜答案，推理时也�
 JSON 里出现 `{"name": …}` 并不稀奇，宁可判"格式错"交给 verifier，也不要执行一个猜出来的空调用。
 
 
-### 2.3 检索就是 `grep`，时间算术就是 `date -d`
+### 2.2 检索就是 `grep`，时间算术就是 `date -d`
 
 **这一版把检索工具砍到底**：没有向量索引、没有 embedding 服务、没有检索 CLI。语料是 JSONL
 文件（一行一条记录），检索就是 **`grep`**，时间算术就是 **`date -d`**。
@@ -457,7 +450,7 @@ date -d "9 Jun 2023 -5 year" +%Y                     # ⑤ 需要时算时间 ->
 "charity race"）就在那条原子上落证据。集合型/散布型问题（"她参加过哪些活动"）则相反 ——
 先 `grep -rln` 看哪些行相关、`summem.jsonl` 定位会话，再**通读那几段 `msgmem.jsonl`、边读边收成员**：实测 LoCoMo
 的标注证据里，1985 条 QA 中 1187 条只用 1 个 session，但有 330 条跨 2 个以上、最多跨 15 个。
-用哪种、什么时候切换，由 agent 自己判断（判据见 §2.2 的策略表）。
+用哪种、什么时候切换，由 agent 自己判断（判据见 §2.1 的策略表）。
 
 **两个实测修掉的坑**（写在这里因为它们都是 grep 特有的）：
 
@@ -468,7 +461,7 @@ date -d "9 Jun 2023 -5 year" +%Y                     # ⑤ 需要时算时间 ->
   `07 5月 2023` —— 那是一条下游读不了的记录。harness 注入 `LC_ALL=C` 把它钉死成
   `07 May 2023`（已实测确认）。
 
-### 2.4 时间推理：会话日期 ≠ 事件日期（实测 27% → 修）
+### 2.3 时间推理：会话日期 ≠ 事件日期（实测 27% → 修）
 
 这是目前最实的一处问题。第一次全量跑完，**temporal 类只有 10/37 = 27% 正确**，
 而其它三类都在 61-77%。把 63 条 INCORRECT 全部逐条读完之后，根因是**三件事叠在一起**，
@@ -574,197 +567,7 @@ evidence -- do NOT demand more*，外加一条"记录上的日期是**说这话�
 外加一条与检索强相关的推论：**evidence 记录必须自带锚点**。下游读者看不到会话，
 所以 "she went there the week before" 这样的记录是没用的 —— 锚点日期必须写进正文。
 
-### 2.4.1 一次"效果变差"的完整归因：58% → 47% 里有多少是真的
-
-改完时间规则后重跑，分数**从 58% 掉到 47%**。逐条归因之后，结论是：
-**这 11 个点里绝大部分是判分口径变了，不是答案变差了。**
-
-做法：把两次运行（`search_20260929_185935` / `search_20260929_214956`）的逐条结果按
-**同一套规则**重新判一遍，再比较。三件事同时发生了：
-
-| 现象 | 影响 | 性质 |
-|---|---|---|
-| **旧 judge 把"空答案"判成 CORRECT** —— 实测 **11 条**（"The prediction correctly identifies that the answer is unsupported…" → 竟然判对） | 旧分数**虚高** | 旧 judge 的 bug，新 judge 修对了 |
-| **新 judge 把"集合型问题多给成员"判成错** —— 集合型 67% → 26%，而参考答案只是**不完整的列表** | 新分数**虚低** | 新 judge 引入的过严，已修 |
-| **temporal 真的变好了** 27.8% → 50.0% | 真实提升 | 时间规则的功劳 |
-
-**统一判据后**（把两边都用同一套规则重判）：
-
-```
-                 旧 run      新 run
-multi_hop      18/30 60% →  9/30 30%
-temporal       10/36 28% → 18/36 50%     ← 真实提升
-open_domain     5/13 38% →  5/13 38%
-single_hop     43/69 62% → 39/69 57%
-总体           76/148 51% → 71/148 48%
-```
-
-**剩下的 20 条"变差"里，14 条的答案覆盖率不低于旧答案**（措辞变了、实质等价，被模型判成
-不同），只有 6 条是真的变差。也就是说：**净变化基本在噪声范围内，唯一确凿的移动是
-temporal +22 个点。**
-
-**为什么判分口径会漂移这么多**，根因是上一版把 judge 的 `reason` 挪到了第一位
-（为了 CoT），副作用是模型从"直接比较"变成"先复述判据标题再比较" —— 点名判据的比例
-**42% → 82%**，而且反射性地去点 `CORE FACTUAL ACCURACY`，在那条判据下"多给内容 = 加错误
-主张 = INCORRECT"。这一条现在明确写了：**集合型问题上超集是 CORRECT**，且 **reason 里不要
-复述判据标题**。
-
-**教训**：judge 是被测量的一部分。它的 prompt 一改，**历史分数就不能直接比了**。
-`scripts/judge_impact.py` 就是为此写的 —— 它拿新规则扫一遍已存的结果，列出"按新规则应该
-翻转"的条目，改 judge 之前先跑它看一眼影响面。
-
-### 2.4.2 时间处理的最优方案：保留相对表达，不折算（2026-10-06）
-
-§2.4 的规则里留着一条**自相矛盾**的指导：一边说"带锚点的短语就是答案"（规则 4），一边又写
-"**Compute when you can: lead with the computed date**"（旧规则 3）。8B 在矛盾下倾向于执行
-"尽量折算"，于是把 "last week" 算成了**会话日期本身** —— 恰好踩中规则 1 明令禁止的错误。
-全量跑后 temporal 只有 36%，但 evidence_recall 高达 83% —— **检索到了，是作答/判定把时间搞错了**。
-
-#### 三个叠加的 bug（逐条实测确认）
-
-**① search 把相对表达错误折算成会话日期。**
-
-```
-源消息 (session_3_1, 时间 9 June 2023): "my school event last week"
-atommem (正确): time = "last week (anchor: 9 June 2023)"  ← pipeline 已保留
-search 写的 evidence (错): "Caroline gave a speech at a school on 9 June 2023"  ← "last week" 被吞成锚点本身
-参考答案: "The week before 9 June 2023"
-```
-
-**② judge 折算 candidate 时丢掉了修饰语，把逐字相同的答案判成不同日期。**
-
-`judge._parse_date("the week before 6 July 2023")` 走的是**绝对日期**分支 —— 它抠出
-"6 July 2023" 算成 `2023-07-06`，**完全无视 "the week before"**。而 reference 走
-`resolve_relative_date` 算出 `2023-06-29`。于是：
-
-```
-reference: "The week before 6 July 2023"  → 2023-06-29
-candidate: "the week before 6 July 2023"  → 2023-07-06   ← 逐字相同却算成差 7 天
-judge: "These differ by 7 day(s)" → INCORRECT
-```
-
-逐字相同的正确答案被判错。**这是 judge 最隐蔽、也最该先修的 bug** —— 它污染测量，
-让"答案其实对了"的题显示为错。
-
-**③ answer 把锚点当成事件时间作答。**
-
-#### 最优方案（用户定的口径）
-
-> **相对时间表达本身就是一个完整、精确、充沛的答案。** "The week before 6 July 2023" 自带锚点
-> 6 July，任何人（包括 judge）都能验证两个答案是否相同 —— **不需要、也不应该折算成绝对日期**。
-> 折算是有损的：它丢掉"一周内哪天"的信息（"the week before X" 是一个**周区间**，不是一个点），
-> 还会引入算错的风险。而"上周发生的"（模糊描述）= 一个周内发生，**不能具体到某一天**。
-> **不要随意理解日期。**
-
-落成三条规则：
-
-| 表达 | 处理 | 理由 |
-|---|---|---|
-| `yesterday` / `today` / `tomorrow` | **折算成绝对日期**（`date -d`，单步精确） | 唯一"精确且平凡"的折算 |
-| `last week` / `last Friday` / `the week before X` / `N years ago` | **保留原表达 + 锚点**，不折算 | 自带锚点即完整答案；折算是信息损失 |
-| `a few weeks ago` / `recently` | 保留为**粗粒度窗口**，绝不细化成日期 | 源就是模糊的，细化 = 编造 |
-
-**具体修改**：
-
-1. **`tool.json` 的 `time_policy`**（search 侧）：删掉"compute when you can"，改成
-   "**preserve, don't convert**" + "只有 yesterday/today/tomorrow 才折算" + "按源的单位作答，绝不细化"。
-2. **`tool.json` 的 worked examples**：把"lead with the computed date"的例子改成
-   "keep 'last week' + anchor" 的正确形态。
-3. **`prompts.ANSWER_PROMPT`**（answer 侧）：加"keep the source's own time wording, anchored --
-   do NOT flatten it into a date" + "read the unit the source used and answer at that unit"。
-4. **`prompts.EVIDENCE_STANDARD`**：第 3 条改为 "TIME ANCHORED, KEPT AS WRITTEN"。
-5. **`judge._parse_date`**：**先试相对表达**（复用 `resolve_relative_date` 的同一套逻辑），
-   识别不到再回退到绝对日期解析 —— 保证 reference 与 candidate **口径完全一致**。
-   把折算逻辑抽成 `_resolve_relative_expression` 供两个函数共用。
-
-#### 实测（Caroline_Melanie 的 3 条 temporal QA）
-
-| QA | 修改前 | 修改后 |
-|---|---|---|
-| qa8 | `9 June 2023`（吞成锚点）❌ | `the week before 9 June 2023` ✅ CORRECT |
-| qa9 | `9 June 2023` ❌ | `the week before 9 June 2023` ✅ CORRECT |
-| qa28 | `15 July 2023` ❌ | `the week before 15 July 2023` ⚠️（差在 "Friday" vs "week"，非时间方案问题）|
-
-token_f1 从 ~0.5 升到 **0.944**。新生成的 evidence 正是期望的形态：
-
-```
-Caroline gave a speech at a school 'last week' (message dated 7:55 pm on 9 June, 2023)
-  -- i.e. the week before 9 June 2023.
-```
-
-### 2.4.3 全量跑后的错因分析：最大瓶颈是"集合题检索不到"（2026-10-06）
-
-时间方案落地后全量跑（`search_20261006_112146`）：**judge 55.4%**，temporal 从 36% 升到 **61.1%**
-（时间方案生效），但 single_hop 62.1%、multi_hop 40.7%、open_domain 33.3%。
-
-#### 按 recall 拆开 58 个错误，瓶颈一目了然
-
-| 错误形态 | 条数 | 含义 |
-|---|---|---|
-| **recall=0（检索不到）** | **29** | evidence 完全没覆盖标注证据 —— 最大瓶颈 |
-| unsupported（没答） | 13 | search 判"证据不足"直接放弃 |
-| recall=1（检索到但答错） | 12 | 证据对，作答/判定错 |
-| recall 部分 | 4 | 集合收不全 |
-
-**29 条 recall=0 里绝大多数是"集合型问题"**（"what activities/pets/books/items does X have"、
-"where has X camped"、"what types of pottery…"）—— 标注证据是一**组散点**，search 收漏一条就大量丢分。
-
-#### 三个具体错因（逐条看轨迹确认）
-
-**① 集合题，agent 只做关键词 grep，不读会话。**
-
-qa18「Where has Melanie camped?」（真答案 `beach, mountains, forest`）的 12 步轨迹全是
-`grep "camp"` / `grep "mountains"` / `grep "campfire"` —— **它从没用过 Strategy 2 的"读会话"**。
-成员散落在多个会话，关键词法永远抓不全。
-
-**② 具体内容被抽象化。**
-
-qa127「What did Caroline make for a local church?」原子层**是对的**（`Caroline made a stained
-glass window`），但 search 写成 `"Caroline created a painting"` —— **"stained glass window" 被抽象成了
-"painting"**。qa112（`a sunset with a palm tree` → `a nature-themed artwork`）同理。
-这正是 `ATOM_AGENT_STANDARD` 规则 13 禁止的，但 search 的 `EVIDENCE_STANDARD` 没有对应条款。
-
-**③ answer 复述 prompt 模板占位符。**
-
-qa18 的 answer 输出 `"the week before <session date>"`、qa71 输出 `"the year before session_7_8"`
-—— 因为 `ANSWER_PROMPT` 的工作示例里写的是 `<session date>` / `<year-1>` 这种**模板标记**，
-模型逐字照抄了，还把它当成了答案。
-
-#### 修改
-
-1. **`strategy`（策略选择）**：加一条判据 —— 集合/计数题**必须走 Strategy 2**，并警告
-   "grep 人名会匹配几乎每一行，`head` 只看到噪声，不是成员"。
-2. **`EVIDENCE_STANDARD` 第 8 条**：新增 `SPECIFICS PRESERVED` —— 保留具体内容（stained glass
-   window / sunset with a palm tree / 标语原文），禁止抽象成类别。
-3. **`verifier`**：加两条 —— 集合题要**具体成员**（不是类别）、答案要**保留具体细节**。
-4. **`ANSWER_PROMPT` 示例**：把 `<session date>` / `<year-1>` 占位符换成**真实示意日期**
-   （9 June 2023 / 2022），并明确"示例里的日期是示意值，必须替换成真实日期；绝不复制占位符、
-   session id 或示例值"。
-5. `system prompt` 上限 19500 → **19700**（上述规则是有意的、针对最大瓶颈的增长）。
-
-#### 诚实记录：一次失败的方向
-
-最初把规则写成"you MUST use Strategy 2"，结果 **充分率从 42% 掉到 0%** —— 8B 把它理解成
-"要 grep 人名"，于是 `grep "Melanie" | head -20` 反复重试、卡住不写 evidence。
-**加规则 ≠ 改行为**：抽象描述（"list the sessions, then read"）8B 会误读，必须给**具体命令形态**
-和**明确的反例**（"grep 人名只会看到噪声"）。这是 add / search agent 反复验证过的教训。
-
-#### 实测（20 条混合题，中等规模验证）
-
-| 指标 | 全量（改前） | 20 条（改后） |
-|---|---|---|
-| judge_accuracy | 55.4% | **60.0%** |
-| unsupported_rate | 10.0% | **0.0%** |
-| token_f1 | 0.404 | **0.442** |
-| sufficient_rate | 42% | **75%** |
-
-（20 条样本小、判分条数少，只作方向参考；全量验证见下。）
-
-
-**一句话总结**：相对时间**保留原样 + 附锚点**是答案，绝对日期只是"锚点 + 偏移"的另一写法；
-judge 两边都要用同一套折算逻辑，否则会把逐字相同的答案判成不同。
-
-### 2.5 输出 schema：`reasoning` 必须放在第一个字段
+### 2.4 输出 schema：`reasoning` 必须放在第一个字段
 
 所有要求模型输出 JSON 的 prompt（answer / baseline / rag / judge / verifier）里，
 **推理字段一律排在首位**：
@@ -780,7 +583,7 @@ judge 同理：`reason` 在前、`label` 在后，等于先做比较再下结论
 解析是按 key 取的，所以字段顺序对下游完全无影响；改的只是生成顺序。测试里有断言盯着
 每个 prompt 的首字段。
 
-### 2.6 上下文预算：工具描述不能吃掉 agent 的步数
+### 2.5 上下文预算：工具描述不能吃掉 agent 的步数
 
 system prompt 是**每条 QA 都完整注入一次**的（agent loop 的每次模型调用都带着它），所以它的
 每一句都在跟检索结果抢上下文。实测现在 **~18770 字符**：
@@ -788,11 +591,11 @@ system prompt 是**每条 QA 都完整注入一次**的（agent loop 的每次�
 | 段落 | 字符 | 说明 |
 |---|---|---|
 | system body | ~4900 | 检索策略（STRATEGY）+ 三条 worked example（关键词检索 / 相对时间 / 通篇读） |
-| EVIDENCE_STANDARD | 2035 | 一条证据要写法上合格（§2.8）—— 自足 / 指代 / 时间锚点 / 不编造精度 / 溯源 |
+| EVIDENCE_STANDARD | 2035 | 一条证据要写法上合格（§2.7）—— 自足 / 指代 / 时间锚点 / 不编造精度 / 溯源 |
 | TOOLS | ~1700 | 三个工具（read / edit / bash）的 description + schema |
 | COMMANDS | 1485 | grep、date 的用法与示例 |
 | WRITING_POLICY | 1981 | 证据是推导、不是抄的 |
-| TIME_POLICY | 1942 | 时间精度规则（§2.4） |
+| TIME_POLICY | 1942 | 时间精度规则（§2.3） |
 | SCHEMA | 650 | evidence 记录字段 |
 | WORKSPACE | 640 | 目录布局与只读规则 |
 | PROTOCOL | 400 | 响应格式 |
@@ -801,7 +604,7 @@ system prompt 是**每条 QA 都完整注入一次**的（agent loop 的每次�
 "证据标准"那一段保留（它换来的是"什么算一条合格的证据"）。
 
 > **2026-10-05 变更 C 使 prompt 增长。** 两种检索策略从散文改成**标准操作流程（SOP）+ 特例
-> 处理**（§2.9），STRATEGY 从 ~2.6k 涨到 ~3.4k。这是用户明确要求的内容，是有意增长；
+> 处理**（§2.8），STRATEGY 从 ~2.6k 涨到 ~3.4k。这是用户明确要求的内容，是有意增长；
 > 上限断言相应从 `< 18000` 抬到 `< 19500`，仍用于防止**非预期**膨胀。同时把 prompt 里
 > 残留的数据集实体（真实人名/日期/书名）全部替换成占位符（`<person>` / `<date>` /
 > `<key word>`），断言里新增一条**负向检查**：渲染后的 prompt 不得出现任何已知数据集实体。
@@ -810,9 +613,9 @@ system prompt 是**每条 QA 都完整注入一次**的（agent loop 的每次�
 所以它该在 CI 里红，而不是等到某次跑完发现步数又不够用了。
 
 **Verifier 同理**：它的 prompt 里没有 few-shot 示例，唯一的例外是**时间精度的两条说明**
-（它很容易把锚点表述判成不完整，于是反向逼 agent 编造更精确的日期 —— 正是 §2.4 要避免的）。
+（它很容易把锚点表述判成不完整，于是反向逼 agent 编造更精确的日期 —— 正是 §2.3 要避免的）。
 
-### 2.7 集合型问题靠遍历，不靠相似度
+### 2.6 集合型问题靠遍历，不靠相似度
 
 有一类问题的答案是**一个集合**："Melanie 参加哪些活动？"、"Caroline 有哪些爱好？"。
 旧版试过用向量相似度解决它 —— **结构性做不到**：相似度按与 query 的距离排序，而"她要去
@@ -829,7 +632,7 @@ key。**没有哪一个 `--tag` 能一次收齐** —— 那是 add 侧的问题
 **字面**提到的东西，覆盖是可数的、可验证的。集合型问题往往要**对着读好几个会话**（同一个成员
 在不同会话里反复出现），这正需要 agent 自己决定读哪几页、读多深。
 
-### 2.8 证据是**推导**出来的，不是抄的（附"证据标准"）
+### 2.7 证据是**推导**出来的，不是抄的（附"证据标准"）
 
 这是 search 的核心语义，也是相对上一版最大的一处变化：
 
@@ -867,7 +670,7 @@ source:  ["session_1_9", "session_2_8", "session_1_17"]
 印象、没见过原话，所以它的 `source` 指向印象里**标注给这条事实的** `session_N`（一个可回溯到
 会话的 id），而不是某条具体消息 id。
 
-### 2.9 code-agent loop 的几件事
+### 2.8 code-agent loop 的几件事
 
 上一版实测暴露了四个问题，这一版逐一修掉（每条都有日志证据）：
 
@@ -877,7 +680,7 @@ source:  ["session_1_9", "session_2_8", "session_1_17"]
 | **60/60 步没有一次完成信号**，12~24 步全烧在重复追加 | **重复检测**：同一工具+参数、**且文件状态未变**时直接拒绝并给出脱困提示（状态感知 —— 文件变了就允许重跑） |
 | 空转被算作"有进展"（往文件里追加重复行） | 进展判据改成**唯一记录集合的指纹**，不是行数、也不是字节数；重复追加不算进展 |
 | prompt 随历史无限涨（3.3k→4.5k tok / 12 步） | **上下文压缩**：超预算即把中段坍缩成摘要，保留 system + 最近 N 条 + **工具用过的 id 集合**（保 id 是关键，否则模型会忘了已收过哪些而重复追加） |
-| **超长工具观测一直堆在上下文里**（一次 `read` 整个 msgmem 就是几千字符，跨轮不再需要却永远占着） | **遗忘**（§2.9.1）：按"轮数 + 长度"双阈值，把够旧且超长的观测定点替换成一行占位符 |
+| **超长工具观测一直堆在上下文里**（一次 `read` 整个 msgmem 就是几千字符，跨轮不再需要却永远占着） | **遗忘**（§2.8.1）：按"轮数 + 长度"双阈值，把够旧且超长的观测定点替换成一行占位符 |
 
 **逐条追加：`edit` 需要专门的 append 模式，不能靠"用最后一行当 oldText"去模拟。** 流程要求
 "每看完一页就把理解**追加**到 `evidence.jsonl`"。最初的做法是让模型用精确替换 `edit` 自己造
@@ -913,7 +716,7 @@ source:  ["session_1_9", "session_2_8", "session_1_17"]
   `jq` 自然产物：**一行一个数组**（`jq -s`）与**整份美化 JSON**（`jq -s` 不加 `-c`）——
   后者以前会让 `write_normalized` 把证据**全部删掉**。
 
-### 2.9.1 遗忘系统：按"轮数 + 长度"双阈值定点清理（变更 D）
+### 2.8.1 遗忘系统：按"轮数 + 长度"双阈值定点清理（变更 D）
 
 **与上下文压缩互补，各管一件事**：压缩是**按总量触发**、把**中段**整体坍缩（兜底）；
 遗忘是**按观测个体**、**按年龄**把**够旧且够长**的单条观测替换成占位（定点）。
@@ -938,13 +741,14 @@ source:  ["session_1_9", "session_2_8", "session_1_17"]
 
 **两个阈值都 > 0 才启用**（任一为 0 即整机关闭）。调用点在 `run_agent_round` 主循环里、
 **在 `compact_messages` 之前**（每轮模型调用前）—— 先做定点遗忘、再按总量兜底压缩。
-add 阶段（`add/atommem.py`）也走同一个 `run_agent_round`，但步数少，默认关闭（两个阈值 0）。
+**只有 search 用这套机制。** add 走的是 pipeline（每条 message 一次并发抽取、没有循环），
+不存在上下文越堆越长的问题，所以 `configs/add.yaml` 里没有这两个阈值。
 
 实测（2026-10-05 小样本重跑 `--max-qa 3 --max-steps 8`）：qa1 / qa2 各命中一次 ——
 `遗忘 1 条超长观测（>2000 字符、>4 回合），省下 7141 / 6898 字符`，无崩溃、证据正常产出。
 `test_search.py` 里有独立单测覆盖：短观测不忘、新观测不忘、超长且旧的被替换成占位、system 保留。
 
-### 2.10 存储与运行目录
+### 2.9 存储与运行目录
 
 旧版这一节是整条链路最重的一块：向量索引（一个目录 17MB）、共享缓存、按 `corpus_sha256`
 判失效、跨运行复用、三个清理命令。**现在这些全都不存在了** —— 语料就是 `data/{dir}/` 下的三个 JSONL
@@ -987,7 +791,7 @@ python -m codemem.search --prune-runs --keep-last 3 --yes  # 保留最近 3 次
 默认保留**含 `full` 的那次运行**（没有则保留最近一次）。实测清理 27 个调试跑次回收
 **24.5MB**（`40M → 29M`）。
 
-### 2.11 两条产物稳健性的实测坑
+### 2.10 两条产物稳健性的实测坑
 
 - **被 `max_tokens` 截断的数组必须抢救**。模型一次 `write` 写出 39 条记录、末尾的 `]`
   被截掉（7687 字节处断）。旧实现逐行读只看到"1 行、解析失败"，于是**把全部证据判成空** ——
@@ -1021,35 +825,7 @@ source:  ["session_1_3"]
 search 阶段只需照取。（`yesterday` 相对于该消息自己的时间，算术精确、锚点已知；如果源说的是
 "last year"，atom 的 time 就该是年份而不是日期。）
 
-### 2.12 用法
-
-```bash
-# **先 dry-run**：只建 inputs/ + 渲染 system prompt 打印出来，不调模型
-python -m codemem.search --sample Caroline_Melanie --dry-run
-
-# 调试首选：只跑前 3 条 QA、每条最多 8 步，看完整数据流
-python -m codemem.search --sample Caroline_Melanie --max-qa 3 --max-steps 8 --log-level debug
-
-# 全部目录全部 QA（注意成本：每条 QA ≈ steps + verifier 次调用）
-python -m codemem.search --experiment search
-
-# 纯 CPU 自测（假模型 + 真工具，零模型成本）
-python scripts/test_search.py
-```
-
-| 参数 | 说明 |
-|---|---|
-| `dirs` / `--sample NAME` | speaker 目录名或路径；缺省处理全部含 `msgmem.jsonl` 的目录 |
-| `--config PATH` | 检索配置（默认 `configs/search.yaml`） |
-| `--tool-config PATH` | 工具配置（默认 `configs/tool.json`） |
-| `--max-qa N` | **调试闸门**：每个目录最多处理前 N 条 QA（0=全部） |
-| `--max-steps N` | 覆盖 `max_steps`（默认 30） |
-| `--max-verify-rounds N` | 覆盖 `max_verify_rounds`（默认 2） |
-| `--concurrency N` | 覆盖 QA 级并发（默认 4） |
-| `--dry-run` | 只渲染 prompt 后打印，不调模型 |
-| `--log-level` / `--log-output` | 覆盖 `log.level` / `log.output` |
-
-### 2.13 不变量（CPU 侧强制，违反即拒绝该动作、不中断 QA）
+### 2.11 不变量（CPU 侧强制，违反即拒绝该动作、不中断 QA）
 
 | # | 不变量 | 动机 |
 |---|---|---|
@@ -1058,11 +834,11 @@ python scripts/test_search.py
 | 3 | 每 QA 收尾校验**整个会话语料树**的 sha256（逐文件）；不一致 → `tampered=true`，该 QA 作废 | bash 可以绕开 #2，检测成本极低 |
 | 4 | 只补全**系统自有字段**（缺 `changelog` → 补 `created`；缺 `score` → 补 0.5），其余不合规的行 **reject 并记账** | 补全语义问题会掩盖失败模式 |
 | 5 | 工具 / 解析 / 模型调用失败 = 一次 failed step，记账后继续 | 所有失败路径都退化为无害一步 |
-| 6 | 连续 `no_progress_patience` 步**唯一记录指纹**没有变化 → **提前收尾**（判据是唯一记录集合，不是行数/字节数；见 §2.7） | 把空转变成机制而不是 prompt 请求 |
+| 6 | 连续 `no_progress_patience` 步**唯一记录指纹**没有变化 → **提前收尾**（判据是唯一记录集合，不是行数/字节数；见 §2.6） | 把空转变成机制而不是 prompt 请求 |
 | 7 | 产物解析容忍两种 `jq` 自然输出：一行一个数组、整份美化 JSON（否则规范化会把证据全删） | `jq` 是 agent 的主要工具，它的自然输出必须能被接住 |
 | 8 | `edit append` **缺 `path` 时默认 `evidence.jsonl`** | 8B 实测常忘填 path，旧行为是报错 → 它把整条调用重复 10+ 次、12 步烧光、0 条证据（一个显然的默认值不值得判错） |
 
-### 2.14 输出与日志
+### 2.12 输出与日志
 
 `data/search_runs/{experiment}_{ts}/`：
 
@@ -1090,7 +866,7 @@ python scripts/test_search.py
 提前收尾）/ `error`。
 
 > ⚠️ **成本**：每条 QA ≈ `检索步数 + verifier 次数` 次模型调用。system 段实测 **~15900 字符（约 4k token）且固定** ——
-> 可命中 prefix cache；随对话历史与工具观测增长，每步再涨 ~1–2k（见 §2.9 的压缩机制）。
+> 可命中 prefix cache；随对话历史与工具观测增长，每步再涨 ~1–2k（见 §2.8 的压缩机制）。
 > **唯一的关键旋钮是 `max_steps`** —— 集合型问题（要读多个 session）比事实型贵得多，按最贵的给。
 > 先用 `--max-qa 3 --max-steps 20` 试跑，`--dry-run` 可先看 prompt 全貌。
 >
@@ -1099,219 +875,6 @@ python scripts/test_search.py
 
 **原子性**：只写 `data/search_runs/` 下的文件，`inputs/` 是硬链且收尾校验 sha256，
 **绝不修改** `data/{dir}/` 下的任何语料。
-
-### 2.15 首次全量跑（Caroline_Melanie，152 QA）的实测结论
-
-> **这组数字来自更早一次全量跑**（当时是"会话时间当事件时间"那一版 prompt），保留它是为了
-> 记录下面三个诊断结论 —— 它们与语料层数、与后来的分阶段改动都无关，至今仍是当前设计的依据。
-> **当前朴素 loop（§2.2）的实测见 §2.16**，这组数字是更早版本的，不能当作它的成绩。
->
-> **两次完整运行的对比在 §2.4.1** —— 那里说明了为什么"58% → 47%"这个表面跌幅
-> 绝大部分是判分口径变化，而不是答案变差（用统一判据重判后是 51% → 48%，
-> 唯一确凿的移动是 temporal 28% → 50%）。
->
-> 所以：**跨版本的分数不能直接比**，除非用同一套 judge 判据重判一遍
-> （`scripts/judge_impact.py` 就是干这个的）。
-
-```
-search   152/152 QA，0 错误，verifier 判"足够" 64%，473 条 evidence
-answer   147 条（5 条无 evidence 可答），证据不足 22 条
-eval     judge_accuracy 55.1%   token_f1 0.310   evidence_recall 43.6%
-```
-
-| category | n | 准确率 | recall |
-|---|---|---|---|
-| single_hop | 68 | 66.2% | 41.2% |
-| open_domain | 12 | 75.0% | 22.5% |
-| multi_hop | 30 | 43.3% | 23.1% |
-| temporal | 37 | 37.8% | **70.3%** |
-
-**三个诊断结论**（都是查了数据才敢下的）：
-
-**① `evidence_recall` 不是可靠的失败信号。** 74 条 recall=0 里有 **36 条答案是对的** ——
-标注 evidence 只列 1-4 条消息，而同一事实往往有其他消息佐证。所以"recall 低"不等于
-"检索差"；判断链路好坏必须看 judge 准确率，recall 只能当参考。
-
-**② temporal 的 recall 70% 但准确率 38% —— 瓶颈已从检索转到作答与判定。** 其中一部分是
-**judge 的测量缺陷**：参考用相对表述（"the week before 6 July 2023"）而预测给绝对日期
-（`2023-06-29`，**两者在时间点上完全相等**），judge 却判错。8B 推算"13 Sep 2023 是周三、
-之前的周末是 9-10 号"这类算术**不可靠**（实测同一条判 3 次都错）。
-
-修法：**日期算术交给代码**（`judge.resolve_relative_date`），把算好的结果作为
-`[PRECOMPUTED] ... SAME date` 提示塞给 judge，让它只做比较、不做推算 ——
-与 search 阶段"相对时间交给 `date -d`"是同一个取舍。效果：temporal 37.8% → **43.2%**，
-且 5 个已知误判里 4 个稳定转正。
-
-**③ 每一条 QA 只写 3.2 条 evidence（均值），且 4-8 条是准确率甜点**：
-
-| evidence 条数 | n | 准确率 |
-|---|---|---|
-| 0（空） | 8 | 0% |
-| 1-3 | 99 | 54% |
-| **4-8** | **27** | **81%** |
-| 9+ | 13 | 46% |
-
-塞太多会引入噪声（9+ 掉到 46%），塞太少则信息不足。`evidence_soft_limit: 40` 太宽松，
-**调到 12 左右更贴合实测的最优区间**。
-
----
-
-### 2.16 从 bad case 反推的一次大改：31.6% → 59.1%
-
-上一节那张表是"印象判答 + 逐 session"版本的。这一节记录**怎么从 bad case 找到根因、
-把 search 砍成一个朴素 loop** 的全过程 —— 这是本项目最实的一次方法改进，也是"范畴判断
-优先于堆流程"的最好例证。
-
-#### 先看数据：104 条 INCORRECT 是什么样的
-
-拿旧版全量跑（152 QA）的 `eval_eval.jsonl` 逐条分类：
-
-| 现象 | 条数 | 性质 |
-|---|---|---|
-| **一次 `grep` 都没做的 QA** | **150 / 152** | 检索被整个短路 |
-| INCORRECT 里"证据在但答错"（= 编造） | **97 / 104** | 不是检索不到，是压根没去检索 |
-| verifier 判 sufficient 的 / 其中错的 | 131 / **87** | verifier 被"看起来完整"的编造骗过 |
-| 集合型问题 `recall=0` | 17 / 18 | 只给一两个成员就收工 |
-
-#### 典型 bad case：0 步检索 + 编造 + 假来源
-
-qa92「What country is Caroline's grandma from?」（参考 **Sweden**）的完整轨迹只有两步：
-
-```
-step1 edit: {"content": "Caroline's grandma is from Canada, as Melanie mentioned
-             during their conversation...", "metadata":{"source":["session_13"]}}
-step2 纯文本 = 完成
-```
-
-它**从没读过 session_13**（正确答案在 `session_4_3`），编了一个国家名、还配了个看似
-可溯源的假 source，verifier 判 sufficient。同形态的还有：
-- qa106「新鞋用来干什么」→ 编"pottery"（答案 running），证据里写着 "**likely required** the use of her new shoes"（臆测）；
-- qa93「奶奶的礼物」→ 编"一幅马的画"（答案 necklace）；
-- qa104「推荐的书」→ 编"The Power of Now"（答案 "Becoming Nicole"）；
-- qa88「期待收养过程的什么」→ 把问题复述一遍当答案。
-
-#### 根因：**顶层概览太像"成品"，把检索短路了**
-
-这些 QA 的共同点是**开头读了一眼 speakers summary 就直接作答**。speakers summary 是
-"整段关系的浓缩印象"，里面提过几乎所有主线（家庭、职业、兴趣）。agent 看到问题沾边，
-就凭印象凑一条答案 —— 它**有把握**（因为印象里确实提过"家庭背景"），于是不去核对。
-浓缩成品 = 一条"看起来够用"的捷径，而捷径一旦存在，模型就会走。
-
-**这不是加规则能修的。** "检索要彻底"这类叮嘱在 8B 上反复失效（§2.9 已多次记录）。
-能修的是**类别判断**：既然"给成品"会诱导跳步，那就**不给成品**。
-
-#### 改法：删掉成品，砍成一个朴素 loop
-
-1. **删掉 speakers summary 这一层**（add 回到两步）。开场只给一份**会话清单**
-   （`session_N (时间)`，不含任何事实）—— 它是路标，不是答案。
-2. **删掉 `next(discard, add)` 上下文块控制工具与整套 stage 机制**，回到**一个 agent loop**：
-   `read` / `edit` / `bash` 三个工具 + 一份简短引导（这题该关键词检索还是通篇读，**由 agent
-   自己选**）。
-3. **唯一新增的引导**是一段 8 行的策略表（§2.2）：关键词检索 vs 通篇读，各给**判据 + 一句做法**，
-   **不给流程**。加一句 `write from what you READ, never from what you assume` 针对编造。
-
-#### 效果（同一目录、同一 judge、Caroline_Melanie）
-
-| | 旧（印象判答 + 逐 session） | 新（朴素 loop） |
-|---|---|---|
-| **judge_accuracy** | 31.6% (48/152) | **59.1% (78/132)** |
-| evidence_recall | — | 0.633 |
-| unsupported_rate | — | 0.083 |
-| token_f1 | — | 0.426 |
-| single_hop | 32.9% | **63.5%** |
-| temporal | 10.8% | **60.0%**（recall 0.80） |
-| multi_hop | 34.4% | **57.7%** |
-
-**检索密度**：旧版全量 **2 次 bash 调用**；新版单目录 **500+ 次**（每个 QA 平均 3-20 步
-真检索）。**这就是全部差别**：同样是 8B 模型、同样的语料，只是把它从"看一眼印象就答"
-逼回"必须真去 grep"。
-
-#### 修掉的两个 harness 级 bug（与模型能力无关）
-
-跑完新流程后仍有 23 条**零证据** QA 直接失败。逐条看轨迹，其中两个根因是**我们的工具**：
-
-- **`grep "a|b"` 没加 `-E`**：基本正则里 `|` 是**字面竖线**，这条命令永远匹配不到东西、
-  返回空，模型据此认定"库里没有"。实测一次全量 **95 次带 `|` 的 grep 有 63 次没加 `-E`**
-  （qa2 连查 12 次全是这种空 grep）。**harness 现在自动补 `-E`** 并在观测里说明修正
-  （`tools._fix_grep_alternation`）—— 这是"工具该替模型兜住的错"，不是 prompt 能解决的。
-- **`edit` 缺 `path`**：8B 写证据时常常只给 `append`、忘了 `path`，旧行为是报
-  `path must be a string, got NoneType`，然后它把**整条一模一样的调用重复 10 次**（每次
-  被重复检测拒掉），12 步烧光、0 条证据。现在缺 `path` 默认 `evidence.jsonl`。
-
-#### 仍未解决：open_domain（反事实题）从 77% 掉到 25%
-
-诚实记录：这一类（"Caroline 会不会信教""会不会写书"）旧版反而更高（77%）。原因是旧版
-凭印象作答时，对这类**没有单一事实、要拿全局印象做推理**的题恰好蒙对得多；新版逼它去
-检索，而库里根本没有一条消息直接说"她信不信教"，它检索一圈后要么返回 `null`（证据不足）、
-要么给个无锚点回答（qa77 答 "soon"）。**这类题的正确解法是"检索少量关键事实 + 让 answer
-阶段从证据推理"，而不是在 search 阶段硬找"那句不存在的话"** —— 属于 §2.2 说的
-"哪些判断该留给下游"的问题，待办。但代价是值得的：用它的 4 个点换 temporal +49 点、
-single_hop +31 点、multi_hop +23 点。
-
-
-### 2.17 又一次大改：引入跨会话索引，31.6%→59.1%→等待新数字
-
-§2.16 把 search 从"印象判答"救回"必须真检索"（31.6%→59.1%）。但 59.1% 的跑次
-（`search_20260930_173758`）逐条看 INCORRECT，**检索已经发生了**（141 条 QA 里 0 条零
-bash），瓶颈换成了两处：
-
-1. **时间推理仍不稳**：temporal 类 16 条答错、9 条找到了却**算错**；只有 7/37 条用了
-   `date -d` —— 模型习惯把会话日期直接当事件日期写（正是 §2.4 反复强调、却仍会犯的错）。
-2. **跨会话联系收不全**：cat1 multi_hop 平均要跨 **2.41 个 session**（最多 7 个），而 agent
-   逐 session 读时"读到后面忘了前面"；只有 33/152 条 QA 读过定位层。散落在几次会话里的
-   同一件事（"Caroline 为帮孩子做过的事"分散在 4 次会话）总是只收到一部分。
-
-#### 改法：把定位层从"摘要"换成"索引"
-
-**删掉 `session_summaries`，改成 `index.jsonl`**（设计见 §1.1）：逐会话抽 `(主体, 关系, 对象)`
-三元组，合并同一关系在不同会话的出现，每条标注它出现在哪些 session/msg_id/源话时间词。
-
-| | 摘要（已删） | 索引（当前） |
-|---|---|---|
-| 形态 | 一段浓缩成品 | 一条条 (s,r,o) + 来源标注 |
-| agent 拿它干什么 | "哦大致讲了这些" → 常不读原文 | "这事在 session 2、8、13 都出现过" → 去读原文核对 |
-| 跨会话连接 | 无（每会话独立） | **合并后有**（一条记录带多个 session 号） |
-
-同时按 §2.16 的教训继续**做减法**：search agent 不再有 `next`，只剩 `read`/`edit`/`bash`；
-引导由"关键词检索 vs 通篇读"两条改为"grep 索引 / grep 原文 / 读整段会话"三条（§2.2）；
-system prompt 明确**核心目标**是产出符合证据标准的 `evidence.jsonl`。
-
-（本节待新跑次数字回来补齐效果对比表。）
-
-### 2.18 又一次大改：不做导航层，直接把消息消解成上下文无关
-
-§2.17 的 `index.jsonl`（扁平三元组）与 §2.18（原）的 `nodes/edges` 图，都是为"跨会话定位"
-**额外造一层导航**：agent 先 grep 指针，再回头读原文。这条路有效，但始终是**两层**——指针
-会漏、会压缩、措辞与原文不一致，agent 得在"指针"和"原文"之间来回对。这一版**把导航层整个
-去掉**，改成**把每条消息本身改写成自足的**（`add/resolve.py`）：
-
-- **时间消解**：把相对时间锚定成**绝对时间**或**带绝对锚点的相对时间**，粒度严格照源话
-  （`last year` → `2022`，不编月日），并标注 `time_kind` = point / range / approx。
-- **指代消解**：`she`/`it`/`there` → 真名 / 真实地点，逐消息、喂前文消息作上下文。
-- **原话保留**：消解结果进 `content`/`time`，原话进 `source_content`/`source_time`
-  （溯源 + re-resolve 幂等的底）。
-
-于是 grep 命中的**就是能回答问题的原料**，不需要指针，也不需要回头对原文；同一实体跨会话
-都写成同一个真名，`grep -rin NAME inputs/sessions/` 一次命中它的全部会话——这正是图"边带
-session 号"想做的事，但不需要单独一层。
-
-**为什么值得再把图也砍掉**（三条，都是"少一层结构"的收益）：
-
-1. **单一事实源。** 图是原文的**压缩**，压缩就有损；消解是原文的**改写**，无损（原话还在
-   `source_*`）。agent 只需读一种东西。
-2. **两种检索策略更自然。** 关键词直达（策略①）直接命中自足句；通读（策略②）时每个会话
-   文件也自足——不会"读到后面忘了前面"。而图路线下，两种策略都要先经"指针"这一跳。
-3. **增量更简单。** 图要"逐会话重抽 + 全局重新合并"；消解只需"重新消解那一个会话文件"
-   （读原始视图，天然幂等），没有跨会话的合并态要维护。
-
-代价说清楚：消解是 **O(消息数)** 次 LLM 调用（图是 O(会话数)×逐消息，两者同量级），且
-**消解质量直接决定检索质量**——消解错了（把事件时间写成会话时间、把代词解成错的人）就会
-固化进语料。所以 prompt 里把三条时间硬约束（自足 / 精度只减不增 / 区分点段大概）写成规则，
-并对每条消息都给出**会话时间锚点**（`source_time`）。
-
-（本节待新跑次数字回来补齐效果对比表。）
-
-
 
 ## 3. answer — 从证据作答
 
@@ -1540,14 +1103,15 @@ python scripts/analyze_atommem_results.py data/eval_runs/atommem_test_*/eval_ato
 每次运行创建 `data/eval_runs/{experiment}_{YYYYMMDD_HHMMSS}/`，目录包含对应的
 `eval_baseline.jsonl`、`eval_rag.jsonl` 或 `eval_atommem.jsonl` 以及 `summary.json`。
 summary 按 LoCoMo category 1-5 输出指标；category 5 (`adversarial_skip`) 只记录结果，不参与评分。
-模型地址、生成模型、judge 模型和 embedding 模型分别配置在 `configs/baseline.yaml`、
-`configs/rag.yaml`、`configs/atommem.yaml` 和 `configs/judge.yaml`。
+模型地址与生成模型配置在 `configs/baseline.yaml` / `configs/rag.yaml` / `configs/atommem.yaml`，
+judge 部分读 `configs/judge.yaml`。**这几个文件当前不在仓库里**（它们随独立的对照环境维护），
+缺失时脚本用内置默认值 —— 要复现那组对照数字，需要自己按上面的模板建齐。
 
 embedding 服务需要以 embedding 模式启动：
 
 ```bash
 sglang serve \
-  --model-path /root/autodl-tmp/Train/model/Qwen3-Embedding-4B \
+  --model-path <你的 embedding 模型目录> \
   --port 30001 \
   --is-embedding \
   --mem-fraction-static 0.30 \
@@ -1558,630 +1122,15 @@ sglang serve \
 
 ---
 
-## 附录 A · 运行辅助
+## 延伸阅读
 
-### A.1 一条命令跑通三步（`scripts/run_eval.py`）
-
-search 是改动最频繁的一步，而完整流程是三步、各有自己的 CLI 与产物路径。这个脚本把它们串起来，
-并把**该看的数字**摆成一张表：
-
-```bash
-python scripts/run_eval.py                        # 默认：1 个目录 × 前 5 条 QA，判分
-python scripts/run_eval.py --tag v5-time-rule     # 打标记，便于和上一版对比
-python scripts/run_eval.py --limit 0              # 0 = 全部 QA（慢）
-python scripts/run_eval.py --no-answer            # 只跑 search，看 evidence 产出
-python scripts/run_eval.py --no-judge             # 跑完三步但只算 CPU 指标（省 judge 调用）
-python scripts/run_eval.py --reuse search_20260929_183148   # 复用 evidence，只重跑 answer+eval
-python scripts/run_eval.py --quick                # 冒烟：--max-steps 8 --limit 3
-```
-
-输出长这样（含按 category 拆开那一栏 —— temporal 是时间规则改动的直接反馈）：
-
-```
--- search --
-  目录                           QA  evidence      步数      充分
-  Caroline_Melanie       5/5             23      61    80%
--- eval（整体）--
-  judge_accuracy   0.600     evidence_recall  0.550     unsupported_rate  0.200
--- eval（按 category）--
-  category           n    judge   recall    unsup
-  temporal           3    0.667    0.700    0.000
--- 失败归类 --
-  missing_evidence      1   → 修 search：该找的没找到
-```
-
-**默认只跑前 5 条 QA**，不是全量 —— 几十条就能看出 prompt 改动的方向对不对；全量给
-`--limit 0`。**步数上限默认 16**（与 `configs/search.yaml` 的 30 同一量级；这个值实测过得
-+3.7 个点，见 §S20），要"快反馈"用 `--quick`（= 8 步 / 3 条）。两处设计上的细节值得一说：
-
-- **它接的是"这一次"的运行目录，不是"最近一次"。** 各步骤原本各自取最近一次，而调试时很容易
-  接错 —— 比如你刚跑过一次无关的 `--dry-run`（它也会建目录）。这里改成"跑前记下已有目录、
-  跑完取差集"。
-- **eval 强制带 `--experiment eval`。** eval 默认把 `summary.json` 写进 `--output-dir`，
-  而 search 已经在那里放了一份 —— 不加前缀就会**覆盖掉**，于是"这次 search 跑了多少步、
-  多少条 evidence"当场丢失，而摘要正要读它。现在写的是 `eval_summary.json`，两份并存。
-
-### A.2 自测
-
-纯 CPU、零模型成本、零网络（假模型 + 真工具）：
-
-```bash
-python scripts/test_search.py       # 全链路断言（含两项静态检查）
-python scripts/test_api.py          # 封装 API 自测（37 项）
-```
-
-`test_search.py` 开头是两项**静态检查**（都纯 AST，不用跑起来）：
-
-- **无未定义引用**：确保没有"调用了但没定义/没导入"的名字 —— 重构最容易留下的就是它。
-- **无过时关键字参数**：调用处传的 `kwarg=` 必须真的存在于签名里。
-  这一条是**实测补上的**：删掉向量索引时去掉了 `run_qa` 的 `index_dir` 形参，但调用处还留着
-  `index_dir=index_dir` —— 全量自测 304 项全绿（测试文件自己也传了这个参数，而测试里那个名字
-  恰好还存在），一上真机就 `NameError`。**形参与实参是两个地方，删一个不等于删另一个。**
-
-### A.3 常见问题
-
-**路径里的反斜杠**：Git Bash 下 `H:\Project\...` 的反斜杠会被 shell 吞掉，请用正斜杠。
-
-**输出被截断（`finish_reason=length`）**：某些模型会消耗大量 reasoning token，且这些 token
-计入 `max_tokens`。日志出现 `TruncatedCompletion` 时调大 `max_tokens`。
-
-**`chat_template_kwargs` 报 400**：该参数只对模型名含 `qwen3` 的端点发送，其它端点自动跳过。
-
-**embedding 的两个实测坑**：
-- **400 且提到 tokenizer 端口连不上** —— 并发压力下的瞬时故障，与请求内容无关，报错信息具
-  误导性。已按 `chunk_size` 分批 + 每批退避重试；批越小越稳（批 64 实测 3/3，批 512 只有 1/3）。
-- **`cudaMalloc failed: out of memory`** —— embedding 模型要占 GPU，腾显存后再跑。
-
-**远端 API key**：`configs/*.yaml` 里的 key 是明文，`.gitignore` 已排除 `configs/`，注意不要提交。
-
----
-
-## 附录 B · TODO
-
-**已完成的架构重构**（2026-09-27）：围绕 add / search / answer / eval 四个步骤重组，
-共享层提到 `codemem/` 顶层（`io` / `llm` / `log` / `dataset`）。
-删掉了 v2 的动作空间版（`evomem.py` + `evoactions.py`，git HEAD 仍可找回）。
-
-- [x] **S0** `evidence_to_ids` 解析 bug 已修（空格分隔多引用 `"D9:1 D4:4 D4:6"` 与 `"D:11:26"`
-      都能解析）—— 现由 `dataset.evidence_to_ids` 唯一实现
-- [x] **S1** 更严格的 CPU 不变量：`evidence.jsonl` 的校验（`content` 非空、
-      `metadata.source` 非空且元素合法、重复 id 拒绝…）在 `search/evidence.py`
-- [x] **S3** search 步骤（code-agent 式证据构建）：见 §2
-- [x] **S4** answer / eval 两个步骤打通，`answers.jsonl` + `eval.jsonl` 端到端可跑
-- [x] **S5** 静态回归网：`test_search.py` 用 AST 扫全包，杜绝"调用了但没导入"
-- [x] **S6** add 只留 session summary（当时删掉了顶层 speakers summary）；search 简化为
-      「检索就是 grep」的搜索 agent；补上时间精度规则（见 §2.3 / §2.4）；删掉向量检索与检索 CLI
-- [x] **S7** `scripts/run_eval.py` 一条命令跑通三步并打印摘要；补一项静态检查
-      （过时关键字参数 —— 它正是 S6 在真机上炸的那个错因）
-- [x] **S8** 封装 API（Add / Search）：多用户隔离、request_id 幂等、复用 search agent 管线、
-      多模态降级（见 §4）
-- [x] **S9** 证据标准抽为独立 prompt 段 `EVIDENCE_STANDARD`；`edit` 加 append 模式、删掉 `write`
-- [x] **S10** **从 bad case 反推的大改**（2026-09-30，见 §2.16）：删掉顶层 speakers summary
-      （实测它把检索短路 —— 150/152 条 QA 一次 grep 都没做）、删掉 `next` 上下文块控制工具与
-      整套 stage 机制，search 砍成**一个朴素 agent loop**；唯一引导是"关键词检索 vs 通篇读"
-      的策略表（由 agent 自己选）。同目录同 judge：**31.6% → 59.1%**（temporal 10.8%→60%、
-      single_hop 32.9%→63.5%、multi_hop 34.4%→57.7%）。顺带修两个 harness 级 bug：
-      `grep` 缺 `-E` 自动补、`edit` 缺 `path` 默认 evidence.jsonl
-- [x] **S11** **引入跨会话索引**（2026-10-01，见 §1.1 / §2.17）：删掉 `session_summaries`
-      这一层，add 第二阶段改为逐会话抽 `(主体,关系,对象)` 三元组、合并成 `index.jsonl`
-      （每条带它出现在哪些 session/msg/源话时间词）。索引是**导航不是摘要** —— 摘要（无论
-      顶层印象还是逐会话）实测都让 agent 跳过检索。跨会话连接是它的核心价值（multi_hop
-      平均跨 2.41 个 session）。search 侧继续做减法：不再有 `next`，只剩 read/edit/bash；
-      引导改为"grep 索引 / grep 原文 / 读整段会话"三条；system prompt 明确核心目标
-- [x] **S12**（已废弃，被 S13 取代）定位层升级为实体关系图：`nodes.jsonl` / `edges.jsonl`
-- [x] **S13** **消解取代导航层**（2026-10-02，见 §1.1 / §2.18）：删掉 `nodes/edges` 图与
-      `index.jsonl` 一路的"额外导航层"，add 第二阶段改为**逐消息消解**——
-      **时间**锚定成绝对时间或带绝对锚点的相对时间（`time` + `time_kind` point/range/approx，
-      粒度只减不增）、**指代**消解成真名（逐消息、喂前文消息作上下文）、**原话**保留在
-      `source_content`/`source_time`（re-resolve 幂等的底）。产物改为
-      `data/{dir}/sessions/session_N.jsonl`（**一次会话一个文件**）。search 侧：语料是
-      `inputs/sessions/` 目录，两种检索策略（keyword 直达 / 通读相关 session）集成在一个
-      agent loop 里、运行中自行切换；`evidence.jsonl` 同时是**笔记**（相关即可写，不必只写答案）
-- [x] **S14** **三层记忆 + add agent 逐消息抽取**（2026-10-04，见 §1）：把"改写消息本身"
-      升级为**分层**——`msgmem.jsonl`（`type=msg`，原话 + 会话时间锚点，纯 CPU 转换）/
-      `summem.jsonl`（`type=summary`，逐 session 一次 LLM 总结）/ `atommem.jsonl`
-      （`type=atom`，**add agent 逐 message 处理**：复用 search 的 `run_agent_round` /
-      `build_tools` / `ToolCatalog`，默认 `max_step=8`，agent 只填 `memory` + `metadata.{time,
-      role, tag}`，`id`/`source`/`type`/`changelog` 由 `finalize_file` 系统补、并支持合并演化）。记录格式对齐
-      `memory_template.jsonl`。同目录逐 message **串行**（后面的 message 能 grep 到前面已生成的
-      atommem，消解跨 session 指代）、不同目录并行；按 `source` 增量覆盖 = 幂等。search 语料换成
-      硬链的三个记忆文件；api 的 `store.append` 在返回前重建该会话的 summem + atommem。
-      删掉 `add/resolve.py` 与 `add/session.py`
-
-待办：
-
-- [ ] **N0**（最高优先）**open_domain（反事实题）从 77% 掉到 25%**（§2.16 末）：这类题没有
-      单一事实、要拿全局信息推理，而 search 阶段硬找"那句不存在的话"只能返回 null。方向是把
-      少量关键事实检索出来、让 **answer 阶段**从证据推理，而不是在 search 阶段逼它找反事实结论
-- [ ] **N1** 效果评估：跑完整 10 个目录，对比 baseline 的 evidence recall 与 judge 准确率；
-      盯 `sufficient_rate`、eval 的 `failures` 归类、`verifier_sufficient` vs `judge_correct`
-      的背离。§2.15/§2.16 目前只有 Caroline_Melanie 一个目录的数字
-- [ ] **N2** search 的多跳补强：`missing[]` 回灌已实现，可考虑让 verifier 能"点名要某条记忆"
-      （当前只能描述缺口，由 agent 自己检索）—— 零证据的 23 条 QA 是这条的实证
-- [ ] **N3** `ANSWER_PROMPT` 加 `used_ids` 字段（后续做 credit 归因要用）
-- [ ] **N4** search 的强化学习：QA 驱动的证据构建已是一条完整 trajectory（状态 = evidence.jsonl，
-      终局奖励 = judge 答案），可直接在其上做 oracle 轨迹采样 + GRPO
-- [ ] **N5** 三个 baseline 脚本（`eval_baseline/rag/atommem`）与新链路的指标口径统一，
-      使"msgmem / atommem / evidence / 全上下文"四者可横向对比
-- [ ] **N6** 三层记忆的端到端效果评估（S14 尚未跑真实模型）：对比"三层（atommem 检索）"与
-      "单层（消解后消息）"的 evidence recall 与 judge 准确率，验证 atommem 的拆分/消解质量
-- [ ] **N7**（S20 实测得出的新方向）**瓶颈已从"检索覆盖"转到"检索到了但答不对"**：
-      Deborah_Jolene 上把步数上限放到 24 后，evidence_recall 42%、judge 58%，而"参考答案实词
-      确实出现在 evidence 里、答案仍然错"的 QA 仍有约 **20 条**（改动前 15 条）—— 多检索到的
-      事实没有转化成正确答案。下一轮该动 **answer / 判定**（含"同一事实在 evidence 里有多条
-      不同措辞、答案挑了次优那条"这类），而不是继续加检索
-
-（注：`data/*/atommem.jsonl` 的 10 个目录为旧原子记忆体系的遗留数据，格式与 S14 不同。）
-
-### S15: 优化 atommem 时间处理 + 原子粒度（2026-10-06）
-
-**bad case 分析（search_20261005_235035）**：总体准确率 50.8%，temporal 只有 40%、multi_hop 31.8%。
-逐条分析 104 条 INCORRECT，发现三类核心问题：
-
-#### 问题 A: 时间处理过于机械（11/35 temporal 错）
-
-**案例 A1**: 相对时间被硬算成绝对日期，丢失锚点
-
-```
-原始: "my school event last week" (9 June 2023)
-atommem 产出: time="2023-06-02"
-正确答案: "The week before 9 June 2023"
-系统答案: "9 June 2023" ❌
-```
-
-**根因**: `parse_time_expression` 把 "last week" 用 `date -d` 算成了 2023-06-02，但丢掉了原始表达和锚点。
-
-**案例 A2**: 持续时间信息完全丢失
-
-```
-原始: "5 years already!" (9 June 2023)
-atommem 产出: time="2023-07-14"
-正确答案: "5 years"
-系统答案: "0 days" ❌
-```
-
-**根因**: pipeline 只处理了事件时间点，"5 years" 这个持续信息完全丢失。
-
-#### 问题 B: 原子抽取粒度不当
-
-**案例 B1**: 复合概念未拆分
-
-```
-原始: "Luna and Oliver! They are so sweet..."
-atommem 产出: 只有 Oliver 和 Bailey 的独立 atom，Luna 没有
-正确答案: "Oliver, Luna, Bailey"
-系统答案: "Oliver and Bailey" (漏了 Luna)
-```
-
-**案例 B2**: 关键属性被掩盖
-
-```
-原始: "tough as a single parent"
-atommem 产出: "Caroline is up for the challenge of being a single parent."
-正确答案: "Single"
-系统答案: "in a committed relationship" ❌
-```
-
-**根因**: 只关注动作/状态，"single" 这个关键属性被埋没了；没有独立抽一条 "Caroline is single"。
-
-#### 优化方案（S15）
-
-**方案 A: 改进时间处理（P0）**
-
-1. 新增 `metadata.time_expr` 和 `metadata.time_anchor` 字段保留原始时间表达
-2. 修改 `parse_time_expression` 策略：相对时间优先保留 "原表达 (锚点)" 形式，只有精确时点（yesterday）才算成绝对日期
-3. 修改 EVIDENCE_STANDARD：优先使用 `time_expr + time_anchor` 而不是硬算的 `time`
-
-```json
-{
-  "memory": "Caroline talked about her transgender journey at a school event.",
-  "metadata": {
-    "time": "last week (anchor: 9 June 2023)",
-    "time_expr": "last week",
-    "time_anchor": "7:55 pm on 9 June, 2023"
-  }
-}
-```
-
-**方案 B: 改进原子粒度（P0）**
-
-1. 集合成员强制拆分：ATOM_EXTRACTION_SYSTEM 规则 6 新增 "Split compound entities"
-2. 关键属性显式抽取：规则 7 新增 "Extract key attributes explicitly"
-3. 示例补充：添加 "Luna and Oliver" 拆分、"single parent" 属性抽取的示例
-
-**实测效果**：
-- ✓ time_expr/time_anchor 正确产出
-- ✓ "last week" 保留为 "last week (anchor: 9 June 2023)"
-- ✓ "yesterday" 算成 "2023-06-08"
-- ✓ prompt 新增集合拆分 + 关键属性抽取规则
-
-**预期提升**: temporal +15-20%（从 40% → 55-60%），single_hop +10-15%（从 62% → 72-77%）。
-
----
-
-## S16: 从 bad case 逆向的四阶段优化：judge → answer → search → add（2026-10-08）
-
-**起点**：`search_20261008_070515`（atommem pipeline + search agent 全量 152 QA）——
-judge_accuracy **57.6%**、token_f1 0.393、evidence_recall 37.1%、unsupported 11.0%。
-按用户要求**逆向分阶段**（judge → answer → search → add）逐层修，每层用现有数据回归。
-
-### 逐条 bad case 的归类（50 条 INCORRECT / 118）
-
-| 形态 | 条数 | 根因 |
-|---|---|---|
-| **时间坍缩**：evidence/answer 把"X 之前的那周/那天"写成了**会话当天的日期** | 11 | **add 侧**（见下）——不是 search 的错 |
-| **集合成员不全/被抽象**：`stained glass window`→`a piece`、`Oliver, Luna, Bailey`→`Oliver and pup` | 12 | add 的**去重把成员名合并没了** + search 早停 |
-| **检索不到（unsupported）** | 13 | search 对集合/计数题收不全 |
-| **session id 泄漏进正文**：answer `the week before session_3_11` | 2 | evidence 用 session id 当日期锚点 |
-| **judge 把集合子集判成 CORRECT** | 4 | judge prompt 自相矛盾（"多给不算错"压过了 COMPLETENESS） |
-
-### 各阶段改动与实测（`--sample Caroline_Melanie`）
-
-| 阶段 | 改动 | 实测 |
-|---|---|---|
-| **judge** | 删掉一整段冗余 worked examples（行为中性）；新增 `_resolve_anchor_form`：把 add 侧落盘的规范形态 `"last week (anchor: 27 June 2023)"` 按**相对表达同一套逻辑**折算（旧版只抠出锚点 `27 June`，差一周）。 | 基线重判不变（57.6%，基线答案没有 anchor-form）；修完后 answer 侧 +3pt |
-| **answer** | `ANSWER_PROMPT` 大幅精简（~78→~40 行）；时间规则重写：锚定短语**原样保留**、只有精确一天偏移才折算、**禁止把锚点当答案**、**禁止回答里出现 session id/占位符** | 固定 evidence 上 58.5% → **60.2%** |
-| **search** | `time_policy` 加两条：**atom.time 等于它自己的会话日期＝红旗**（add 侧可能坍缩过）、**禁止拿 session id 当日期**；`EVIDENCE_STANDARD` 加第 11 条"正文不写 id/占位符" | 单靠 search 修不动时间题（原子本身是错的），必须先修 add |
-| **add** | ① `atommem_pipeline.parse_time_expression` 改为**委托**给单一事实源 `atommem_time.parse_time_expression`；② 去重加**专有名词守卫**（见下） | 见下 |
-
-### add 的两处根因（本轮的**关键**）
-
-**① 时间解析器是坏的（`date -d` 的陷阱）。** pipeline 自己那份 `parse_time_expression` 直接
-`date -d "<anchor> <expr>"`，两个实测缺陷都直接造成 temporal 答错：
-
-- `date -d "25 May 2023 last saturday"` → **`2023-05-25`**（GNU date 返回的正是会话日期本身），
-  于是 "last Saturday" 被错记成会话当天 —— qa5/qa28/qa29/qa79… 一批题全错在这。
-- 粗粒度表述（"last week"）被压成**单日日期**，丢掉锚点，下游只能照抄这个日期。
-
-修正版 `atommem_time.parse_time_expression` 早就写好了（保留锚点、星期几用 Python 精确折算、
-精度只减不增），但**只有 agent 模式在用**；默认的 pipeline 走的是自己那份坏的。改为委托后：
-`last Saturday`(25 May) → `2023-05-20`、`last week`(9 June) → `"last week (anchor: 9 June 2023)"`。
-全量 atommem：`flat_iso` 106→**37**、`anchored` 79→**136**。
-
-**② 去重把枚举成员合并没了。** `_is_same_fact` 的 token-Jaccard（≥0.6）会把
-`"Melanie has a pet named pup"` 与 `"...named Luna"` 判成同一事实（Jaccard 0.67）——于是
-**Luna / Oliver / Bailey 三条被并进"pup"那条，成员名全丢**（qa52/qa124 的 pet 题死在这）。
-修法：**专有名词不同 ⇒ 不同事实**（新 `_proper_nouns` 守卫）。名字正是区分枚举成员的关键，
-措辞再像也不能并。修完后 atommem 里 `named Luna / Oliver / Bailey` 三条齐全。
-
-### 实测（同一目录、同一 judge）
-
-| 指标 | 优化前 | 优化后 |
-|---|---|---|
-| **judge_accuracy** | 57.6% | **70.9%** |
-| evidence_recall | 37.1% | **51.0%** |
-| unsupported_rate | 11.0% | **5.5%** |
-| token_f1 | 0.393 | 0.395 |
-
-| category | 前 | 后 |
-|---|---|---|
-| multi_hop | 35.0% | **76.2%** |
-| temporal | 57.1% | **72.2%** |
-| single_hop | 65.4% | **71.7%** |
-| open_domain | 62.5% | 50.0%（n=8→10，样本小） |
-
-**同集合口径**（两跑共有的 106 条 QA）：59.4% → **70.8%**（20 条变好 / 8 条变差）。
-
-### 诚实记录：本轮的三个教训
-
-1. **judge 的措辞极度敏感，不能当"顺手简化"的对象。** 试着把 JUDGE_PROMPT 重写得更短，
-   分数在 **46.6% ↔ 61.9%** 之间来回跳（同一批答案）——8B 对"默认 CORRECT/extra 不算错/
-   空答案必错"这些措辞极其敏感。最终**只删了冗余示例块**（行为中性），逻辑一字未动。
-2. **测量口径要先校准。** judge 不能读 `"(anchor: X)"` 形态是**真 bug**，但它同时压低了
-   基线和新跑——所以要先修 judge，否则 new/old 不可比。
-3. **改下游 prompt 修不动上游的数据。** search 的 time_policy 再怎么强调"别用会话日期当事件
-   日期"，只要 atom 的 `time` 本身就是会话日期（add 的错），agent 就会照抄。**根因在哪一层，
-   就必须在哪一层修。**
-
----
-
-## S17: 清理死代码 / 过时配置 + atommem 并行化（2026-10-08）
-
-三件事：**atommem pipeline 并行化**、**删确定死代码**、**修过时/重复的 yaml 与一处配置 bug**。
-
-### atommem pipeline 并行化（效率）
-
-原来是**逐 message 串行**（`run_dir` 的 `for target in targets: await run_message_pipeline(...)`），
-每处理一条就把全库重写一遍。但**每条 message 的抽取其实互不依赖**：
-
-- 召回（`recall_context`）只读 `msgmem`，**不需要**"前 N-1 条已产出的 atom"；
-- id 按各自 `source_id` 独立分配（`_max_suffix(set(), source_id)` 对全新 source 恒为 0）；
-- 去重本就可以是收尾的**一次全局 pass**（保留首次出现，与逐条增量等价）。
-
-改成：全部 message 并发抽取（`asyncio.gather` + `Semaphore(concurrency)`）→ `_dedup_atoms` 一次
-→ 落盘一次。**实测 419 条 message：串行 ~45 分钟 → 并行 ~1 分钟**。agent / agent-v2 模式保持原样
-（串行/并行各自成立）。同时把管道模式不再使用的 `summem` 读取移到 agent 分支里。
-
-### 删除的确定死代码（AST 全仓扫描，含 `scripts/` 与 `__all__` 复核）
-
-| 文件 | 删除 |
+| 想知道 | 去哪 |
 |---|---|
-| `io.py` | `append_jsonl` / `ensure_jsonl` / `resolve_dir` / `default_config_path` / `msg_role` / `msg_kind` / `source_content` / `source_time` / `make_session_record` / `memory_tags` / `memory_speaker` / `dedupe_by_id` / `format_time`（全部 0 引用） |
-| `search/tools.py` | `create_write_tool`（`write` 工具早已删除）+ 级联的 `shrink_notice` |
-| `search/agent.py` | `steps_for_record` |
-| `search/runner.py` | `corpus_files` |
-| `search/evidence.py` | `_try_whole_file` |
-| `add/memory.py` | `load_memories` / `recent_window` |
-| `add/msgmem.py` | `parse_session_datetime` |
-| `eval/judge.py` | 同步版 `judge_answer` |
-| `llm.py` | `complete_sync` |
-| `api/store.py` | `debug_dump` |
-| 各文件 | 十余处未使用 import（`json` / `sys` / `Path` / `field` / 未用的 `_TAG_ALIASES` 等） |
-
-`eval/legacy.py` 与 `scripts/eval_baseline|rag|atommem` 是 core.md §6 记录的**历史对照链路**，保留。
-
-### 修掉的过时 / 重复配置（含一处真 bug）
-
-- **`eval/judge.py` 有两处 `CONFIG_FILE` 赋值**：第一处指向 `configs/eval.yaml`，第二处（模块末尾）
-  却指向**并不存在的** `configs/judge.yaml` —— 于是 `load_config` 一直在读一个不存在的文件，
-  **`eval.yaml` 的 `judge:` 段被静默忽略**。删掉那行后，`eval.yaml` 的 judge 配置才真正生效。
-- **`search.yaml`** 顶部注释写的是"消解后的会话语料（sessions/）"——`sessions/` 早被三层记忆文件
-  （`atommem`/`msgmem`/`summem`）取代。重写抬头；冗余长注释压到 `runner.py` 的 `DEFAULT_CONFIG`（单一事实源）。
-- **`add.yaml`**：`enable_thinking` **重复出现两次**（YAML 后者覆盖前者）；`tool_config` 键**无人读取**
-  （CLI 走 `--tool-config`）——两者都删。注释里"逐 message agent"与默认（pipeline）不符，已更正，
-  并把只被 agent 模式读取的键归到一段。
-- **`answer.yaml` / `eval.yaml`**：删掉过时的远程模型（openlux / gpt-4o-mini，含明文 key）注释块。
-- **`configs/atommem.yaml`**：只被历史 baseline 脚本使用，加抬头注明"历史对照、不参与当前管线"。
-
-### 验证
-
-`python scripts/test_search.py`（470 项）与 `python scripts/test_api.py`（44 项）全绿；
-五个 CLI（add/search/answer/eval/api）`--help` 均可跑；`python -m compileall src/codemem` 通过。
-
----
-
-## S18: 时间形态对齐参考语料 + answer 风格 + 全量 run_eval（2026-10-08）
-
-用户反馈三点，逐一处理。
-
-### ① 时间答案要**照参考的形态**，不要折算成算出的日期
-
-实测（`search_20261008_090757`）：qa28/qa29 参考是 ``"The Friday before 15 July 2023"``，而系统答
-``"2023-07-14"`` —— **算对了，但形态不对**。问题在于：
-
-- judge 未必能复核日期算术（§2.4 早已反复踩）；
-- token F1 直接受损（两个答案 token 几乎不重叠）；
-- 参考语料里 "when" 类答案**绝大多数本身就是** ``"the week/day/weekend before <日期>"`` 这种形态
-  （全库 72 条 anchored-relative，见下）。
-
-**改法：** ``atommem_time.parse_time_expression`` 不再把相对表达折算成绝对日期，而是产出**与参考
-同形的锚定表述**：
-
-| 源（会话时间锚点） | 旧产出 | 新产出 |
-|---|---|---|
-| "last Saturday"（25 May 2023） | `2023-05-20` | `the Saturday before 25 May 2023` |
-| "last week"（9 June 2023） | `2023-06-02` | `the week before 9 June 2023` |
-| "Last Fri"（15 July 2023） | `2023-07-14` | `the Friday before 15 July 2023` |
-| "last weekend"（17 July 2023） | `2023-07-15` | `the weekend before 17 July 2023` |
-| "yesterday"（8 May 2023） | `2023-05-07` | `7 May 2023`（非 ISO） |
-| "last night"（14 August 2023） | `2023-08-13` | `13 August 2023` |
-| "two days ago"（12 July 2023） | `2023-07-10` | `10 July 2023` |
-| "last year" | `2022` | `2022`（不变） |
-
-绝对日期统一写成 ``"7 May 2023"`` 形态（``date -d ... +"%-d %B %Y"``），不再写 ISO。
-另补两处漏洞：数词（"two days ago"）与星期缩写（"last Tues"）之前识别不了。
-
-**answer 侧同步**（``prompts.ANSWER_PROMPT``）：显式禁止把 "the Friday before X" 替换成算出的日期
-（"2023-07-14" 是更差的答案）；日期写 ``"7 May 2023"`` 而非 ISO；并要求**答案要短**
-（短语而非整句，不复述问题）——参考语料很多答案就是一个短语（"mental health" / "Sweden" / "5 years"），
-贴风格既提升 token F1 也更容易判对。
-
-**实测（10 条 temporal QA）**：改前多数答成算出的日期或会话日期；改后 **10/10 与参考逐字同形**：
-
-```
-qa0  7 May 2023                          ✓
-qa5  the Saturday before 25 May 2023     ✓
-qa8  the week before 9 June 2023         ✓
-qa28/29 the Friday before 15 July 2023   ✓
-qa41 the Tuesday before 20 July 2023     ✓
-qa44 13 August 2023                      ✓
-qa54 the week before 23 August 2023      ✓
-qa74 the weekend before 20 October 2023  ✓
-qa79 the Friday before 22 October 2023   ✓
-```
-
-### ② open_domain（LoCoMo cat3，反事实题）偏弱
-
-实测 37.5%（n=8）。逐条看：一半是**弃答**（"Would Caroline be religious?" → null），一半是**方向答反**
-（"Would Melanie enjoy Vivaldi?" 参考 "Yes; classical music"，答 "Unlikely"）。改法是把
-``ANSWER_PROMPT`` 的 counterfactual 段写死：**"would X" 题除非语料对 X 一无所知，否则禁止弃答**；
-要从 X 已显露的偏好/价值**判断方向**（喜欢/做过 → Yes/Likely yes；明确拒绝/冲突 → No/Likely no），
-不要默认 "Unlikely"；输出短句 "<Yes|No|Likely …>; <一句理由>"（与参考同形）。
-
-### ③ `run_eval.py --limit 0` 只跑了 Caroline_Melanie
-
-根因：``scripts/run_eval.py`` 的 ``--dirs`` **默认值写死了** ``["Caroline_Melanie"]``。改为默认
-``[]``（= 全部含 ``msgmem.jsonl`` 的目录），并在文档里说明 ``--limit 0`` 才是全量。
-
-### ④ add 并行的**全局**并发闸门（顺带修的）
-
-上一版把 atommem 改成整目录并行后，``async_main`` 的"目录级 semaphore" + ``run_dir`` 的"message 级
-semaphore"是**两层独立**的 → 跑 10 个目录会有 ``concurrency × 10`` 个并发请求打在模型端点上。
-改成：一个**全局** semaphore，所有目录、所有 message 任务共用（单一上限 = ``concurrency``）。
-
-### 验证
-
-``scripts/test_search.py``（478 项）与 ``test_api.py``（44 项）全绿；``parse_time_expression``
-的 8 个新模式各有断言；all-dirs 重新生成 atommem 走通。跨全部 10 个目录的全量评测留给
-``python scripts/run_eval.py --limit 0``（现在会真的跑全部目录）。
-
-### S18 实测（Caroline_Melanie 全量，`search_anchorfix_20261008_100103`）
-
-| 指标 | 改前（090757） | 改后 |
-|---|---|---|
-| **token_f1** | 0.408 | **0.473** |
-| **open_domain** | 37.5% | **75.0%** |
-| evidence_recall | 48.4% | 52.3% |
-| unsupported_rate | 8.9% | **2.3%** |
-| judge_accuracy | 69.1% | 66.4% |
-| temporal | 76.5% | 70.3%（**定向 10 条 temporal 全对**，见上表）|
-| multi_hop | 71.4% | 52.4% |
-| single_hop | 68.3% | 67.7% |
-
-**同集合口径**（两跑共有的 113 条）：judge 69.0% → 68.1%（**基本不变**）；分项
-open_domain 0.50→0.67、single_hop 0.67→0.69、temporal 0.76→0.76、multi_hop 0.67→0.50。
-
-**诚实说明 multi_hop 的落差**：它**不是**这几处 prompt 改动造成的，而是 search 的逐跑随机性
-（temp 0.2）—— 两次运行 **113 条里有 89 条答案不同**。抽查 qa37（"what did Melanie paint
-recently?"，参考 "sunset"）与 qa24（"ways to destress"，参考 "Running, pottery"）：新跑的
-**evidence 里就没有** sunset / pottery（search 没检索到），answer 无米下炊，与 answer prompt 无关。
-answer 侧本身也有 ±2~3pt 的方差（同一 evidence、只改 STYLE 措辞，multi_hop 在 47.6%~57.1% 之间跳）。
-
-**结论**：锚定时间形态（+token F1）与 counterfactual 强化（+open_domain）是**确定的正向**；
-judge 整体在噪声内持平；STYLE 段保留"先给完整答案"的写法以规避集合题漏成员。
-
----
-
-## S19: S18 的一次回归及其根因（2026-10-08）
-
-S18 落地后用户全量复测：judge **69.1% → 61.7%**，且 `reference="2022"` 答成 `8 May 2023`、
-`"June 2023"` 答成 `next month`、`"July 2023"` 答成 `this month` —— 明显回归。逐条查证后是**两处**
-改动叠加，都定位到了具体机制。
-
-### 根因 1：`EVIDENCE_STANDARD` 第 3 条被改写，把 search agent 带偏
-
-S18 把第 3 条从
-> "Keep a relative phrase AS WRITTEN **and attach its anchor when a reader ... would need it**: '<person>
-> did X 'last week' -- i.e. the week before <session date>'"
-
-改成
-> "Keep a relative phrase AS WRITTEN **with its anchor**: 'last week' -> 'the week before <session date>'"
-
-措辞看着等价，但 8B 的实际行为变了：它开始**照抄 msgmem 的原始相对词**（`last year` / `next month`），
-而不是照抄 atommem 里**已经解算好**的 `time`（`2022` / `September 2023`）。**对照实验**（把旧 atommem 换回来、
-prompt 不变）证明这不是语料问题：qa1 在新旧 atommem 下都答错 → 是 **prompt** 的锅。
-
-**修法：把第 3 条回退到 S18 之前的措辞**（保留 "attach its anchor when a reader would need it" 的原句）。
-
-### 根因 2：`atommem_time` 把月份写成 `the month after 28 August 2023`
-
-S18 让相对表达产出"与参考同形"的锚定表述，但**月份的参考形态是月份名**（`June 2023` / `September 2023`），
-不是 `the month after X`。更糟的是 judge 的 `resolve_relative_date` 只认 `the <unit> **before** X`
-（不认 `after`），于是 `the month after 28 August 2023` 既非参考形态、judge 也解析不出。
-
-**修法：`last/this/next month` 直接产出月份名 + 年份**（`_shift_month`）——`next month` @ 28 Aug → `September 2023`。
-week/weekend/weekday 仍保留 `the <unit> before <anchor>`（那正是参考形态）。
-
-### 实测（Caroline_Melanie 全量）
-
-| 运行 | 状态 | judge |
-|---|---|---|
-| `search_090757` | S17（改动前） | 69.1% |
-| `search_123213` | S18（回归） | 61.7% |
-| `search_fix2` | S18 + 这两处修复 | **72.3%** |
-
-**同集合口径**（fix2 vs 090757 共有的 115 条）：68.7% → **73.9%**；分项 temporal 0.76→**0.85**、
-single_hop 0.67→**0.74**、multi_hop 0.67→0.61（噪声）、open_domain 0.50→0.50。
-
-### 教训
-
-- **search agent（8B）对 prompt 措辞极其敏感** —— 一句"看着等价"的改写就能让它整体换一种行为。
-  任何 search prompt 改动**必须全量跑一次**才能宣布有效，不能用"读起来更清楚"来判断。
-- **"与参考同形"要按每条参考的实际形态定**：日期是 `7 May 2023`、周是 `the week before X`、
-  **月是 `September 2023`** —— 不能一刀切。
-- judge 的解析能力是"答案形态"的硬约束：产出 judge 认不出的形态（`the month after X`）等于答错。
-
-> **另一处试过但**没生效**的修法（记录以免重试）**：qa6/qa17 这类"evidence 里就是一个裸相对词
-> （`next month` / `this month`）"的情况，试过在 answer prompt 里加"用该条记忆里的任何日期把它解析出来"
-> 的规则 —— 实测**不生效**（8B answer 仍原样输出 `next month`），且 0.723 → 0.708 轻微拖累，已回退。
-> 要根治只能在 **search 侧**让 agent 产出带锚点的 evidence（风险高，需整轮复测）。
-
----
-
-## S20: 从 Deborah_Jolene 全量 bad case 反推的一轮审计（2026-10-13）
-
-**起点**：用户报的一组数（`search_20261013_022233`，Deborah_Jolene 全量 165 QA，gpt-4o-mini）——
-judge_accuracy **55.6%**、evidence_recall 32.5%、unsupported 11.5%、token_f1 0.408；
-失败归类 wrong_answer 52 / missing_evidence 19 / judge_error 5。
-
-### 先量噪声：同一份代码跑两遍能差多少
-
-`search_baserep_20261013_030406` 是**同配置重跑**：judge 53.7%（-1.9 点）。逐条比对，
-**165 条里有 27 条的判对/判错翻转**。所以本节所有结论都以**多次重跑的均值**为准 ——
-单次差 2 个点不构成证据。下面每个配置都跑了 3~4 次。
-
-### 逐条 bad case 归因（71 条非 judge_error 的错例）
-
-先按"错在哪一层"分类：以参考答案的实词能否在 **atommem** 里找到为准。
-
-| 形态 | 条数 | 含义 |
-|---|---|---|
-| **答案就在 atommem 里** | **42** | 纯检索行为问题 —— 能找，没去找 |
-| 全语料都没有（含只在图片里的多模态题） | 28 | 语料里确实没有 |
-| 只在 msgmem 里 | 1 | 原子层漏抽了这条 |
-
-72% 错在检索行为上，继续拆"为什么没找到"：
-
-| 现象 | 量 | 证据 |
-|---|---|---|
-| **第一步是 `grep -rin "<说话人>" inputs/`** | **90/165 条 QA** | 说话人几乎出现在每条记录里 → 命中几百行、观测被截断；`broad_grep` 提示全量触发 **81 次** |
-| **从没 grep 过参考答案里那个区分性实词** | 35 条 | qa118 问"Deborah 跟猫做什么"，全程 grep `activity:` 而**从没 grep 过 `cats`** |
-| **疑问句 atom 被当成答案** | 原子层 **6.4%** 是 `"X asks about Y"` | qa88 命中 `session_5_4_3 "Deborah asks about the accomplishments…"` 就收工，而回答那句（session_5_5）**原子层压根没抽出来** |
-| **同域名实体只找到"一个"就停** | ≥8 条 | 游戏题（qa117/125/147/154）、瑜伽姿势题（qa22）：语料里有 5 个游戏名，命中哪个答哪个 |
-
-### 一个不属于"模型不听话"的机制：命中顺序
-
-```
-qa62  "When did Jolene and her partner return home from Rio de Janeiro?"
-  grep -rin "Rio de Janeiro" inputs/   -> 4206 字符；命中顺序 msgmem, summem, atommem
-  atommem（正确）: session_23_1_1  time = "29 August 2023"
-  summem （误导）: "On 30 August 2023, Jolene shared ... had returned from a trip ..."
-  模型写的:        "returned home from Rio de Janeiro on 30 August 2023"   ❌（抄了会话日期）
-```
-
-`grep -r inputs/` 的命中顺序取决于 **readdir**（实测同一个目录里换一个 pattern 顺序都能变），
-而 `summem` 是**整段会话总结**：实测单条 4KB，七条就能把 8000 字符的观测预算吃光，
-`atommem` 里那些**时间已经消解好**的记录一条都轮不到被看到。qa19（atom 明明写着 `2023-01-28`，
-模型却把 `next Saturday` 自己算成 4 February）、qa27（summem 说 "mini retreat on 1 February"，
-atom 说 "the Wednesday before 9 February"）、qa42 全是这个形态：**先看到哪条，就用哪条。**
-
-### 改动（五条）
-
-| # | 位置 | 改动 |
-|---|---|---|
-| 1 | `search/tools.py` | **语料 grep 的命中按记忆层重排**：`atommem -> msgmem -> summem`。只重排、不删改；同层稳定排序；只在"每行都属于这三层、至少命中两层、未被截断"时动，否则原样返回。实测同一 pattern：开头 8000 字符从"6 条 summem 长段"变成"15 条 atom + 7 条 msgmem" |
-| 2 | `audit.py` | **引号里的专名不再漏检**。证据标准本来就鼓励引用源话（`recommending 'Stardew Valley'`），而 `fullmatch("[A-Z][a-zA-Z]{2,}")` 要求整词恰好是大写开头的字母串 —— 带引号就匹配不上，**编造专名里最该抓的那类整类漏掉**。剥掉词首/词尾非字母字符后，同一批 1020 条 evidence 的命中数 24 -> 29 |
-| 3 | `audit.py` | **新增"抄了消息时间戳当事件日期"检查**：被引消息原文里有**精确天偏移**（yesterday / "N days ago" / last night…），而记录写的日期**正好是那条消息自己的会话日期** —— 事件必然发生了偏移，记录里那个日期只能是"说这话的时间"。判据全确定，而且**把正确日期算出来**直接告诉 agent（"the day before yesterday" @ 26 June -> 24 June）。单次 run 上命中 13 条 / 9 个 QA，抽查全是真阳性（qa10/33/43/47/62…，正是前面测出的那一批"差一天"错） |
-| 4 | `tool.json` strategy / time_policy | ① 关键词取问题里**最稀有的实词**，明确**不许拿说话人名字当关键词**；② **疑问句 atom 是路标不是答案**；③ 停下前确认命中的是**问题问的那个**实体；④ **atom 的 `time` 就是结果，别自己重算**（例外仍是"time 等于自己会话日期"这个红旗）；⑤ `next <weekday>` = 消息当天之后**第一个**该星期几 |
-| 5 | `add/atommem_time.py` | 两个**静默失效**的精确折算：`"yesterday morning"` 被 `_normalize_expr` 变成 `"-1 day morning"`，`date -d` 直接解析失败 → 退回"保留 + 锚点"（qa43 的 yoga 因此错成 6 June）；`"the day before yesterday"` **压根不在偏移表里**（qa47 差两天）。两条都补上，并让长表达优先替换（否则 `the day before yesterday` 只剩 `-1 day`）。全库 12806 条 atom 里命中 11 条；**要下次 `add` 才会落进语料** |
-
-配套：`test_search.py` 从 449 项加到 **476 项** —— 新增 §16 audit（这一段此前**一条测试都没有**，
-而它治的是"编造事实配假 source"这类最贵的错）与 §17 命中重排（钉住"只换顺序、不增删内容、
-非语料输出一字不动"）。system prompt 预算 21000 -> 22800（有意增长，注释写明来源）。
-
-### 实测（同目录、同 165 QA、gpt-4o-mini；每个配置 3~4 次重跑）
-
-| 配置 | judge_accuracy（逐次） | **均值** | evidence_recall | sufficient |
-|---|---|---|---|---|
-| A 改动前 @12 步 | 55.6 / 53.7 / 51.5 / 53.4 | **53.6** | 32.7 | 0.32~0.40 |
-| B 仅 prompt（#4）@12 | 53.7 / 52.8 / 54.9 | **53.8** | 34.0 | 0.22~0.28 |
-| C B + 命中重排（#1）@12 | 50.9 / 54.9 / 54.3 / 51.5 | **52.9** | **37.8** | 0.26~0.35 |
-| D C + 步数 12→24 | 59.3 / 58.6 / 54.0 | **57.3** | 40.6 | **0.52** |
-| **E D + 抄锚点检查（#2/#3）** | 55.5 / 59.0 / 59.8 | **58.1** | **42.4** | 0.45~0.55 |
-
-A → E：judge **53.6% → 58.1%（+4.5）**，evidence_recall **32.7% → 42.4%（+9.7）**。
-（合并标准误约 1.57，差 4.5 ≈ t 2.9；n 只有 3~4，属于"方向明确、幅度待更大语料复核"。）
-
-**三条诚实的结论：**
-
-1. **这一轮最大的单点收益是"把评测的步数上限调回配置该有的值"，不是任何 prompt 技巧。**
-   `configs/search.yaml` 写的是 `max_steps: 30`，但 `scripts/run_eval.py` **默认把它压到 12**
-   （那是"快反馈"时代的遗留），而**用户报的那组数字全部来自 12 步的 run**。放到 24：
-   judge 52.9 → 57.3、sufficient 32% → 52%、missing_evidence 23 → 18。步数均值只从 10.0 涨到
-   16.5（agent 一般自己会停），代价是模型调用 +65%。**已把 `run_eval.py` 的默认值改成 24**
-   （注释写明来历），`--quick` 仍是 8。**这条不改代码，只改一个默认值。**
-
-2. **prompt 那五条规则机制上生效、分数上没动。** 行为确实变了：第一步就是说话人名 grep 的
-   QA 从 **90/165 掉到 24/165**，说话人名 grep 占比 22% → 14%，`read` 从 93 次升到 106 次。
-   但 judge 均值 53.8 vs 53.6 是**噪声内的持平** —— 省下来的那一步没有被用在更深的检索上。
-   这几条保留下来是因为它们各自指向一条确凿的失败形态（且不占多少预算），不是因为分数。
-
-3. **命中重排换来的是 recall，不是准确率。** recall 32.7 → 37.8（四次重跑**每一次**都高于
-   基线对应值），judge 却在噪声内略降。也就是说**瓶颈已经不在"检索覆盖"**：C 配置里
-   "参考答案实词出现在 evidence 里、答案仍错"的 QA 从 15.3 涨到 20.3 条 —— 多检索到的事实
-   没有转化成正确答案，压力转移到了 answer 与判定一侧。**这是下一轮该动的地方**
-   （也是 §2.16 末 N0 那条的同一个方向）。
-
-> **样本量提醒**：Deborah_Jolene 只有 165 QA，单次 judge 的标准差约 **2 个点**；上面的
-> "均值"是 3~4 次重跑出来的。要判定 1 个点级别的差异，得继续加重复或换更大语料
-> （`--limit 0` 跑全部 10 个目录，约 1300 QA）。**跨配置比较时不要拿单次数字对齐。**
+| 每一步的完整设计（本文） | §1 add / §2 search / §3 answer / §4 API / §5 eval / §6 baseline |
+| add 的三层记忆与 pipeline | [`add.md`](add.md) |
+| search 的 code-agent、工具契约、两种策略 | [`search.md`](search.md) |
+| **每一轮的实测数字、失败归因、被取代过的设计、里程碑与待办、运行手册** | [`log.md`](log.md) |
+| 快速上手与项目导航 | [`../README.md`](../README.md) |
+
+**本文只写"现在是什么"。** 一个设计之所以长成现在这样，通常是因为前面几版都失败了 ——
+那些失败的形态、数字与归因都在 [`log.md`](log.md) 里；本文只在**结论仍然成立**的地方引用它们。

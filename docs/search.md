@@ -60,9 +60,10 @@
 ```
                        ┌──────────────────── 一次运行的目录 ────────────────────┐
                        │                                                        │
-  data/{dir}/sessions/session_N.jsonl  ──硬链──► inputs/sessions/session_N.jsonl  │
-                       │   （没有向量索引、没有 CLI —— agent 用 grep 检索）         │
-                       │                                                        │
+  data/{dir}/msgmem.jsonl    ──硬链──► inputs/msgmem.jsonl                       │
+  data/{dir}/summem.jsonl    ──硬链──► inputs/summem.jsonl   （没有向量索引、      │
+  data/{dir}/atommem.jsonl   ──硬链──► inputs/atommem.jsonl    没有 CLI ——         │
+                       │                                        agent 用 grep 检索）│
                        │   qa_{idx}/                    ← workspace == bash 的 cwd │
                        │       evidence.jsonl           ← 唯一产物               │
                        └────────────────────────────────────────────────────────┘
@@ -81,24 +82,24 @@
 
 ---
 
-## 2. 语料：消解后的会话文件（一次会话一个）
+## 2. 语料：add 产出的三层记忆
 
-| 位置 | 粒度 | 用途 |
-|---|---|---|
-| `sessions/session_N.jsonl` | 一次会话一个文件，一条消息一行 | **已消解**：时间绝对、指代消解 |
+search 不直接读原始对话，读的是 add 产出的**三个 JSONL 文件**（格式相同，见
+[`docs/add.md`](add.md)）：
 
-**没有摘要层，也没有额外的索引/图层。** 曾经有过两种"摘要"层，实测都被淘汰：**顶层
-speakers summary**（把全部摘要压成一段整体印象）诱导 agent 看一眼就凑答案 —— 152 条 QA 里
-150 条一次 `grep` 都没做；**逐会话 session summary** 则 119/152 条压根不读。后来又有
-`index.jsonl`（三元组）、`nodes/edges`（图）两层"导航"，有效但都是**额外的指针层**。
-这一版**把导航层整个去掉**：add 阶段（`resolve`）直接把每条消息改写成**上下文无关**的
-形式 —— 时间是绝对时间（`7 May 2023`）或带绝对锚点的相对时间（`the week before 9 June
-2023`），指代已换回真名。于是 **grep 命中的就是能回答问题的原料**，同一实体跨会话都写成
-同一个真名（`grep -rin NAME inputs/sessions/` 即一次命中它的全部会话）。
+| 文件 | `type` | 粒度 | 用途 |
+|---|---|---|---|
+| `atommem.jsonl` | `atom` | 逐 message 抽出的原子事实（自足、指代消解、时间锚定） | **首选**：一行 = 一条可回答的事实 |
+| `msgmem.jsonl` | `msg` | 逐条原始消息（原话 + 会话时间戳） | 具体措辞、具体数字/名字的出处 |
+| `summem.jsonl` | `summary` | 每会话一份总结 | 定位"哪次会话谈过这件事" |
 
-`session_template.jsonl` 是唯一的记录格式：`{"msg_id", "role", "time", "content"}`，
-消解后额外带 `time_kind`（point/range/approx）与 `source_content` / `source_time`（原话与
-原始会话时间戳）。**agent 只需理解一种格式。**
+**三个文件三种粒度，各自有用，没有第四层。** 曾经有过两种"印象/概览"层，实测都被淘汰：
+**顶层 speakers summary** 诱导 agent 看一眼就凑答案 —— 152 条 QA 里 150 条一次 `grep` 都没做；
+`index.jsonl`（三元组）、`nodes/edges`（图）两种"导航层"有效但都是额外的指针层，也一并去掉。
+
+之所以是**三个文件而不是"每会话一个文件"**：agent 只需要理解一种记录格式与三个固定路径，
+而不是"每会话一个文件名、要先知道自己该读第几个"。`grep -rin "词" inputs/` 一条命令扫全部
+三层，命中顺序固定（atommem → msgmem → summem）。
 
 ---
 
@@ -106,28 +107,27 @@ speakers summary**（把全部摘要压成一段整体印象）诱导 agent 看�
 
 ```
 data/search_runs/{experiment}_{ts}/{dir}/
-    inputs/
-        sessions/session_N.jsonl  # 只读，硬链（每会话一个文件）
+    inputs/                        # 只读，硬链（三个文件）
+        msgmem.jsonl  summem.jsonl  atommem.jsonl
     qa_{idx}/
-        evidence.jsonl            # 产物（agent 用 edit/bash 生成）
-    {dir}.qa_trajectories.jsonl   # 每 QA 一行：轨迹、步数、工具调用序列、reject、tampered…
-    {dir}.model_calls.jsonl       # 每次模型调用的原始输出（debug 级排错用）
+        evidence.jsonl             # 产物（agent 用 edit 生成）
+    {dir}.qa_trajectories.jsonl    # 每 QA 一行：轨迹、步数、工具调用序列、reject、tampered…
+    {dir}.model_calls.jsonl        # 每次模型调用的原始输出（debug 级排错用）
     summary.json
 ```
 
-`inputs/` 用**硬链**而不是拷贝：省空间。再加一道保险 —— **每个 QA 跑完校验整个会话语料树的
+`inputs/` 用**硬链**而不是拷贝：省空间。再加一道保险 —— **每个 QA 跑完校验整个语料树的
 sha256**，不一致则记 `tampered=true` 并把该 QA 的结果作废（不计入统计）。这是"检测而非防御"：
 bash 理论上能写任何地方，但"检测 + 作废"足够便宜，不值得为此做沙箱。
 
 `qa_{idx}/inputs` 是**一个**指向公共 `inputs/` 的目录链接（不是每 QA 建一整套软链）：
-那些文件在一个运行目录内对每个 QA 完全相同，逐个建链等于把同一组链接复制 152 遍，
-实测浪费 4.2MB（目录 458 个 + 软链 608 个），而全部证据加起来才 45KB。
+那些文件在一个运行目录内对每个 QA 完全相同，逐个建链等于把同一组链接复制上百遍。
 
 链接优先用**符号链接** —— 工具层的路径约束会 `resolve()`，解析后落在工作目录之外，所以
 写 `inputs/...` 会被直接拒绝。Windows 上普通账户建符号链接需要开发者模式/管理员权限
 （`WinError 1314`），`runner.link_dir_or_copy` 会退回**逐文件硬链**：此时 `bash >>` 会写穿到
-源文件（实测确认），收尾的 sha256 校验负责抓到它并把该 QA 作废；`write`/`edit` 的原子替换
-则只会悄悄换掉自己那份链接，源文件不受影响。
+源文件（实测确认），收尾的 sha256 校验负责抓到它并把该 QA 作废；`edit` 的原子替换则只会
+悄悄换掉自己那份链接，源文件不受影响。
 
 ---
 
@@ -160,22 +160,23 @@ export CODEMEM_INPUTS=<run>/{dir}/inputs # 语料目录的绝对路径
 
 ### 4.2 `grep` —— 检索就是它
 
-语料是 `inputs/sessions/` 下的多个 JSONL 文件（每会话一个），一行一条记录，所以 `grep` 直接可用、行号稳定：
+语料是 `inputs/` 下的三个 JSONL 文件，一行一条记录，所以 `grep` 直接可用、行号稳定：
 
 | 动作 | 命令 | 何时 |
 |---|---|---|
-| 全库关键词检索 | `grep -rin "词" inputs/sessions/` | 关键词直达；命中即相关句（已消解，可回答） |
-| 定位相关会话 | `grep -rln "词" inputs/sessions/` | 通读策略第一步：拿到该读哪几个文件 |
-| 通读一个会话 | `read inputs/sessions/session_5.jsonl` | 集合/散布型：从头读到尾 |
+| 三层一起关键词检索 | `grep -rin "词" inputs/` | 首选：命中顺序 atommem → msgmem → summem |
+| 只搜原子事实 | `grep -rin "词" inputs/atommem.jsonl` | 原子已消解，命中通常已接近答案 |
+| 定位相关会话 | `grep -rin "词" inputs/summem.jsonl` | 通读策略第一步：哪次会话谈过它 |
+| 拿一个会话的全部消息 | `grep -in "session_5_" inputs/msgmem.jsonl` | 集合/散布型：逐个会话收成员 |
 
 ```bash
-grep -rin "husband" inputs/sessions/                 # ① 全部会话里 husband 出现在哪
-grep -rln "husband" inputs/sessions/                 # ② 哪些会话文件提到它
-grep -Ein "pottery|camping|painting" inputs/sessions/ | head   # ③ 几个词一起
-read inputs/sessions/session_5.jsonl                 # ④ 通读一次会话
+grep -rin "husband" inputs/                                   # ① 三层一起搜
+grep -rin "pottery|painting" inputs/atommem.jsonl | head      # ② 只搜原子
+grep -rin "camping" inputs/summem.jsonl                       # ③ 哪次会话谈过 camping
+grep -in "session_5_" inputs/msgmem.jsonl                     # ④ 拿这次会话的全部原话
 ```
 
-每条记录自带 `time`（会话时间）与 `msg_id`，所以 agent 从任何一行都能拿到时间锚点，
+每条记录自带 `time`（会话时间）与 `metadata.id`，所以 agent 从任何一行都能拿到时间锚点，
 不必非去找会话首条。
 
 **grep 的退出码 1 是个坑，观测层替它翻译。** `grep` 没匹配时打印空、退出码 1 —— 工具层会附
@@ -204,7 +205,7 @@ echo $(( ( $(date -d "2023-06-17" +%s) - $(date -d "2023-05-08" +%s) ) / 86400 )
 
 | | 形状 |
 |---|---|
-| 输入语料 | `{"msg_id", "role", "time", "content"}`（没有 `metadata`） |
+| 输入语料 | `{"memory", "metadata": {"id", "time", "role", "type", ...}}` |
 | `evidence.jsonl` | `{"content", "metadata": {"source": [...], "score": ...}}` |
 
 **两者不能直接拷贝** —— 从输入搬一行过来会因为缺少 `source` 而被拒。这条是刻意的：
@@ -221,30 +222,31 @@ echo $(( ( $(date -d "2023-06-17" +%s) - $(date -d "2023-05-08" +%s) ) / 86400 )
 单一事实源。既用于渲染注入 prompt，也保留 JSON Schema 以便将来切换为模型原生 `tools=` 参数。
 加载与渲染在 `src/codemem/search/toolcfg.py`。
 
-**上下文预算**：这段文本**每条 QA 都完整注入一次**，所以它的每一句都在跟检索结果抢上下文。
-实测 **12977 字符**，分配如下：
+**上下文预算**：这段文本**每个 round 都完整注入一次**，所以它的每一句都在跟检索结果抢上下文。
+当前 **≈21k 字符**，分配如下：
 
 | 段落 | 字符 | 说明 |
 |---|---|---|
-| system body | 5039 | 两条策略的判据 + 三条 worked example（多跳 / 相对时间 / 遍历） |
-| TOOLS | 2006 | 四个工具的 description + schema |
-| COMMANDS | 1485 | grep 与 date 的用法与示例 |
-| WRITING_POLICY | 1410 | 证据是推导、不是抄的 |
-| TIME_POLICY | 1307 | **时间精度**规则（见 §6.2） |
-| SCHEMA | 611 | evidence 记录字段 |
-| WORKSPACE | 557 | 目录布局与只读规则 |
-| PROTOCOL | 381 | 响应格式 |
+| STRATEGY | 4588 | 两条标准流程 + 频率题 + 特例处理 |
+| EVIDENCE_STANDARD | 3098 | **什么算一条合格的证据**（12 条可核对清单，在 `prompts.py`） |
+| TOOLS | 2435 | 三个工具的 description + args schema |
+| TIME_POLICY | 2293 | **时间精度**规则（见 §6.2） |
+| WRITING_POLICY | 1717 | 证据是推导、不是抄的；不许换措辞重复 |
+| COMMANDS | 1397 | grep 与 date 的用法与示例 |
+| WORKSPACE | 1089 | 三个记忆文件、目录布局与只读规则 |
+| SCHEMA | 692 | evidence 记录字段 |
+| PROTOCOL | 396 | 响应格式 |
+| system body | 3348 | 开场、写文件的时机、硬规则、三条 worked example |
 
-这个数字比删掉向量检索之前**反而大了一点** —— 因为多了一整套时间精度规则和第二条策略。
-换来的是：不再需要维护索引与嵌入服务，也不再需要为"排序为什么是这样"做解释。
-
-`scripts/test_search.py` 里有一条断言把这个上限钉住（`< 13000 字符`）——
+`scripts/test_search.py` 里有一条断言把这个上限钉住（`< 21500 字符`）——
 **涨回去就等于白做这次简化**，所以它该在 CI 里红，而不是等到某次跑完发现步数又不够用了。
+新增一条规则之前，先看看能不能删掉一条旧的。
 
-**为什么走文本协议而不是模型原生 `tool_calls`**：生成模型是本地 `Qwen3-8B`，原生 tool-calling
-的格式遵循度不稳定，而项目已经积累了一整套稳健的文本解析经验（围栏剥离、括号修复、裸 JSON，
-见 `toolcfg.parse_tool_call`）——**所有解析失败路径都退化为"无害的一步"**，这条路更可靠。
-`tool.json` 同时保留 JSON Schema，所以将来换成原生 `tools=` 只改一个适配层。
+**为什么默认走文本协议而不是模型原生 `tool_calls`**：两种都支持，由 `native_tools` 开关决定
+（`configs/search.yaml` 里默认开）。原生 `tool_calls` 把 schema 作为 `tools=` 下发，格式遵循度
+更好，是现在的默认；文本协议则保留给**不遵守**原生协议的模型 —— `toolcfg.parse_tool_call`
+有一整套稳健解析（围栏剥离、括号修复、裸 JSON、`<tool_call>` 块），**所有解析失败路径都退化
+为"无害的一步"**。两条路共用同一份 `tool.json`，所以切换只改一个适配层。
 
 ---
 
@@ -286,25 +288,35 @@ for qa in questions:                            # 每条 QA 一个 workspace，Q
 
 ### 6.1 两种策略（写进 system prompt）
 
-`tool.json` 的 system prompt 里有一段 `# PICK YOUR STRATEGY FIRST`，让模型**先选策略再动手**：
+`tool.json` 的 `strategy` 槽位写进了两条**标准流程**，并明确说"不必一开始就选定，不奏效就换"：
 
 | | 判据（问题长什么样） | 动作 |
 |---|---|---|
-| **A. KEYWORD HOP** | 一个名字/数字/标题/具体事件；"when did X"、"where did X" | grep 定位会话 → 读它 → **拿新词再 grep** |
-| **B. SWEEP** | 答案是**一个集合**或散落在多处；"what activities does X do"、"what books has X read"、"how much has X done with Y" | grep 出所有相关会话，**逐个走完**，边读边收成员 |
+| **Strategy 1 — keyword lookup** | 一个名字/数字/标题/具体事件；"when did X"、"where did X" | grep 定位 → 读它 → **拿新读到的名字/日期再 grep**（多跳） |
+| **Strategy 2 — read through related sessions** | 答案是**一个集合**或散落在多处；"what activities does X do"、"what books has X read" | 用 summem 定位相关会话，**逐个走完**，边读边收成员 |
 
 **为什么必须显式给这两条**：实测 LoCoMo 的标注证据里 **1187/1985 条 QA 只用到 1 个 session**
-（策略 A 的主场），但有 **330 条跨 2 个以上、最多跨 15 个**，另有 57 条是集合型问题。
-两类问题的最优动作相反 —— A 要快、要跳；B 要慢、要覆盖。只写一句"检索要彻底"会让模型在
-B 上过早收手（收不全成员），在 A 上过早发散。
+（策略 1 的主场），但有 **330 条跨 2 个以上、最多跨 15 个**，另有 57 条是集合型问题。
+两类问题的最优动作相反 —— 1 要快、要跳；2 要慢、要覆盖。只写一句"检索要彻底"会让模型在
+2 上过早收手（收不全成员），在 1 上过早发散。
 
 **不做的选择：加一个显式的 plan 阶段**（先跑一次模型调用输出 `{strategy, keywords}`）。
 那会让每条 QA 多一次调用，而 8B 有可能把策略也选错 —— 先把判据写进 prompt，
 用实测判断值不值得显式化（记在 §12）。
 
-prompt 里对 B 有一个额外的机制性保护：`evidence_soft_limit`（默认 12）会在写太多条时提醒
-精简，而 writing policy 明确说**集合型问题应该写进一条记录**（"Melanie's activities include
-pottery, camping, painting and swimming"），而不是每个成员一条。
+策略段里还有三条**实测反推**的硬规则，都不是"更好听"，而是各自对应过一类 bad case：
+
+- **不许拿说话人名字当关键词** —— 实测大多数 QA 的第一步就是 `grep "<说话人>"`，命中几百行、
+  被截断到 8000 字符，白烧一步还只看到一个片段；
+- **疑问句 atom 是路标不是答案** —— 原子层含有 `"<person> asks about <thing>"` 这类记录，
+  按主题 grep 常先命中它，要跟着读进回复；
+- **写具体值，不写类别** —— `"likes classical music"` 回答不了"喜欢哪些古典音乐家"，
+  真正需要的具体名（`"Bach and Mozart"`）通常再读一条 msgmem 就能拿到。
+
+prompt 里对集合题还有一个额外的机制性保护：`evidence_soft_limit`（默认 12）会在写太多条时
+提醒精简，而 writing policy 明确说**集合型问题应该写进一条记录**（"Melanie's activities
+include pottery, camping, painting and swimming"），而不是每个成员一条；EVIDENCE_STANDARD
+第 12 条进一步要求**每条记录必须带来新事实**，禁止换措辞重复同一条。
 
 ### 6.2 时间精度：不得编造源语料没有的精度
 
@@ -409,8 +421,8 @@ prompt 会随历史无限涨（实测 12 步从 3.3k 涨到 4.5k token）。超�
 | # | 不变量 | 动机 |
 |---|---|---|
 | 1 | `evidence.jsonl` 每行必须是 `{content: 非空, metadata.source: 非空数组}`；`score` / `changelog` 系统可补，其余不合规的行 **reject 并在轨迹里记账** | `source` 非空是**反幻觉护栏**：它必须列出真读过的 msg_id，而不是记得或猜的 |
-| 2 | `write`/`edit` 路径必须落在 `qa_{idx}/` 内 | 只读输入不被误写 |
-| 3 | 每 QA 收尾校验**整个会话语料树**的 sha256（逐文件）；不一致 → `tampered=true`，该 QA 作废 | bash 可以绕开 #2，检测成本极低 |
+| 2 | `edit` 路径必须落在 `qa_{idx}/` 内 | 只读输入不被误写 |
+| 3 | 每 QA 收尾校验**整个语料树**的 sha256（逐文件）；不一致 → `tampered=true`，该 QA 作废 | bash 可以绕开 #2，检测成本极低 |
 | 4 | 只补全**系统自有字段**（缺 `changelog` → 补 `created`；缺 `score` → 补 0.5） | 补全语义问题会掩盖失败模式 |
 | 5 | 工具/解析/模型调用失败 = 一次 failed step，记账后继续 | 所有失败路径都退化为无害一步 |
 | 6 | 连续 `no_progress_patience` 步唯一记录指纹没变 → 提前收尾 | 把空转变成机制而不是 prompt 请求 |
@@ -430,29 +442,32 @@ prompt 会随历史无限涨（实测 12 步从 3.3k 涨到 4.5k token）。超�
 | `NOOP` 动作 | 终止由"不再调用工具 + verifier 判定"决定 |
 | 目录内串行 | 语料只读 + 产物 per-QA → QA 级并发 |
 | 展示串渲染（`format_current` / `build_recalled_block`） | agent 只看原始 JSONL，展示串不存在了 —— 顺带消灭了正文污染 bug |
-| 顶层 speakers summary | 见 §2：合成文本，无 msg_id 可回溯，破掉溯源不变量 |
-| 原子记忆（`atommem`）/ 原子抽取模型 / 为其造的 dpo 数据 | 原子把会话结构打碎，且抽取阶段无词表约束 |
+| 顶层 speakers summary | 见 §2：合成文本，无 id 可回溯，破掉溯源不变量 |
+| `index.jsonl` / `nodes`+`edges` 导航层 | 额外的指针层；add 阶段已把时间锚定、指代消解，grep 命中的就是原料 |
 
 **保留复用**：`log.py`（日志）、`judge.py` / `metrics.py`（评测）、`reference/tools.py`
 的工具语义与 `shell_command_prefix`。
+
+> 注：**原子记忆（`atommem`）先删后加**。早先那版原子层在 search 侧被去掉（当时原子抽取
+> 无词表约束、质量不稳）；现在它回到链路里，但位置在 **add 侧**，由 pipeline 单次抽取 +
+> 代码级后处理产出（见 [`docs/add.md`](add.md)），search 只把它当三层语料里优先读的一层。
 
 ---
 
 ## 10. 并发与成本
 
 **QA 级并发是这次最大的结构收益**。旧版必须目录内串行，只因为所有 QA 共享一份可变的记忆库；
-现在语料只读、产物 per-QA，QA 之间零共享 → 可以按 `concurrency` 直接并发（唯一的共享是
-只读索引与 embedding 服务，前者只读、后者已有分批与退避）。
+现在语料只读、产物 per-QA，QA 之间零共享 → 可以按 `concurrency` 直接并发。
 
-**成本**：每条 QA ≈ `max_steps(≤30) + verifies(≤2)` 次 `Qwen3-8B` 调用，system 段约
-**12977 字符（约 3.2k token）且固定**，可命中 prefix cache。单目录 199 条 QA 最坏约 6000 次
-本地 8B 调用。先用 `--max-qa 3 --max-steps 8` 试跑。
+**成本**：每条 QA ≈ `max_steps + verifies` 次生成调用，system 段约 **21k 字符（约 5k token）
+且固定**，可命中 prefix cache（上限由 `scripts/test_search.py` 的断言守着，见 §5）。
+先用 `--max-qa 3 --max-steps 8` 试跑。
 
 **没有索引，也就没有索引的成本**。旧版这一步是整条链路最重的一块：向量索引（一个目录
 17MB）、共享缓存、按 `corpus_sha256` 判失效、跨运行复用。现在这一切都不存在 ——
-语料就是一个 `sessions/` 目录（每会话一个 JSONL 文件），硬链进运行目录（inode 共享，0 额外空间），agent 直接 grep。
-删掉的代码：`index.py`（344 行）、`embedder.py`（115 行）、`searchmem.py`（434 行）、
-`searchctl.py`（531 行）、`timecalc.py`（247 行），合计约 1670 行，以及它们对应的测试。
+语料就是三个 JSONL 文件，硬链进运行目录（inode 共享，0 额外空间），agent 直接 grep。
+删掉的代码：`index.py`、`embedder.py`、`searchmem.py`、`searchctl.py`、`timecalc.py`，
+以及它们对应的测试。
 
 **代价是诚实的**：语义检索能命中"换了种说法"的表述，grep 不能。这个取舍在 LoCoMo 上是划算的
 （多跳靠词面匹配、时间靠算术），但如果将来语料变成用户自由输入的长文本，值得重新评估。
@@ -482,5 +497,8 @@ prompt 会随历史无限涨（实测 12 步从 3.3k 涨到 4.5k token）。超�
    存在的 —— 这个目的靠 prompt 里明确写"用 `date -d`，不要心算"同样能达到。
 3. **按问题类型选策略写进 prompt，而不是加一个 plan 阶段**：多一次模型调用换更稳的策略，
    对 8B 不一定划算（它可能把策略也选错）。先把判据写清楚，看实测再决定要不要显式化。
-4. **文本工具协议（本方案）而非模型原生 `tool_calls`**：对本地 8B 更稳，且 `tool.json`
-   里已存 JSON Schema，日后切换只改适配层。
+4. **默认模型原生 `tool_calls`，文本协议作为兜底（`native_tools` 开关）**：原生函数调用把
+   schema 直接下发，格式遵循度更好，是现在的默认；文本协议保留给不遵守原生协议的模型，
+   `toolcfg.parse_tool_call` 的稳健解析仍在。两条路共用同一份 `tool.json`，切换只改适配层。
+5. **证据标准抽成一份可核对的清单（12 条）而不是散在策略里**：分数掉下来时，"找到没找到"
+   与"写出来的能不能用"要能分开归因 —— 清单里的每一条都能用眼睛验。

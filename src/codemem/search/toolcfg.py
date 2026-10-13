@@ -100,6 +100,12 @@ def _first_json_object(text: str) -> dict[str, Any] | None:
 
     这里刻意不做括号修复：模型偶尔会在命令字符串里用未转义的引号，那种情况下"修"出来的
     对象往往语义已经错了。宁可把这一步判为"没有工具调用"，也不要执行一条猜出来的命令。
+
+    但"多吐一个 ``}``"是另一回事：对象本身**完整且合法**，后面跟了个尾巴。严格解析会报
+    ``Extra data`` 把整条调用丢掉 —— 实测 Qwen3-8B 在 Caroline_Melanie 全量上有 **31 步**
+    栽在这上面，其中 **28 步是 ``edit`` append**，也就是本该写进 ``evidence.jsonl`` 的记录
+    被无声丢掉了。``raw_decode`` 只吃"从某个 ``{`` 起的一个完整 JSON 文档"、忽略其后的字符，
+    它**不会**把非法 JSON 修成合法，所以不吃掉上面那条安全边界。
     """
     # 先试整段（严格 JSON / 代码围栏包裹的 JSON）
     for candidate in (text, _strip_fences(text)):
@@ -112,7 +118,18 @@ def _first_json_object(text: str) -> dict[str, Any] | None:
             else:
                 if isinstance(parsed, dict):
                     return parsed
-    # 再试"文字里夹了一个对象"
+    # 再试"从某个 { 起解一个完整对象，后面的尾巴不管"
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    # 最后试"文字里夹了一个对象"
     for match in _JSON_OBJECT_RE.finditer(text):
         try:
             parsed = json.loads(match.group(0))

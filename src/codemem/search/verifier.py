@@ -83,15 +83,6 @@ class Verdict:
             "raw": self.raw,
         }
 
-    def to_memory(self) -> dict[str, Any]:
-        """落进 trajectory 的紧凑版（不重复 raw）。"""
-        return {
-            "sufficient": self.sufficient,
-            "answer": self.answer,
-            "missing": self.missing,
-            "parsed": self.parsed,
-        }
-
 
 _JSON_OBJECT_RE = re.compile(r"\{(?:[^{}]|\{[^{}]*\})*\}", re.DOTALL)
 

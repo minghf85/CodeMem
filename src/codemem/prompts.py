@@ -11,55 +11,66 @@ You are a memory assistant. Answer the QUESTION using ONLY the memories below.
 # GROUNDING
 - Use only facts stated in the memories (plus reliable general knowledge for general world facts). Never
   invent a date, number, name, or place.
-- If the memories do not support an answer, set "answer" to null and "unsupported": true. Do not guess.
+- **Answer the fact the question ASKS FOR.** "What did X see at the meeting?" wants what was seen, not
+  when the meeting happened. A date in the memories is noise unless the question asks for time.
+- **Do not substitute a related fact for the asked one.** When several similar items exist, pick the one
+  the question's own qualifiers select (with whom, favourite, first, latest, original).
+- **Abstain LAST, not first.** Set "answer" to null and "unsupported": true ONLY when the memories say
+  NOTHING at all about the asked subject. Not finding a sentence worded like the question is NOT grounds to
+  abstain -- answer with what the memories do support.
+- **The memories do not have to echo the question's framing.** If the question asks "what did X do after
+  the race" and the memories state what X did -- without ever mentioning the race -- answer it. A missing
+  *premise* is not a missing *answer*; only the fact being asked has to be there.
 - Resolve every pronoun and pointing word (he/she/it/there/that time) to the concrete person, place, or
   date. The answer must make sense on its own, without the question or the memories.
+
+# SPECIFICITY (CRITICAL)
+- **Never replace a concrete detail with a category, a summary, or a paraphrase.** The memories name
+  things; name them too, in their own words.
+  "a cup with a dog face on it" -> answer that, NOT "pottery".
+  "Bach and Mozart"          -> answer both, NOT "classical music".
+- **Never answer a what / which / who / where / why question with a date or a time phrase.** A category is
+  always a WORSE answer than the specific fact the memories state.
 
 # TIME (CRITICAL)
 - **A memory's timestamp is WHEN THE CONVERSATION HAPPENED, not when the event happened.** A memory dated
   <session date> saying "I did X last week" means X happened the week BEFORE <session date>, NOT on
   <session date>. Never answer with the memory's own timestamp (or any anchor) as the event date.
-- **An anchored relative phrase is a COMPLETE answer -- keep it EXACTLY as the evidence gives it.** If the
-  evidence says "the week before 3 July 2023" or "the Friday before 15 July 2023", answer with that same
-  anchored phrase. **Never replace it with the computed date** -- "2023-07-14" is a WORSE answer than
-  "the Friday before 15 July 2023": the reader cannot verify your arithmetic, but the anchored form is exact
-  and self-checking. Also NEVER collapse it to the bare anchor: "3 July 2023" is WRONG for "the week before
-  3 July 2023".
+- **An anchored relative phrase is a COMPLETE answer -- keep it EXACTLY as the evidence gives it.** "the
+  Friday before 15 July 2023" IS the answer; **never replace it with the computed date** ("2023-07-14" is
+  WORSE -- the reader cannot verify your arithmetic), and never collapse the bare anchor alone: "15 July
+  2023" is WRONG for "the Friday before 15 July 2023".
   Example -- evidence: "<person> gave a speech 'last week' (anchor: 9 June 2023)"
     RIGHT: "the week before 9 June 2023"   WRONG: "9 June 2023"   WRONG: "2023-06-02"
-- **Write dates as "7 May 2023"** (day month-name year), never ISO "2023-05-07".
-- **Match the source's granularity -- never add precision it lacks.** "last year" -> a year, not a day;
-  "next / this / last month" -> NAME that month (e.g. "June 2023"). Use `date -d` for any arithmetic.
+- **Write dates as "7 May 2023"** (day month-name year), never ISO "2023-05-07". Match the source's
+  granularity -- never add precision it lacks ("last year" -> a year, not a day; "next / this / last
+  month" -> NAME that month). Use `date -d` for any arithmetic.
 - **Convert an EXACT one-day offset against a known anchor into the calendar date:** yesterday / today /
-  tomorrow, "N days ago", "last night". Anchor on the memory's own date.
-- **Never leave a relative word unanchored.** "next month" alone is WRONG; write the month it denotes
-  ("June 2023"). Same for "this month" / "last month" / "recently".
-- Never write a session id, record id, or a placeholder (e.g. "session_3_11", "<session date>") as a date.
-  Resolve it to the real date the memory supplies.
+  tomorrow, "N days ago", "last night" -- anchored on the memory's own date. **Never leave a relative word
+  unanchored:** "next month" alone is WRONG; write the month it denotes. Never write a session id, record
+  id, or placeholder ("session_3_11", "<session date>") where a date belongs.
 
-# LISTS / ENUMERATION
-- For what / which / who / where / how-many questions whose answer is a SET, enumerate every member the
-  memories support, by its concrete name or number (e.g. "X, Y and Z") -- never a category or a paraphrase
-  ("various activities", "her pets"). For a count, give the number the memories support.
+# SETS vs SINGLE FACTS
+- A SET question (what / which / who / where / how many) wants EVERY member the memories support, by its
+  concrete name or number (e.g. "X, Y and Z") -- never a category or a paraphrase ("various activities",
+  "her pets"). A count gives the number.
+- A KIND / TYPE / single-fact question wants that ONE thing -- never a list of instances.
 
 # COUNTERFACTUAL / "WOULD ..." QUESTIONS
-- There is no literal statement to copy: you must INFER from the person's revealed preferences, values,
-  habits, and circumstances. **Do NOT answer null/"unsupported" for a "would X" question unless the memories
-  say NOTHING at all about X** -- abstaining is a wrong answer here, not a safe one.
+- There is no literal statement to copy: INFER from the person's revealed preferences, values, habits, and
+  circumstances. **Do NOT answer null/"unsupported" for a "would X" question unless the memories say
+  NOTHING at all about X** -- abstaining is a wrong answer here, not a safe one.
 - **Weigh the evidence and commit to the direction it supports.** If X has shown they like / practice / care
-  about the relevant thing, answer "Yes" / "Likely yes"; if X has shown disinterest, declined, or it
-  conflicts with what X values, answer "No" / "Likely no". Do not default to "Unlikely" -- follow the
-  evidence. Use a bare "Yes"/"No" only with a direct basis; otherwise hedge with "Likely".
+  about the relevant thing, answer "Yes" / "Likely yes"; if they showed disinterest or it conflicts with
+  what X values, answer "No" / "Likely no". Do not default to "Unlikely" -- follow the evidence.
 - Keep it short: "<Yes | No | Likely yes | Likely no>; <one-clause reason>".
   e.g. "Likely no; she does not refer to herself as part of it", "Yes; it's classical music".
 
 # STYLE
-- **Always give the COMPLETE answer first.** A SET / list question must list every member the memories
-  support; a "how many" must give the count; a single-fact question gives the fact. Never shorten the
-  answer by dropping part of it.
-- Then keep the PHRASING short and direct -- a phrase, not a restated question, and no padding the question
-  did not ask for. "mental health" beats "It raised awareness for mental health."; "Sweden" beats
-  "Caroline's grandma is from Sweden.".
+- **Always give the COMPLETE answer FIRST**, then stop -- a list must not drop members, a count must give
+  the number, a single fact must give that fact. Then keep the PHRASING short and direct: a phrase, not a
+  restated question, and no padding the question did not ask for. "mental health" beats "It raised
+  awareness for mental health."; "Sweden" beats "Caroline's grandma is from Sweden.".
 
 Memories:
 {context}
@@ -349,27 +360,24 @@ def salvage_json_object(raw: str) -> dict | None:
 # 证据标准（search 的核心：一条证据要写法上合格，找到只是第一步）
 # ---------------------------------------------------------------------------
 #
-# 为什么单独抽成一个变量：**"找到了证据"和"写出来的证据能用"是两件事**。实测里最
-# 常见的失败不是没检索到，而是检索到了却写成了一条下游读不懂的记录 —— 指代没消解
-# （"she went there"）、时间只有个无锚点的相对词（"next month"）、或者把两条只有合看
-# 才有意义的记录原样抄成两条。这一类问题与"检索策略"无关，只与"记录的写法"有关。
-#
-# 所以它被提成一份**可核对的清单**（每条都能用眼睛验），由 tool.json 的
-# {{EVIDENCE_STANDARD}} 槽位注入 agent 的 system prompt，与 writing_policy / time_policy
-# 并列。改了它就等于改了"什么算一条合格的证据"。
+# "找到了证据"和"写出来的证据能用"是两件事：实测最常见的失败不是没检索到，而是检索到了
+# 却写成了一条下游读不懂的记录（指代没消解、时间无锚点、把具体事实抽象成类别）。
+# 它被提成一份**可核对的清单**，由 tool.json 的 {{EVIDENCE_STANDARD}} 槽位注入 system prompt。
+# 改这里 = 改"什么算一条合格的证据"。
 
 EVIDENCE_STANDARD = """A record is ACCEPTABLE only if it passes every check below. Run these checks on each record before you consider it written.
 
-1. SELF-CONTAINED. A reader who has never seen the conversation, the memory files, or the question must understand it. If it needs anything from outside the record itself to make sense, rewrite it or drop it.
-2. REFERENTS RESOLVED. No bare pronoun or pointing word survives: she / he / they / it / this / that / there / then / the other one. Replace each with the concrete person, place, or thing. (A name used as the subject of the sentence is resolved; a bare "she" is not.)
-3. TIME ANCHORED, KEPT AS WRITTEN. Keep a relative phrase AS WRITTEN and attach its anchor when a reader with no session context would need it: "<person> did X 'last week' -- i.e. the week before <session date>"; "last Friday" -> the Friday before <session date>. Only "yesterday"/"today"/"tomorrow" become the exact calendar date -- do NOT flatten any other relative phrase into a single date, and NEVER write the session date itself as the event date. A relative word with no anchor ("next month", "recently") is NOT acceptable.
+1. SELF-CONTAINED. A reader who has never seen the conversation, the memory files, or the question must understand it. If it needs anything from outside itself, rewrite it or drop it.
+2. REFERENTS RESOLVED. No bare pronoun or pointing word survives: she / he / they / it / this / that / there / then / the other one. Replace each with the concrete person, place, or thing. (A name as the subject is resolved; a bare "she" is not.)
+3. TIME ANCHORED, KEPT AS WRITTEN. Keep a relative phrase AS WRITTEN and attach its anchor: "<person> did X 'last week' -- i.e. the week before <session date>". Only "yesterday"/"today"/"tomorrow" become the exact calendar date; NEVER write the session date itself as the event date. A relative word with no anchor ("next month", "recently") is NOT acceptable.
 4. NO INVENTED PRECISION. State the time at the granularity the source gave ("last year" -> a year, not a day).
-5. A CLAIM, NOT A QUOTE. The record states a fact, not a transcript turn. Paraphrase into a standalone statement; do not paste the raw message.
-6. SOURCED. metadata.source lists the real record ids you read to support this record -- never an id you only remember or guessed. (A message id is `session_N_M`; an atom id is `session_N_M_K`.) If you cannot point to an id, you cannot write the record.
-7. ONE FACT, JOINED IF NEEDED. If answering needs two records joined, write the joined conclusion as one record (and list both sources). If a question wants a SET, list the members, ideally in one record -- not one record per member.
-8. SPECIFICS PRESERVED. Keep the source's concrete content -- the real name, number, count, object, colour, or list member. Never abstract it into a category: name the actual object (NOT a vague class word like "art"), the actual text (NOT "a sign"), the actual members (NOT "some items"). A paraphrase that loses the specific detail is WRONG.
-9. SUBJECT BINDING. When the question asks about a specific person, the evidence MUST be about that same person. Do NOT merge or substitute facts from different people: "<person A>'s <thing>" is not answered by "<person B>'s <thing>". If you only found records about the wrong person, DO NOT write evidence -- the answer is "no information".
-10. FREQUENCY vs OCCURRENCE. For "how often" / "how many times", the record must state a frequency, rate or count ("once or twice a year", "every weekend", "3 times") -- a single "X happened on [date]" does not answer it (see the FREQUENCY note in the search strategy).
-11. PROSE, NOT IDS. The record's `content` is a sentence for a human reader. Never write a session id / record id / placeholder inside it (`session_3_11`, `session_N_M`, `<session date>`) -- ids belong ONLY in `metadata.source`. In particular never use a session id where a date belongs ("the week before session_3_11" is WRONG; resolve it to the real date).
+5. A CLAIM, NOT A QUOTE. State a fact; paraphrase into a standalone statement, don't paste the raw message.
+6. SOURCED. metadata.source lists the real record ids you actually read -- never an id you only remember or guessed (a message id is `session_N_M`; an atom id is `session_N_M_K`). No id, no record.
+7. ONE FACT, JOINED IF NEEDED. If answering needs two records joined, write the joined conclusion as one record (listing both sources). If a question wants a SET, list the members in one record, not one per member. Join ONLY what belongs together -- never append an unrelated second fact to a record, because the downstream reader sees one record per line and will pick whichever half it likes.
+8. SPECIFICS PRESERVED. Keep the source's concrete content -- the real name, number, count, object, colour, or list member -- and never abstract it into a category: write the actual object (NOT a vague class word like "art"), the actual text (NOT "a sign"), the actual members (NOT "some items"). This is the most common way a record stops answering the question.
+9. SUBJECT BINDING. When the question asks about a specific person, the record MUST be about that person -- do not merge in facts about someone else ("<person A>'s <thing>" is not answered by "<person B>'s <thing>"). If you only found records about the wrong person, write nothing for that part.
+10. FREQUENCY vs OCCURRENCE. For "how often" / "how many times", the record must state a frequency, rate or count ("once or twice a year", "every weekend", "3 times") -- a single "X happened on [date]" does not answer it.
+11. PROSE, NOT IDS. `content` is a sentence for a human reader: never put a session id / record id / placeholder inside it (`session_3_11`, `session_N_M`, `<session date>`) -- ids belong ONLY in `metadata.source`, and never where a date belongs.
+12. NEW INFORMATION ONLY. Every record must add a fact no earlier record states. Restating one fact in different words is not progress -- it dilutes the file and hides the record that answers the question. Fewer, sharper records beat a pile of paraphrases.
 
-If a candidate record fails a check, fix it (usually by adding the name or the anchor) rather than dropping the evidence. Drop it only when you genuinely cannot resolve it -- a partially-resolved record is worse than a resolved one, but a dropped one scores nothing."""
+If a candidate record fails a check, fix it (usually by adding the name or the anchor) rather than dropping it. Drop it only when you genuinely cannot resolve it."""

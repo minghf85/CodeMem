@@ -150,6 +150,29 @@ def oversize_notice(records: int, limit: int) -> str:
     )
 
 
+def empty_finish_notice(filename: str, attempt: int, limit: int) -> str:
+    """想收工、但产物一个字都没写时的拒绝提示。
+
+    与 ``write_nudge_notice`` 的分工：那个是**劝**（插一句观测），这个是**拦**（不接受完成信号）。
+    实测 Qwen3-8B 在 Caroline_Melanie 全量上，**18/138 条**跑完两轮 verifier、每轮都在 grep、
+    一个字没写就回复纯文本收工 —— 劝不动，只能拦。
+
+    ``attempt``/``limit`` 是必要的：拦满 ``limit`` 次就放行，否则模型会在这里死循环，
+    而空产物至少还能被记一条失败；卡死连失败都记不上。
+    """
+    return (
+        f"[STOP: {filename} is still EMPTY. You cannot finish yet ({attempt}/{limit}).]\n\n"
+        f"A finished run MUST leave at least one record in {filename} -- an empty file scores "
+        f"zero no matter how well you searched.\n\n"
+        f"Right now, append ONE record for the single most relevant thing you have ALREADY read, "
+        f"even if it does not fully answer the question:\n"
+        f'  {{"tool":"edit","args":{{"append":"{{\"content\": \"...\", \"metadata\": '
+        f'{{\"source\": [\"<id you actually read>\"], \"score\": 0.5}}}}\n"}}}}\n'
+        f"Then keep searching and appending. Do not reply with plain text until the file is "
+        f"non-empty."
+    )
+
+
 def write_nudge_notice(step_count: int, have: int, filename: str = "evidence.jsonl") -> str:
     """"读了很多步却一个字没写"时的强制提醒。
 
@@ -272,10 +295,6 @@ class Step:
         if self.progressed_override is not None:
             return self.progressed_override
         return self.state_before.signature() != self.state_after.signature()
-
-    @property
-    def call_repr(self) -> str:
-        return self.call.describe() if self.call else "(no tool call)"
 
     @property
     def command(self) -> str:
@@ -671,6 +690,8 @@ async def run_agent_round(
     log: Logger,
     observation_max_chars: int = 8000,
     write_nudge_after: int = 5,
+    # 产物为空时最多拒绝几次收工（0 = 不拦，恢复旧行为）。见 empty_finish_notice。
+    max_empty_finish_refusals: int = 2,
     nudge_filename: str = "evidence.jsonl",
     evidence_soft_limit: int = 40,
     max_parse_retries: int = 2,
@@ -697,6 +718,7 @@ async def run_agent_round(
     repeats = _RepeatTracker()
     progress = _ProgressTracker()
     nudged = False
+    empty_finish_refusals = 0
     oversize_warned = False
     consecutive_no_progress = 0
     steps_used = 0
@@ -781,6 +803,21 @@ async def run_agent_round(
                     "short -- if you are writing a large file, write fewer records at a time."})
                 log.warn(f"step {global_step} 输出像被截断的 JSON，注入纠正消息重试"
                          f"（{outcome.parse_retries}/{max_parse_retries}）")
+                continue
+
+            # ---- 想收工、但产物是空的 -> **拒绝这次完成**，逼它先写一条 ----
+            # prompt 里的必须写对 8B 无效（实测 18/138 条空手收工），所以拦在机制层。
+            # continue 不消耗步数，靠 empty_finish_refusals 封顶，避免死循环。
+            if (empty_finish_refusals < max_empty_finish_refusals
+                    and read_evidence_state(evidence_path).unique_ids == 0):
+                empty_finish_refusals += 1
+                messages.append({"role": "assistant", "content": reply})
+                messages.append({"role": "user", "content": empty_finish_notice(
+                    nudge_filename, empty_finish_refusals, max_empty_finish_refusals)})
+                log.warn(
+                    f"step {global_step} 试图在 {nudge_filename} 为空时收工，已拒绝"
+                    f"（{empty_finish_refusals}/{max_empty_finish_refusals}）"
+                )
                 continue
 
             step = Step(index=global_step, round=round_index, reply=reply, call=None,

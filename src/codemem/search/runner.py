@@ -89,6 +89,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 为什么需要它：prompt 里写了"第 4 步前必须写"，但 8B 会无视 —— 实测 12 步全在读、
     # 一次都没写。软约束不可靠，机制可靠。
     "write_nudge_after": 5,
+    # 产物为空时最多拒绝几次"收工"（0 = 不拦）。
+    # 实测 Qwen3-8B：138 条里 18 条烧完两轮 verifier、一个字没写就收工 —— 劝不动，只能拦。
+    "max_empty_finish_refusals": 2,
     # evidence 条数软上限：超过就提醒模型精简（**不硬截断** —— 截断会静默丢证据）。
     # 实测踩到：pump"集合型问题要收全成员"后，模型单事实问题也写 658 条，顶爆上下文。
     "evidence_soft_limit": 12,
@@ -399,10 +402,6 @@ class Workspace:
     inputs: Path                   # = qa_{idx}/inputs（软链到 <run>/{dir}/inputs）
     evidence: Path                 # = qa_{idx}/evidence.jsonl
     shell_prefix: str
-
-    @property
-    def empty_evidence(self) -> bool:
-        return not self.evidence.exists() or self.evidence.stat().st_size == 0
 
 
 def link_or_copy(source: Path, target: Path) -> None:
@@ -948,6 +947,7 @@ async def run_phases(
             log=log,
             observation_max_chars=observation_max_chars,
             write_nudge_after=write_nudge_after,
+            max_empty_finish_refusals=int(config.get("max_empty_finish_refusals", 2)),
             evidence_soft_limit=evidence_soft_limit,
             max_parse_retries=max_parse_retries,
             repeat_limit=repeat_limit,
@@ -1382,7 +1382,7 @@ def summarize_dir(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="search：搜索 agent 的证据构建"
-                    "（read/write/edit/bash；检索靠 grep，时间靠 date -d）"
+                    "（read/edit/bash；检索靠 grep，时间靠 date -d）"
     )
     parser.add_argument("dirs", nargs="*", help="speaker 目录名或路径；缺省处理全部")
     parser.add_argument("--config", default=str(CONFIG_FILE), help="搜索配置（默认 configs/search.yaml）")

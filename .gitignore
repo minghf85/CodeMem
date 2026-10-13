@@ -9,6 +9,7 @@ wheels/
 # Virtual environments
 .venv
 data
+data_backup
 output
 reference
 *.yaml

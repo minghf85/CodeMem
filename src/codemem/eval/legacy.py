@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import math
@@ -181,46 +180,6 @@ def evidence_to_ids(evidence: list[str] | None) -> set[str]:
     return result
 
 
-def format_messages(messages: Iterable[dict[str, Any]], max_tokens: int | None = None) -> str:
-    """Format messages with optional truncation to fit within token limit.
-
-    Args:
-        messages: Iterable of message dicts with id, speaker, text
-        max_tokens: Maximum approximate tokens (estimated as 4 chars per token).
-                   If None, no truncation is applied.
-
-    Returns:
-        Formatted string with messages, potentially truncated from the start.
-    """
-    message_list = list(messages)
-    if max_tokens is None:
-        return "\n".join(
-            f"[{item['id']}] {item['speaker']}: {item['text']}" for item in message_list
-        )
-
-    # Estimate tokens (rough: 4 chars ≈ 1 token)
-    formatted = [f"[{item['id']}] {item['speaker']}: {item['text']}" for item in message_list]
-    total_chars = sum(len(line) for line in formatted)
-    estimated_tokens = total_chars / 4
-
-    if estimated_tokens <= max_tokens:
-        return "\n".join(formatted)
-
-    # Truncate from the beginning, keep most recent messages
-    target_chars = int(max_tokens * 4 * 0.95)  # Keep 95% to leave margin
-    kept = []
-    current_chars = 0
-
-    for i in range(len(formatted) - 1, -1, -1):
-        line_len = len(formatted[i]) + 1  # +1 for newline
-        if current_chars + line_len > target_chars and kept:
-            break
-        kept.insert(0, formatted[i])
-        current_chars += line_len
-
-    return "\n".join(kept)
-
-
 def format_memories_with_metadata(memories: Iterable[dict[str, Any]], max_tokens: int | None = None) -> tuple[str, dict[str, Any]]:
     """Format memories with timestamp and speaker information for context.
 
@@ -336,18 +295,6 @@ def build_answer_messages(
     ]
 
 
-def build_answer_prompt(
-    question: str,
-    context: str,
-    prompt: str = ANSWER_PROMPT,
-    current_date: str | None = None,
-) -> str:
-    """Render the answer prompt into a single string (for logging or debugging)."""
-    if current_date is None:
-        current_date = datetime.now().strftime("%Y-%m-%d")
-    return prompt.format(question=question, context=context, current_date=current_date)
-
-
 def parse_answer_output(text: str) -> dict[str, Any]:
     """Parse a model answer response into a unified dict.
 
@@ -450,10 +397,6 @@ async def complete_with_client(
     request_config = dict(DEFAULT_LLM_CONFIG)
     request_config.update(config)
     return await llm.chat_completion(client, request_config, messages)
-
-
-def complete_sync(messages: list[dict[str, str]], config: dict[str, Any]) -> str:
-    return asyncio.run(complete(messages, config))
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -701,26 +644,3 @@ async def retrieve_by_embedding_async(
     return [item for _, item in sorted(scored, key=lambda pair: pair[0], reverse=True)[:top_k]]
 
 
-async def retrieve_by_embedding_async_old(
-    query: str,
-    messages: list[dict[str, Any]],
-    model_name: str,
-    top_k: int,
-    embedding_client: Any,
-) -> list[dict[str, Any]]:
-    texts = [item["text"] for item in messages]
-    try:
-        response = await embedding_client.embeddings.create(model=model_name, input=[query, *texts])
-    except Exception as exc:  # noqa: BLE001
-        message = str(exc)
-        if "--is-embedding" in message or "embedding model" in message.lower():
-            raise RuntimeError(
-                "Embedding API 未按 embedding 模式启动，请在 sglang 命令中加入 --is-embedding"
-            ) from exc
-        raise
-    vectors = [item.embedding for item in response.data]
-    scored = [
-        (cosine_similarity(vectors[0], vector), item)
-        for vector, item in zip(vectors[1:], messages)
-    ]
-    return [item for _, item in sorted(scored, key=lambda pair: pair[0], reverse=True)[:top_k]]

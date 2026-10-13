@@ -288,11 +288,6 @@ class ParsedFile:
     salvaged: bool = False
     dropped_fragments: int = 0
 
-    @property
-    def needs_rewrite(self) -> bool:
-        """文件形态是否偏离"一行一条"的约定（偏离就必须规范化写回）。"""
-        return bool(self.fallback_used or self.multi_record_lines)
-
 
 def _iter_records(text: str) -> ParsedFile:
     """解析文本里的全部记录。**委托给 ``io.parse_jsonl_text``，不自己实现。**
