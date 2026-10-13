@@ -112,8 +112,11 @@ def test_toolcfg(tmp: Path) -> None:
     check("渲染给出通读相关 session 的策略", "Strategy 2" in rendered or "read through related sessions" in rendered)
     check("渲染说明两种策略可自由混用、不必一开始选定",
           "mix them freely" in rendered or "switch" in rendered)
-    check("渲染给出 keyword 检索的判据（可直接 grep 出词）",
-          "greppable words" in rendered or "pull the greppable" in rendered.lower())
+    # 关键词怎么选：取问题里**最稀有**的实词，且**不许拿说话人名字当关键词**（实测 90/165 条 QA
+    # 的第一步是 `grep "<说话人>"` —— 命中几百行、被截断、白烧一步）。
+    check("渲染给出 keyword 检索的判据（取最稀有的实词）",
+          "RAREST content word" in rendered)
+    check("渲染禁止拿说话人名字当关键词", "Never grep a speaker's name" in rendered)
     check("渲染给出通读的判据（集合/散布型）", "SET" in rendered and "spread" in rendered.lower())
     check("渲染提醒不要猜、要真读到", "never from what you assume" in rendered
           or "do not write the record" in rendered)
@@ -241,7 +244,14 @@ def test_toolcfg(tmp: Path) -> None:
     # 如 "likes classical music" 丢了 "Bach and Mozart"），同样是有意增长。
     # 19950 -> 21000：两条针对实测 bad case 的时间规则（"atom.time == 会话日期 是红旗" +
     # "不许把 session id 当日期"）与证据标准第 11 条（正文不写 id/占位符），都是有意增长。断言继续防非预期膨胀。
-    check("system prompt 控制在 21000 字符内", len(rendered) < 21000, str(len(rendered)))
+    # 21000 -> 22800：三条针对 Deborah_Jolene 全量 165 QA 逐条归因的策略规则（见 docs/core.md S20）——
+    # ① 关键词要取问题里**最稀有**的实词、**不许拿说话人名字当关键词**（实测 90/165 条 QA 的第一步
+    #    就是 `grep "<说话人>"`，命中几百行、被截断、白烧一步）；② **疑问句 atom 是路标不是答案**
+    #    （原子层含 6.4% 的 `"X asks about Y"`，按主题 grep 常先命中它）；③ 停下前要确认命中的是
+    #    **问题问的那个**实体（同域名实体并列时只找到"一个"匹配）。同时把 TIME_POLICY 的
+    #    "atom 的 time 要照用、别自己重算" 与 "next <weekday> = 消息之后第一个该星期几" 写进去。
+    # 这些全部来自逐条 bad case，属有意增长；断言继续防非预期膨胀。
+    check("system prompt 控制在 22800 字符内", len(rendered) < 22800, str(len(rendered)))
 
     # 响应解析
     check("解析裸 JSON", (toolcfg.parse_tool_call('{"tool":"bash","args":{"command":"ls"}}') or
@@ -1336,6 +1346,147 @@ def test_agent_guards() -> None:
     check("过大提醒给出集合型问题的替代写法", "ONE record" in over)
 
 
+def test_corpus_hit_order() -> None:
+    """语料 grep 的命中重排（``tools._prioritize_corpus_hits``）。
+
+    实测动机见该函数的注释：``grep -rin "<词>" inputs/`` 的命中顺序取决于 readdir（同一个
+    目录里换一个 pattern 顺序都能变），而 summem 单条 4KB —— 几条就把 8000 字符的观测预算
+    吃光，atommem 里**时间已经消解好的**记录反而看不到。这里钉住三条性质：重排只换顺序、
+    只认这三种输出、其它输出一个字都不动。
+    """
+    section("17. tools：语料 grep 命中按记忆层重排（atommem -> msgmem -> summem）")
+    f = tools_mod._prioritize_corpus_hits
+    mixed = "\n".join([
+        'inputs/summem.jsonl:5:{"memory": "summary text"}',
+        'inputs/msgmem.jsonl:48:{"memory": "raw text"}',
+        'inputs/atommem.jsonl:68:{"memory": "atom text"}',
+        'inputs/summem.jsonl:9:{"memory": "another summary"}',
+    ]) + "\n"
+    out = f(mixed)
+    order = [line.split("/")[-1].split(":")[0] for line in out.strip().split("\n")]
+    check("三层重排为 atommem -> msgmem -> summem",
+          order == ["atommem.jsonl", "msgmem.jsonl", "summem.jsonl", "summem.jsonl"], str(order))
+    check("重排不增删任何一行", sorted(out.split("\n")) == sorted(mixed.split("\n")))
+    check("同层内保持原顺序（稳定排序）",
+          out.strip().split("\n")[-1].startswith("inputs/summem.jsonl:9:"))
+
+    single = 'inputs/atommem.jsonl:1:a\ninputs/atommem.jsonl:2:b'
+    check("只命中一个文件时原样返回", f(single) == single)
+    plain = "hello\nworld"
+    check("非语料输出原样返回", f(plain) == plain)
+    mixed_other = 'inputs/summem.jsonl:1:a\nsome other line'
+    check("混有非语料行时原样返回", f(mixed_other) == mixed_other)
+    check("没有换行的单行输出原样返回", f("inputs/atommem.jsonl:1:a") == "inputs/atommem.jsonl:1:a")
+    # bash 工具层真的接上了这个重排（不是只有函数在、调用点在别处）
+    src = Path(tools_mod.__file__).read_text(encoding="utf-8")
+    check("create_bash_tool 里调用了重排", "_prioritize_corpus_hits(output_text)" in src)
+
+
+def test_audit(tmp: Path) -> None:
+    """证据审计（``codemem/audit.py``）：只抓机器能**确定判定**的两类问题。
+
+    这段本模块一直缺测试，而它治的正是最要命的一类错 —— agent 编造一条事实、配一个
+    看着可溯源的 source，于是 judge 也判它像真的。实测 1020 条 evidence 里有 24 条
+    与所引来源对不上；其中 qa125 编的 ``'Stardew Valley'`` **整类漏检**：证据标准本来就
+    鼓励引用源话，于是句中专名常被引号包住，而 ``fullmatch("[A-Z][a-zA-Z]{2,}")``
+    要求整词恰好是大写开头的字母串 —— 带引号就匹配不上。下面是这条的回归网。
+    """
+    section("16. audit：确定性证据审计（专名对不上来源 / source 不存在）")
+    from codemem.audit import build_corpus_index, audit_facts
+
+    corpus = tmp / "audit_inputs"
+    corpus.mkdir(exist_ok=True)
+    (corpus / "msgmem.jsonl").write_text(
+        json.dumps({"memory": "I bought it a year ago in Paris.",
+                    "metadata": {"id": "session_2_24", "type": "msg", "role": "Jolene",
+                                 "time": "4:06 pm on 23 January, 2023"}}) + "\n"
+        + json.dumps({"memory": "My snake Seraphim is calming.",
+                      "metadata": {"id": "session_2_25", "type": "msg", "role": "Jolene",
+                                   "time": "4:06 pm on 23 January, 2023"}}) + "\n",
+        encoding="utf-8")
+    (corpus / "summem.jsonl").write_text(
+        json.dumps({"memory": "On 22 March 2023, Jolene mentioned video games and time management.",
+                    "metadata": {"id": "session_10_summary", "type": "summary"}}) + "\n",
+        encoding="utf-8")
+    (corpus / "atommem.jsonl").write_text(
+        json.dumps({"memory": "Jolene bought Seraphim in Paris",
+                    "metadata": {"id": "session_2_24_1", "type": "atom", "role": "Jolene"}}) + "\n",
+        encoding="utf-8")
+    index = build_corpus_index(corpus)
+    check("索引里有三个文件共 4 条记录", len(index.texts) == 4, str(sorted(index.texts)))
+
+    # 编造的专名被引号包住 —— 这正是旧实现整类漏掉的情形
+    fabricated = ("Jolene recommended 'Stardew Valley' for its relaxing gameplay "
+                  "during a conversation on 22 March 2023.")
+    report = audit_facts([(fabricated, ["session_10_summary"])], index)
+    check("引号里的编造专名被抓到",
+          report.count() == 1 and "stardew" in report.findings[0].missing_entities,
+          str(report.findings))
+    check("审计提示里有可执行的下一步", "point it at the source id" in
+          __import__("codemem.audit", fromlist=["audit_notice"]).audit_notice(report))
+
+    # 真实专名不报（Seraphim 来自 session_2_25、Paris 来自 session_2_24 —— 两条都要引）
+    real = "Jolene bought Seraphim a year ago in Paris, as she said on 23 January 2023."
+    check("对得上的专名不报",
+          audit_facts([(real, ["session_2_24", "session_2_25"])], index).clean,
+          str(audit_facts([(real, ["session_2_24", "session_2_25"])], index).findings))
+    # 反过来：只引一条来源，另一条来源才有的专名就该报出来
+    partial = audit_facts([(real, ["session_2_24"])], index)
+    check("漏引来源时该专名会被报出",
+          partial.count() == 1 and partial.findings[0].missing_entities == ("seraphim",),
+          str(partial.findings))
+
+    # source id 不存在 —— 零误报的一类
+    unknown = audit_facts([("Jolene went to Paris.", ["session_99_99"])], index)
+    check("不存在的 source id 被抓到",
+          unknown.count() == 1 and unknown.findings[0].unknown_sources == ("session_99_99",),
+          str(unknown.findings))
+
+    # 句首大写不是实体名（"Through" 不该被当成编造的人名）
+    check("句首大写不误报",
+          audit_facts([("Through it all Jolene kept her calm.", ["session_2_25"])], index).clean)
+    # 月份/星期是正常的时间表达，不是编造的实体
+    check("月份不误报",
+          audit_facts([("Jolene bought it in Paris in October.", ["session_2_24"])], index).clean)
+    # 说话人的名字不算编造
+    check("说话人名不误报",
+          audit_facts([("Jolene stayed calm with Seraphim.", ["session_2_25"])], index).clean)
+
+    # 抄锚点：把被引消息**自己的**时间戳当成事件日期。判据全是确定的（消息原文里有精确天
+    # 偏移 + 正文写的正好是那条消息的会话日期），所以零猜测 —— 而且能把正确日期算出来。
+    (corpus / "msgmem.jsonl").write_text(
+        (corpus / "msgmem.jsonl").read_text(encoding="utf-8")
+        + json.dumps({"memory": "Yesterday my partner and I got back from a trip.",
+                      "metadata": {"id": "session_9_1", "type": "msg", "role": "Jolene",
+                                   "time": "11:46 am on 30 August, 2023"}}) + "\n"
+        + json.dumps({"memory": "Both of us share a love of travel.",
+                      "metadata": {"id": "session_9_2", "type": "msg", "role": "Deborah",
+                                   "time": "11:46 am on 30 August, 2023"}}) + "\n",
+        encoding="utf-8")
+    index2 = build_corpus_index(corpus)
+
+    copied = ("Jolene and her partner returned home from a trip on 30 August 2023, "
+              "as she mentioned in a message.")
+    finding = audit_facts([(copied, ["session_9_1"])], index2).findings
+    check("抄了消息时间戳当事件日期 -> 报出并算出正确日期",
+          len(finding) == 1 and finding[0].anchor_copied
+          == ("session_9_1", "30 August 2023", "29 August 2023", "Yesterday"),
+          str(finding))
+    check("抄锚点的结论指纹非空（否则提示发不出去）", bool(finding and finding[0].describe()),
+          str(finding[0].describe() if finding else ""))
+    notice = __import__("codemem.audit", fromlist=["audit_notice"]).audit_notice(
+        audit_facts([(copied, ["session_9_1"])], index2))
+    check("提示里直接给出正确日期", "29 August 2023" in notice and "NOT 30 August 2023" in notice,
+          notice[:300])
+
+    # 写对了日期就不报（消息原文有 "yesterday" 但正文写的是 29 August）
+    correct = "Jolene and her partner returned home from a trip on 29 August 2023."
+    check("写对日期不误报", audit_facts([(correct, ["session_9_1"])], index2).clean)
+    # 消息原文没有精确天偏移（"last month"）-> 不属于"抄锚点"，交给既有的时间规则
+    vague = "Jolene returned home from a trip on 30 August 2023."
+    check("粗粒度相对词不算抄锚点", audit_facts([(vague, ["session_9_2"])], index2).clean)
+
+
 def test_judge_temporal() -> None:
     """judge 的相对时间折算（纯 CPU）—— 8B 判不准日期算术，所以由代码算。"""
     section("14. judge：相对时间确定性折算")
@@ -1614,6 +1765,19 @@ def test_add_memory_module(tmp: Path) -> None:
           _P("yesterday", "1:56 pm on 8 May, 2023") == "7 May 2023")
     check("parse_time：'last night' 折成前一天 '13 August 2023'",
           _P("last night", "2:24 pm on 14 August, 2023") == "13 August 2023")
+    # 精确单点的两个漏洞（实测各造成一条 temporal 答错）：
+    # ① 时段词后缀让 `date -d` 解析失败 → 精确折算**静默失效**（qa43 的 "yesterday morning"）
+    # ② "the day before yesterday" 压根没进 `_EXPR_OFFSETS`（qa47 的新鱼缸差两天）
+    check("parse_time：'yesterday morning' 仍折成 '5 June 2023'（时段词不该让折算失效）",
+          _P("yesterday morning", "3:56 pm on 6 June, 2023") == "5 June 2023")
+    check("parse_time：'the day before yesterday' 折成 '24 June 2023'",
+          _P("the day before yesterday", "9:17 am on 26 June, 2023") == "24 June 2023")
+    check("parse_time：'the day after tomorrow' 折成 '28 June 2023'",
+          _P("the day after tomorrow", "9:17 am on 26 June, 2023") == "28 June 2023")
+    check("parse_time：'yesterday evening' 也认（时段词是噪声）",
+          _P("yesterday evening", "9:17 am on 26 June, 2023") == "25 June 2023")
+    check("parse_time：长表达优先（'the day before yesterday' 不能被当成 'yesterday'）",
+          atommem_time_mod._normalize_expr("the day before yesterday") == "-2 day")
     check("parse_time：'last year' -> 年份", _P("last year", "5:00 pm on 8 May, 2023") == "2022")
     check("parse_time：'next month' -> 月份名 'September 2023'（照参考，别写 'the month after X'）",
           _P("next month", "1:00 pm on 28 August, 2023") == "September 2023")
@@ -1860,6 +2024,8 @@ def main() -> int:
         test_add_memory_module(tmp)
         test_verifier_rendering()
         test_agent_guards()
+        test_corpus_hit_order()
+        test_audit(tmp)
         test_forgetting_units(tmp)
         test_judge_temporal()
         test_answer_parse()

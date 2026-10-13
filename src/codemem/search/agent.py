@@ -915,7 +915,8 @@ async def run_agent_round(
                 if key and key not in seen_audit:
                     seen_audit.add(key)
                     observation += audit_notice(report)
-                    log.warn(f"step {global_step} 证据审计：{report.count()} 条引用了来源中没有的实体")
+                    log.warn(f"step {global_step} 证据审计：{report.count()} 条与所引来源对不上"
+                             f"（其中抄了消息时间戳当事件日期的 {sum(1 for f in report.findings if f.anchor_copied)} 条）")
         if state_after.duplicate_lines >= duplicate_warn_at and not warned_duplicates:
             warned_duplicates = True
             observation += (

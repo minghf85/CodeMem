@@ -281,6 +281,7 @@ You summarize ONE session of a conversation between {speaker_a} and {speaker_b}.
 - Time, resolved: the session's own date is the anchor. A fact stated as "last week" becomes "the week before {session_date}" (or the exact date when the arithmetic is certain). Never leave a bare relative word.
 
 ## Rules
+- Summarize the session with the same language.
 - Resolve every pronoun and pointing word (he / she / they / it / there / then) to the concrete person, place, or time.
 - Do NOT invent facts, dates, or names that the session does not support.
 - Do NOT add precision the source lacks: "last year" stays a year, not a date.
@@ -368,7 +369,7 @@ EVIDENCE_STANDARD = """A record is ACCEPTABLE only if it passes every check belo
 7. ONE FACT, JOINED IF NEEDED. If answering needs two records joined, write the joined conclusion as one record (and list both sources). If a question wants a SET, list the members, ideally in one record -- not one record per member.
 8. SPECIFICS PRESERVED. Keep the source's concrete content -- the real name, number, count, object, colour, or list member. Never abstract it into a category: name the actual object (NOT a vague class word like "art"), the actual text (NOT "a sign"), the actual members (NOT "some items"). A paraphrase that loses the specific detail is WRONG.
 9. SUBJECT BINDING. When the question asks about a specific person, the evidence MUST be about that same person. Do NOT merge or substitute facts from different people: "<person A>'s <thing>" is not answered by "<person B>'s <thing>". If you only found records about the wrong person, DO NOT write evidence -- the answer is "no information".
-10. FREQUENCY vs OCCURRENCE. If the question asks "how often" / "how many times", the evidence must state a frequency, rate, or count ("once or twice a year", "every weekend", "3 times"), NOT just "X happened on [date]". A single occurrence does not answer a frequency question.
+10. FREQUENCY vs OCCURRENCE. For "how often" / "how many times", the record must state a frequency, rate or count ("once or twice a year", "every weekend", "3 times") -- a single "X happened on [date]" does not answer it (see the FREQUENCY note in the search strategy).
 11. PROSE, NOT IDS. The record's `content` is a sentence for a human reader. Never write a session id / record id / placeholder inside it (`session_3_11`, `session_N_M`, `<session date>`) -- ids belong ONLY in `metadata.source`. In particular never use a session id where a date belongs ("the week before session_3_11" is WRONG; resolve it to the real date).
 
 If a candidate record fails a check, fix it (usually by adding the name or the anchor) rather than dropping the evidence. Drop it only when you genuinely cannot resolve it -- a partially-resolved record is worse than a resolved one, but a dropped one scores nothing."""

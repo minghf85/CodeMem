@@ -14,8 +14,9 @@
     python scripts/run_eval.py --reuse RUN_DIR        # 复用已有 evidence，只重跑 answer+eval
     python scripts/run_eval.py --quick                # = --max-steps 8 --limit 3（冒烟）
 
-**默认参数是"快反馈"配置**，不是全量：小样本、步数偏紧，几十条 QA 就能看出 prompt 改动
-的方向对不对。全量要显式给 `--limit 0`（0 = 不限）。
+**默认只跑前 5 条 QA** —— 几十条就能看出 prompt 改动的方向对不对；全量要显式给
+`--limit 0`。**步数上限默认 16**（实测最佳，来历见 `--max-steps` 的注释；`configs/search.yaml`
+的上限是 30），要"快反馈"用 `--quick`（= 8 步 / 3 条）。
 
 脚本做三件事：
 
@@ -173,7 +174,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="交给 search 的 speaker 目录（缺省 = 全部含 msgmem 的目录）")
     parser.add_argument("--limit", type=int, default=5,
                         help="每个目录处理前 N 条 QA（默认 5；0 = 全部）。这是 --max-qa")
-    parser.add_argument("--max-steps", type=int, default=12, help="每条 QA 步数上限（默认 12）")
+    # 步数上限：**这里曾经写死 12**，而 `configs/search.yaml` 是 30（"集合型问题要读多个
+    # session，按最贵的给"）。Deborah_Jolene 全量做过 A/B（见 docs/core.md S20）：12 -> 16
+    # 让 judge 52.9% -> **57.3%**、sufficient 32% -> **52%**，代价是模型调用 +65%。
+    # 原来那个 12 是"快反馈"时代的遗留 —— 它把**全量**评测也一起压低了，所以改成实测值。
+    parser.add_argument("--max-steps", type=int, default=16,
+                        help="每条 QA 步数上限（默认 16；--quick 用 8）")
     parser.add_argument("--qa", default="", help="只跑指定 QA 下标（逗号/空格分隔），透传给 search")
     parser.add_argument("--tag", default="", help="给这次运行打标记，写进目录名与摘要")
     parser.add_argument("--config", default="", help="search 的 --config（默认用项目默认）")

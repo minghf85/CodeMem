@@ -719,6 +719,49 @@ def _fix_grep_alternation(command: str) -> str:
     return re.sub(r'(\bgrep\b[^"\']*?)(["\'])([^"\']*)\2', fix_one, command, count=1)
 
 
+# 记忆层优先级：已消解的原子 -> 原话 -> 会话总结。与 ``runner.CORPUS_FILES`` 同序。
+_CORPUS_PRIORITY = ("atommem.jsonl", "msgmem.jsonl", "summem.jsonl")
+
+
+def _prioritize_corpus_hits(text: str) -> str:
+    """把"多文件语料 grep"的命中按**记忆层优先级**重排：atommem -> msgmem -> summem。
+
+    为什么需要：``grep -rin "<词>" inputs/`` 是 agent 用得最多的检索，而三个文件的命中顺序
+    **不稳定** —— grep 走 readdir，实测同一个目录里换一个 pattern，顺序都能变。后果不是
+    "顺序不好看"，而是**模型只读得到开头那几条**：``summem`` 是整段会话总结，实测单条 4KB，
+    几条就能把 8000 字符的观测预算吃光，``atommem`` 里那些**时间已经消解好**的记录一条都
+    轮不到被看到。逐条读轨迹确认过两次：qa42 先读到 summem 那句 "On 1 February 2023 ...
+    robotics project"，就写成"项目在 1 February 2023 完成"（真答案是 May 2023）；qa27 先读到
+    "she had a mini retreat on 1 February 2023"，就写成 1 February —— 而 atommem 里同一条
+    事实的 ``time`` 是 "the Wednesday before 9 February 2023"。两次都是"先看到哪条就用哪条"。
+    实测同一 pattern：重排前开头 8000 字符里是 6 条 summem 长段，重排后是 15 条 atom + 7 条
+    msgmem。
+
+    只重排、不删改：同层内保持原顺序（稳定排序），且只在"每一行都属于这三层、至少命中两层"
+    时才动 —— 否则说明不是这种输出，原样返回。
+    """
+    if "\n" not in text:
+        return text
+    lines = text.split("\n")
+    trailing = ""
+    if lines and lines[-1] == "":        # 命令输出通常以换行结尾，末位空串不是一行
+        lines, trailing = lines[:-1], "\n"
+    if len(lines) < 2:
+        return text
+    rank = {name: index for index, name in enumerate(_CORPUS_PRIORITY)}
+    ordered: list[tuple[int, str]] = []
+    for line in lines:
+        head = line.split(":", 1)[0]
+        name = head.rsplit("/", 1)[-1]
+        if "/" not in head or name not in rank:
+            return text                  # 有非语料行 -> 不是这种输出，不动
+        ordered.append((rank[name], line))
+    if len({r for r, _ in ordered}) < 2:  # 只命中一个文件 -> 重排没有意义
+        return text
+    ordered.sort(key=lambda item: item[0])  # 稳定排序：同层内保持原顺序
+    return "\n".join(line for _, line in ordered) + trailing
+
+
 def create_bash_tool(
     *,
     cwd: Path,
@@ -796,6 +839,10 @@ def create_bash_tool(
         # 以为是环境问题 → 换个写法再查 → 又被重复检测拒掉 → 循环到预算耗尽。
         # 观测文本由渲染层统一决定（见 render_observation），工具只负责如实返回空串。
         output_text = truncation.content
+        # 语料 grep 的命中按记忆层重排（atommem -> msgmem -> summem）。只在**没有截断**时做：
+        # 截断过的话尾部的 "[Showing lines X-Y ...]" 是按原始行号写的，重排会让它对不上。
+        if not truncation.truncated:
+            output_text = _prioritize_corpus_hits(output_text)
         full_output_path: str | None = None
         if truncation.truncated:
             full_output_path = _write_temp_output(output)

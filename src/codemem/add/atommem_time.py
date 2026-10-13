@@ -22,7 +22,17 @@ import re
 import subprocess
 
 # 时间表达归一化：口语 → date -d 能理解的相对偏移。
+#
+# **顺序即优先级**：``_normalize_expr`` 是按元组顺序做 ``str.replace`` 的，所以更长的表达
+# 必须排在包含它的短表达前面 —— "the day before yesterday" 里含 "yesterday"，顺序反了就只剩
+# "-1 day"（少一天），正是实测踩到的坑。这两条两天偏移此前**根本没被识别**：模型写
+# "the day before yesterday" 时落到"保留原表达 + 锚点"那一支，于是 atommem 里留下
+# ``"the day before yesterday (anchor: 26 June 2023)"``，而项目口径（§S18）本来要求
+# 「精确单点折算成 '7 May 2023'」—— 下游把它读成锚点 26 June，答案就差两天。
 _EXPR_OFFSETS = (
+    ("the day before yesterday", "-2 day"),
+    ("the day after tomorrow", "+2 day"),
+    ("last night", "-1 day"),
     ("yesterday", "-1 day"),
     ("today", "+0 day"),
     ("tomorrow", "+1 day"),
@@ -33,6 +43,13 @@ _EXPR_OFFSETS = (
     ("next month", "+1 month"),
     ("next year", "+1 year"),
 )
+
+# 一天之内的时段词：折算日期时它们是噪声。实测 ``_normalize_expr("yesterday morning")``
+# 会得到 ``"-1 day morning"``，``date -d`` 直接解析失败（返回空），于是整条表达退回"保留 +
+# 锚点"，`yesterday` 的精确折算**静默失效**（qa43 的 yoga on mount Talkeetna 就是这么错成
+# 6 June 的）。替换掉偏移之后把时段词清掉即可。
+_TIME_OF_DAY_WORDS = re.compile(
+    r"\b(morning|afternoon|evening|night|midday|noon|tonight)\b", re.IGNORECASE)
 
 # 精确星期几：识别 "last Friday" / "next Monday"（缩写 "Fri"/"Tues" 也认）。
 _WEEKDAY_PATTERN = re.compile(
@@ -90,7 +107,9 @@ def _normalize_expr(expr: str) -> str:
     for word, offset in _EXPR_OFFSETS:
         out = out.replace(word, offset)
     out = re.sub(r"(\d+)\s+(day|week|month|year)s?\s+ago", r"-\1 \2", out)
-    return out
+    # 剩下的时段词只是噪声（"yesterday morning" -> "-1 day morning" 会让 date -d 直接失败），
+    # 清掉它们，否则精确折算会静默失效 —— 见 `_TIME_OF_DAY_WORDS` 的注释。
+    return re.sub(r"\s+", " ", _TIME_OF_DAY_WORDS.sub(" ", out)).strip()
 
 
 def _parse_anchor_date(anchor_date: str) -> "date | None":
