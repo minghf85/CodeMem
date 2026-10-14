@@ -25,6 +25,7 @@ from .atommem import (
     _max_suffix,
     _normalize_tags,
 )
+from ..adapters import speaker_pair, speakers_phrase
 
 # ============================================================================
 # Prompt
@@ -32,27 +33,32 @@ from .atommem import (
 
 ATOM_EXTRACTION_SYSTEM = """You are extracting atomic facts from a conversation message.
 
+**WHO THIS SESSION BELONGS TO**: {speakers}
+Every record here carries a `role` naming who -- or what -- it belongs to; `role` in your output
+must be one of the values above. Two different speakers are never merged into one fact
+("<A> does X" is not "<B> does X").
+
 **CRITICAL RULE**: The `memory` field must NEVER contain ANY time expressions.
 Forbidden words in memory: yesterday, today, tomorrow, ago, last, next, past, recent, recently, soon, future, now, currently, presently, before, after, since, until, during, N days, N weeks, N months, N years
 
 Instead:
 - Put the original time expression in `time_expr` (e.g., "yesterday", "last year")
-- Write the memory as a timeless fact (e.g., "speaker_b got married" NOT "speaker_b got married 5 years ago")
+- Write the memory as a timeless fact (e.g., "{speaker_b} got married" NOT "{speaker_b} got married 5 years ago")
 
 **Output format**: JSON array of atoms. Each atom:
 ```json
 {
   "memory": "Pure factual statement WITHOUT any time words",
   "time_expr": "Original time expression from the source message, or empty string if no time",
-  "role": "speaker_a or speaker_b",
+  "role": "one of the speakers listed above, or the record's own role",
   "tag": ["key:value", ...]
 }
 ```
 
 **Rules**:
-1. `memory`: Timeless fact. Resolve pronouns (she/he/it/there → speaker_a or speaker_b). NO time words.
+1. `memory`: Timeless fact. Resolve pronouns (she/he/it/there → the speaker) to the actual name. NO time words.
 2. `time_expr`: Extract original time expression ("yesterday", "last week", "5 years ago"). Leave empty if message has no time reference.
-3. `role`: "speaker_a" or "speaker_b"
+3. `role`: the speaker of the target message -- one of the values listed above.
 4. `tag`: Array of "key:value". Keys MUST be from: speaker, topic, activity, action, event, state, sentiment, relation, entity, possession, time, other
 5. **One atom = one sentence, one fact.** NO multiple sentences in one memory.
 6. **Capture specifics — names, numbers, titles, exact wording**:
@@ -63,55 +69,60 @@ Instead:
    - Object types: "stained glass window" / "cup with a dog face" — NOT "painting" / "pottery"
    - Pet names: when message says "Luna and Oliver" / "another cat named Bailey", you MUST create atoms for Luna, Oliver, AND Bailey — omitting any member is WRONG
 7. **Named lists must enumerate each member**: "Luna and Oliver" → 2 atoms (one for Luna, one for Oliver). "another cat named Bailey" → separate atom for Bailey. NEVER drop members or abstract to a count.
-8. Skip greetings, filler, pure questions without content.
+8. **NOT every record is a person talking.** A record may be a document, a database triple (`Subject | relation | object`), a narration line, or an evaluation record. For those: state the fact exactly as the record gives it, use the record's own `role`, and invent no speaker. `Antibiotics | treats | infection` becomes one atom about that relation -- never "someone said antibiotics treat infection".
+9. Skip greetings, filler, pure questions without content.
 
 **WRONG (abstraction failures — DO NOT do these)**:
 - Message: "I just finished reading Charlotte's Web"
-  WRONG: {"memory": "speaker_b finished reading a book", ...}  ← Lost the title!
-  RIGHT: {"memory": "speaker_b finished reading Charlotte's Web", ...}
+  WRONG: {"memory": "{speaker_b} finished reading a book", ...}  ← Lost the title!
+  RIGHT: {"memory": "{speaker_b} finished reading Charlotte's Web", ...}
 - Message: "These shoes are for running"
-  WRONG: {"memory": "speaker_b got shoes", ...}  ← Lost the purpose!
-  RIGHT: {"memory": "speaker_b got shoes for running", ...}
+  WRONG: {"memory": "{speaker_b} got shoes", ...}  ← Lost the purpose!
+  RIGHT: {"memory": "{speaker_b} got shoes for running", ...}
 - Message: "The posters said 'Trans Lives Matter'"
-  WRONG: {"memory": "speaker_a saw posters about transgender activism", ...}  ← Lost the exact text!
-  RIGHT: {"memory": "speaker_a saw posters saying 'Trans Lives Matter'", ...}
+  WRONG: {"memory": "{speaker_a} saw posters about transgender activism", ...}  ← Lost the exact text!
+  RIGHT: {"memory": "{speaker_a} saw posters saying 'Trans Lives Matter'", ...}
 - Message: "I made a stained glass window"
-  WRONG: {"memory": "speaker_a made art", ...}  ← Lost the object type!
-  RIGHT: {"memory": "speaker_a made a stained glass window", ...}
+  WRONG: {"memory": "{speaker_a} made art", ...}  ← Lost the object type!
+  RIGHT: {"memory": "{speaker_a} made a stained glass window", ...}
 - Message: "We have Luna and Oliver, and another cat named Bailey"
-  WRONG: {"memory": "speaker_b has a pet named Oliver", ...}  ← Lost Luna and Bailey!
-  RIGHT: {"memory": "speaker_b has a pet named Luna", ...}, {"memory": "speaker_b has a pet named Oliver", ...}, {"memory": "speaker_b has a pet named Bailey", ...}
+  WRONG: {"memory": "{speaker_b} has a pet named Oliver", ...}  ← Lost Luna and Bailey!
+  RIGHT: {"memory": "{speaker_b} has a pet named Luna", ...}, {"memory": "{speaker_b} has a pet named Oliver", ...}, {"memory": "{speaker_b} has a pet named Bailey", ...}
 - Message: "We go to the beach once or twice a year"
-  WRONG: {"memory": "speaker_b goes to the beach", ...}  ← Lost the frequency!
-  RIGHT: {"memory": "speaker_b goes to the beach once or twice a year", ...}
+  WRONG: {"memory": "{speaker_b} goes to the beach", ...}  ← Lost the frequency!
+  RIGHT: {"memory": "{speaker_b} goes to the beach once or twice a year", ...}
+- Message (a knowledge-graph record): "Latvia | official language | Latvian"
+  WRONG: {"memory": "{speaker_a} stated the official language of Latvia", ...}  ← Invented a speaker!
+  WRONG: {"memory": "Latvia", ...}  ← Dropped the relation, which is the whole fact!
+  RIGHT: {"memory": "Latvia's official language is Latvian", "role": "corpus", ...}
 
 **Examples**:
 
 Message: "I got married yesterday!"
-→ [{"memory": "speaker_b got married", "time_expr": "yesterday", "role": "speaker_b", "tag": ["event:marriage", "relation:spouse"]}]
+→ [{"memory": "{speaker_b} got married", "time_expr": "yesterday", "role": "{speaker_b}", "tag": ["event:marriage", "relation:spouse"]}]
 
 Message: "I've been working at Google for 3 years."
-→ [{"memory": "speaker_b works at Google", "time_expr": "for 3 years", "role": "speaker_b", "tag": ["topic:job", "entity:Google"]}]
+→ [{"memory": "{speaker_b} works at Google", "time_expr": "for 3 years", "role": "{speaker_b}", "tag": ["topic:job", "entity:Google"]}]
 
 Message: "She went to the lake last summer."
-→ [{"memory": "speaker_a went to the lake", "time_expr": "last summer", "role": "speaker_a", "tag": ["activity:travel", "entity:lake"]}]
+→ [{"memory": "{speaker_a} went to the lake", "time_expr": "last summer", "role": "{speaker_a}", "tag": ["activity:travel", "entity:lake"]}]
 
 Message: "I love hiking and my daughter loves it too."
 → [
-  {"memory": "speaker_b loves hiking", "time_expr": "", "role": "speaker_b", "tag": ["activity:hiking", "sentiment:love"]},
-  {"memory": "speaker_b's daughter loves hiking", "time_expr": "", "role": "speaker_b", "tag": ["activity:hiking", "relation:daughter", "sentiment:love"]}
+  {"memory": "{speaker_b} loves hiking", "time_expr": "", "role": "{speaker_b}", "tag": ["activity:hiking", "sentiment:love"]},
+  {"memory": "{speaker_b}'s daughter loves hiking", "time_expr": "", "role": "{speaker_b}", "tag": ["activity:hiking", "relation:daughter", "sentiment:love"]}
 ]
 
 Message: "Luna and Oliver! They are so sweet."
 → [
-  {"memory": "speaker_b has a pet named Luna", "time_expr": "", "role": "speaker_b", "tag": ["entity:Luna", "possession:pet"]},
-  {"memory": "speaker_b has a pet named Oliver", "time_expr": "", "role": "speaker_b", "tag": ["entity:Oliver", "possession:pet"]}
+  {"memory": "{speaker_b} has a pet named Luna", "time_expr": "", "role": "{speaker_b}", "tag": ["entity:Luna", "possession:pet"]},
+  {"memory": "{speaker_b} has a pet named Oliver", "time_expr": "", "role": "{speaker_b}", "tag": ["entity:Oliver", "possession:pet"]}
 ]
 
 Message: "It'll be tough as a single parent, but I'm up for it."
 → [
-  {"memory": "speaker_a is single", "time_expr": "", "role": "speaker_a", "tag": ["state:single", "relation:marital_status"]},
-  {"memory": "speaker_a plans to be a parent", "time_expr": "", "role": "speaker_a", "tag": ["state:planning", "relation:parent"]}
+  {"memory": "{speaker_a} is single", "time_expr": "", "role": "{speaker_a}", "tag": ["state:single", "relation:marital_status"]},
+  {"memory": "{speaker_a} plans to be a parent", "time_expr": "", "role": "{speaker_a}", "tag": ["state:planning", "relation:parent"]}
 ]"""
 
 ATOM_EXTRACTION_USER = """**Conversation context** (for resolving pronouns and references):
@@ -184,8 +195,15 @@ async def extract_atoms_llm(
     log: Logger,
     speaker_a: str = "speaker_a",
     speaker_b: str = "speaker_b",
+    speakers: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """单次 LLM 调用，产出 atom 数组。"""
+    """单次 LLM 调用，产出 atom 数组。
+
+    ``speakers`` 是**本次会话实际出现的说话人名单**（由 ``adapters.speakers_of`` 从已落盘的
+    msgmem 推出），填进 prompt 的 ``{speakers}`` 槽。``speaker_a`` / ``speaker_b`` 只用来
+    替换示例里的人名占位符 —— 名单超过两人（剧本、多人语料）时示例仍取前两个，**名单本身
+    才是模型该照抄的**。
+    """
     msg_id = memory_id(target)
     msg_time = (target.get("metadata") or {}).get("time", "")
     role = memory_role(target) or "unknown"
@@ -199,7 +217,14 @@ async def extract_atoms_llm(
         content=content,
     )
 
-    system_prompt = ATOM_EXTRACTION_SYSTEM.replace("speaker_a", speaker_a).replace("speaker_b", speaker_b)
+    names = list(speakers) if speakers else [speaker_a, speaker_b]
+    first, second = speaker_pair(names)
+    system_prompt = (
+        ATOM_EXTRACTION_SYSTEM
+        .replace("{speakers}", speakers_phrase(names))
+        .replace("{speaker_a}", first)
+        .replace("{speaker_b}", second)
+    )
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -341,10 +366,12 @@ async def run_message_pipeline(
     log: Logger,
     speaker_a: str = "speaker_a",
     speaker_b: str = "speaker_b",
+    speakers: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """三阶段 pipeline 处理一条 message。
 
     返回：新产出的 atom 列表（已补全系统字段，未去重）。
+    ``speakers`` 见 ``extract_atoms_llm``：本会话真实出现过的说话人名单。
     """
     msg_id = memory_id(target)
     anchor_time = (target.get("metadata") or {}).get("time", "")
@@ -360,7 +387,7 @@ async def run_message_pipeline(
 
     # Stage 2: 抽取
     raw_atoms = await extract_atoms_llm(
-        target, context, client, config, log, speaker_a, speaker_b
+        target, context, client, config, log, speaker_a, speaker_b, speakers=speakers,
     )
 
     if not raw_atoms:

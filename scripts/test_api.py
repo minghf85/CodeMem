@@ -32,6 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import codemem.llm as llm_mod  # noqa: E402
+from codemem import adapters  # noqa: E402
 from codemem.io import read_jsonl  # noqa: E402
 from codemem.api import retriever, store as store_mod  # noqa: E402
 from codemem.api.models import normalize_content  # noqa: E402
@@ -426,6 +427,245 @@ def test_resume(tmp: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 形态适配层（codemem/adapters.py）
+# ---------------------------------------------------------------------------
+
+def test_adapters() -> None:
+    """每个平台形态各来一条，钉住"谁说的 / 什么时候 / 正文是什么"这三件事。"""
+    print("\n[8] 形态适配层：把平台编码的信息搬回正确的字段")
+
+    # --- ① 带记账标签的对话：真名在 content 前缀里 ---
+    batch = adapters.adapt_messages([{
+        "role": "user", "timestamp": 1704153600000,
+        "content": "[beam_100k][session_1][D1:21][text] Christina Baker: I'm trying to "
+                   "implement city autocomplete using OpenWeather's API.",
+    }])
+    check("形态=dialogue", batch.family == "dialogue", batch.family)
+    check("说话人从 content 前缀取到", batch.speakers == ["Christina Baker"], str(batch.speakers))
+    check("role 是真名而不是 user", batch.messages[0].role == "Christina Baker")
+    check("记账标签不进正文",
+          batch.messages[0].content.startswith("I'm trying to implement"), batch.messages[0].content)
+    check("timestamp 原样保留", batch.messages[0].timestamp == 1704153600000)
+
+    # --- ② 正文里本来就有的方括号不能被当成记账标签剥掉 ---
+    batch = adapters.adapt_messages([{
+        "role": "user", "content": "[clbench_16_32k][session_1][D1:2][text] user: [part 1/2] Background\nOTC is stable.",
+    }])
+    check("只剥平台记账标签，正文方括号留下",
+          batch.messages[0].content == "[part 1/2] Background\nOTC is stable.",
+          batch.messages[0].content)
+    check("user:/assistant: 收敛成通用角色", batch.messages[0].role == "user")
+
+    # --- ③ 说话人前缀不许被短词前缀匹配吃掉（Andrew 曾被 and 吃掉）---
+    speaker, rest = adapters.split_speaker("Andrew: Thanks! That sounds cute.")
+    check("Andrew: 认成说话人（不被 and 前缀匹配吞掉）", speaker == "Andrew", str(speaker))
+    check("也认编号角色", adapters.split_speaker("#8: I think you're wrong.")[0] == "#8")
+    check("正文类型前缀不是说话人", adapters.split_speaker("Corpus: {...}")[0] is None)
+    check("语气词不是说话人", adapters.split_speaker("Wait: I think so")[0] is None)
+
+    # --- ④ 旁白 / 舞台指示 ---
+    batch = adapters.adapt_messages([{
+        "role": "user",
+        "content": "[angry][session_1][D1:1][narration] NARRATION: (SCENE.—A sitting-room.)",
+    }])
+    check("NARRATION: → role=narration", batch.messages[0].role == "narration")
+    check("NARRATION 标记不进正文", batch.messages[0].content.startswith("(SCENE."))
+    batch = adapters.adapt_messages([
+        {"role": "user", "content": "[angry][session_1][D1:2][narration] NARRATION: FOREMAN: 35 years old."},
+        {"role": "user", "content": "[angry][session_1][D1:3][dialogue] JUDGE: Pardon me, gentlemen."},
+    ])
+    check("旁白里连着的角色名被认出来",
+          batch.messages[0].role == "FOREMAN" and batch.messages[0].content == "35 years old.",
+          f"{batch.messages[0].role} / {batch.messages[0].content!r}")
+    check("剧本角色进 speakers", batch.speakers == ["FOREMAN", "JUDGE"], str(batch.speakers))
+
+    # --- ⑤ 文档 ---
+    batch = adapters.adapt_messages([{
+        "role": "user",
+        "content": "[docpp][session_1][D1:1][text] document: Document: a.pdf\nNative clip page: 1 of 5\n\n```text\nBody",
+    }])
+    check("形态=document", batch.family == "document", batch.family)
+    check("document: 标记被剥、文档名保留",
+          batch.messages[0].role == "document"
+          and batch.messages[0].content.startswith("Document: a.pdf"), batch.messages[0].content)
+
+    # --- ⑥ 知识图谱三元组 ---
+    batch = adapters.adapt_messages([{
+        "role": "user",
+        "content": 'Corpus: {"subject": "Latvia", "relation": "official language", '
+                   '"object": "Latvian", "subject_id": "Q211", "relation_id": "P37"}',
+    }])
+    check("形态=triples", batch.family == "triples", batch.family)
+    check("三元组渲染成 subject | relation | object",
+          batch.messages[0].content == "Latvia | official language | Latvian", batch.messages[0].content)
+    check("Q-id 不进正文", "Q211" not in batch.messages[0].content)
+    check("三元组没有说话人", batch.messages[0].role == "corpus" and batch.speakers == [])
+    batch = adapters.adapt_messages([{
+        "role": "user",
+        "content": 'Corpus: UPDATE: replace the prior value of this subject and relation with '
+                   'the following fact.\n{"subject": "India", "relation": "continent", "object": "Africa"}',
+    }])
+    check("UPDATE 语义被保留", batch.messages[0].content.startswith("UPDATE: India | continent | Africa"),
+          batch.messages[0].content)
+
+    # --- ⑦ [Time: ...] 标签里的时间要搬到 timestamp ---
+    batch = adapters.adapt_messages([{
+        "role": "user", "timestamp": None,
+        "content": "[Time: Sep 04, 2025, 09:05:32] Hello! I'd like to share my info.",
+    }])
+    check("[Time: ...] 解析成毫秒时间戳", batch.messages[0].timestamp == 1756976732000,
+          str(batch.messages[0].timestamp))
+    check("时间标签不进正文",
+          batch.messages[0].content.startswith("Hello!"), batch.messages[0].content)
+    batch = adapters.adapt_messages([{
+        "role": "user", "timestamp": None, "content": "[Time: Unknown] FOREMAN: 35 years old.",
+    }])
+    check("[Time: Unknown] 不编造时间且仍拆出说话人",
+          batch.messages[0].timestamp is None and batch.messages[0].role == "FOREMAN")
+
+    # --- ⑧ 流式 QA 反馈：转义 JSON → 可读多行 ---
+    batch = adapters.adapt_messages([{
+        "role": "user", "content": 'Streaming online QA feedback:\n{"qa_id": "q1", '
+                                   '"question": "When did Jon lose his job?\\n\\nA. 2022\\nB. 2023", '
+                                   '"predicted_answer": "(B)", "score": 0.0}',
+    }])
+    check("形态=qa-feedback", batch.family == "qa-feedback", batch.family)
+    check("不再是转义的一行（真换行）", "\nB. 2023" in batch.messages[0].content,
+          batch.messages[0].content[:80])
+    check("旧答案被标明不是权威", "not authoritative" in batch.messages[0].content)
+
+    # --- ⑨ agent 轨迹：展开成逐条消息，且任务号可 grep ---
+    trajectory = {
+        "dataset": "ALF", "task_index": 86,
+        "trajectory": [
+            {"role": "system", "content": "You are in a household."},
+            {"role": "user", "content": "Your task is to: examine the cd with the desklamp."},
+        ],
+    }
+    batch = adapters.adapt_messages([{
+        "role": "user",
+        "content": "Streaming intra-transfer train trajectory:\n" + json.dumps(trajectory),
+    }])
+    check("形态=trajectory", batch.family == "trajectory", batch.family)
+    check("展开成逐条消息（2 条）", len(batch.messages) == 2, str(len(batch.messages)))
+    check("每条的 role 来自轨迹内部", [m.role for m in batch.messages] == ["system", "user"])
+    check('查询字面串 "ALF task index 86" 可 grep',
+          all("ALF task index 86" in m.content for m in batch.messages))
+
+    # --- ⑩ 没有前缀的人机对话：role 用协议给的 ---
+    batch = adapters.adapt_messages([
+        {"role": "user", "content": "医生您好，我想问问我这个膝盖的事。", "timestamp": 1704240000000},
+        {"role": "assistant", "content": "听起来这几天的膝盖确实让你有点不安。"},
+    ])
+    check("形态=plain", batch.family == "plain", batch.family)
+    check("role 退回协议值", [m.role for m in batch.messages] == ["user", "assistant"])
+    check("正文一字未改", batch.messages[0].content.startswith("医生您好"))
+
+    # --- ⑪ 说话人名单渲染 ---
+    check("两人名单", adapters.speakers_phrase(["Caroline", "Melanie"]) == "Caroline and Melanie")
+    check("空名单有兜底", "user" in adapters.speakers_phrase([]))
+    check("人数超上限时写清总数", "7 distinct speakers" in
+          adapters.speakers_phrase([f"s{i}" for i in range(7)], limit=3))
+    check("speaker_pair 单人时的第二位不是自己",
+          adapters.speaker_pair(["Solo"]) == ("Solo", "the other participant"))
+
+
+def test_adapters_end_to_end(tmp: Path) -> None:
+    """走完整的 store 写入：适配层 → msgmem → summem/atommem 的 prompt 里有没有真名。"""
+    print("\n[9] 形态适配贯通到三层记忆（说话人一路传下去）")
+
+    seen_prompts: list[str] = []
+    inner = llm_mod.chat_completion
+
+    async def spy(client, config, messages):  # noqa: ANN001
+        seen_prompts.append(str(messages[0].get("content", "")) if messages else "")
+        return await inner(client, config, messages)
+
+    llm_mod.chat_completion = spy  # type: ignore[assignment]
+    try:
+        app = _app_with_temp_store(tmp)
+        config = app.state.api.config
+        client = app.state.api.add_client
+        root = Path(app.state.api.store_root)
+        user_id, session_id = "eval:fmt:beam:conv-0", "eval:fmt:beam:sess-0"
+        store = store_mod.UserStore(user_id, root)
+
+        asyncio.run(store.append(
+            request_id="fmt-1", session_id=session_id,
+            messages=[
+                {"role": "user", "timestamp": 1704153600000,
+                 "content": "[beam_100k][session_1][D1:21][text] Christina Baker: I'm trying to "
+                            "implement city autocomplete using OpenWeather's API."},
+                {"role": "user", "timestamp": 1704153660000,
+                 "content": "[beam_100k][session_1][D1:22][text] Christina Baker: hmm, what about "
+                            "when the API response takes longer?"},
+            ],
+            config=config, client=client,
+        ))
+
+        records = store.sessions()
+        check("msgmem 落的是真名", {r["metadata"]["role"] for r in records} == {"Christina Baker"},
+              str({r["metadata"]["role"] for r in records}))
+        check("msgmem 正文没有记账标签",
+              all("[beam_100k]" not in r["memory"] for r in records))
+        check("msgmem 时间锚点还在",
+              records[0]["metadata"]["time"] == "2024-01-02T00:00:00Z",
+              records[0]["metadata"]["time"])
+
+        atom_prompts = [p for p in seen_prompts if "extracting atomic facts" in p]
+        check("atom 抽取的 prompt 收到了真名",
+              bool(atom_prompts) and all("Christina Baker" in p for p in atom_prompts),
+              str(len(atom_prompts)))
+        check("atom prompt 不再出现 speaker_a 字面量",
+              all("speaker_a" not in p and "speaker_b" not in p for p in atom_prompts))
+
+        summ_prompts = [p for p in seen_prompts if "You summarize ONE session" in p]
+        check("summem 的 prompt 收到了真名",
+              bool(summ_prompts) and all("Christina Baker" in p for p in summ_prompts),
+              str(len(summ_prompts)))
+        check("summem 不再把参与者写死成两个人",
+              all("between" not in p for p in summ_prompts))
+    finally:
+        llm_mod.chat_completion = inner  # type: ignore[assignment]
+
+
+def test_participants_block(tmp: Path) -> None:
+    """search 的 user_begin 里那段"这份语料有谁"：数据驱动，且不该说的话不说。"""
+    print("\n[10] search 的参与者说明（user_begin 的 {{PARTICIPANTS}} 槽）")
+    from codemem.add.memory import write_memories
+    from codemem.io import make_memory
+    from codemem.search.runner import render_participants
+
+    inputs = tmp / "inputs"
+    inputs.mkdir(parents=True, exist_ok=True)
+
+    def write(*roles: str) -> None:
+        write_memories(inputs / "msgmem.jsonl", [
+            make_memory(memory=f"m{i}", memory_type="msg", mem_id=f"session_1_{i + 1}", role=role)
+            for i, role in enumerate(roles)
+        ])
+
+    write("Caroline", "Melanie")
+    text = render_participants(inputs)
+    check("列出语料里真实的人名", "Caroline" in text and "Melanie" in text, text)
+    check("不提醒'别编造说话人'（对话语料没有这个问题）", "never invent a speaker" not in text)
+    check("不提三元组记法（这份语料里没有）", "|" not in text)
+
+    write("user", "assistant")
+    check("纯 user/assistant 语料整段不渲染", render_participants(inputs) == "",
+          render_participants(inputs))
+
+    write("corpus", "corpus", "corpus")
+    text = render_participants(inputs)
+    check("三元组语料说明 `A | relation | B` 怎么读", "subject's relation is the" in text, text)
+    check("三元组语料提醒别编造说话人", "never invent a speaker" in text)
+
+    write("Caroline", "corpus")
+    text = render_participants(inputs)
+    check("混合语料两段都说", "Caroline" in text and "never invent a speaker" in text)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -435,11 +675,14 @@ def main() -> int:
     test_iso_from_ms()
     test_slug()
     test_records_to_data()
+    test_adapters()
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         test_endpoints(tmp)
         test_validation(tmp)
         test_resume(tmp)
+        test_adapters_end_to_end(tmp / "e2e")
+        test_participants_block(tmp / "participants")
 
     print(f"\n{'=' * 60}\n通过 {PASS} / 失败 {FAIL}")
     return 1 if FAIL else 0

@@ -284,7 +284,7 @@ REMINDER: Output ONLY the JSON object. Start with {{ and end with }}. Nothing el
 
 SUMMEM_SYSTEM_PROMPT = """CRITICAL: Your response must be ONLY a JSON object. No explanation, no reasoning, no markdown fences, no text before or after the JSON.
 
-You summarize ONE session of a conversation between {speaker_a} and {speaker_b}. A reader who has never seen the conversation must understand the summary, and be able to find the session again by grepping a name, place, or fact in it.
+You summarize ONE session of a record. **Who this session belongs to**: {speakers}. A reader who has never seen the material must understand the summary, and be able to find the session again by grepping a name, place, or fact in it.
 
 ## What the summary must contain
 - The main events, facts, and topics of the session, in the order they came up.
@@ -296,6 +296,7 @@ You summarize ONE session of a conversation between {speaker_a} and {speaker_b}.
 - Resolve every pronoun and pointing word (he / she / they / it / there / then) to the concrete person, place, or time.
 - Do NOT invent facts, dates, or names that the session does not support.
 - Do NOT add precision the source lacks: "last year" stays a year, not a date.
+- **Not every session is a conversation.** It may be a document, a set of database facts (`Subject | relation | object`), a screenplay, or an evaluation record. Summarize what is actually there, in its own terms, and **never invent a speaker** for material that has none.
 - 3-8 sentences. Dense and specific, not vague ("they talked about life" is useless).
 - Write it as a standalone paragraph a downstream reader can use directly.
 

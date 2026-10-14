@@ -60,6 +60,7 @@ from . import agent as agent_mod
 from . import evidence as evidence_mod
 from . import toolcfg
 from . import verifier as verifier_mod
+from .. import adapters
 from .. import audit
 from .. import dataset
 from ..log import Logger, block
@@ -784,7 +785,7 @@ def render_session_index(roster: dict[int, str]) -> str:
     """
     if not roster:
         return "(no sessions found -- check inputs/msgmem.jsonl)"
-    lines = ["The conversation is split into these sessions (each has a summary in summem.jsonl):"]
+    lines = ["The material is split into these sessions (each has a summary in summem.jsonl):"]
     for number in sorted(roster):
         when = roster[number]
         lines.append(f"  session_{number}" + (f"  ({when})" if when else ""))
@@ -848,6 +849,81 @@ def tag_index_for(inputs_dir: Path) -> str:
     except OSError:
         key = str(inputs_dir)
     return _cached_tag_index(key)
+
+
+# ``metadata.role`` 里**不是人名**的那些值来自 ``adapters.NON_PERSON_ROLES``（与 ``audit`` 共用
+# 同一份定义）。这里再分出"明说没有说话人"的那几个：``user``/``assistant`` 的普通对话本来就有人
+# 说话，只是没给名字 —— 对它说"别编造说话人"是多余的。
+_RECORD_KIND_ROLES = adapters.RECORD_KIND_ROLES
+_NON_PERSON_ROLES = adapters.NON_PERSON_ROLES
+
+
+def render_participants(inputs_dir: Path, max_names: int = 24) -> str:
+    """把**这份语料里真实存在的** ``metadata.role`` 渲染成一小段说明，放进 user_begin。
+
+    为什么给数据而不是再写一段 prompt 说教：同一个理由见 ``render_tag_index`` —— 小模型不会
+    因为被**描述**就采用一个它没见过的字段。语料里的说话人是 ``Christina Baker`` 还是
+    ``user``，只有把真实的值摆出来它才知道。
+
+    解决的是实测到的一类错：查询问 ``"What fields would Caroline be likely to pursue?"``，
+    而 ``atommem`` 里一条 ``Caroline`` 都没有（写成了 ``user``）—— 于是 agent 既不知道
+    ``role`` 字段里有名字可用，也不知道该 grep 谁。**语料形状（对话 / 文档 / 三元组 /
+    轨迹）也不一样**：``A | relation | B`` 这类记录没有说话人，agent 若按"某人说"去写证据
+    就是编造。
+
+    两种语料各说各的话，**都不适用就整段不渲染**（``user``/``assistant`` 的普通对话既没有
+    人名可指，也没有"别编造说话人"的问题）—— 空白不占 prompt。
+    """
+    path = inputs_dir / "msgmem.jsonl"
+    if not path.exists():
+        return ""
+
+    counts: Counter[str] = Counter()
+    for record in read_jsonl(path):
+        role = str((record.get("metadata") or {}).get("role") or "").strip()
+        if role:
+            counts[role] += 1
+    if not counts:
+        return ""
+
+    people = [name for name, _ in counts.most_common() if name.lower() not in _NON_PERSON_ROLES]
+    kinds = [name for name, _ in counts.most_common() if name.lower() in _RECORD_KIND_ROLES]
+
+    lines: list[str] = []
+    if people:
+        shown = ", ".join(people[:max_names])
+        if len(people) > max_names:
+            shown += f", ... ({len(people)} in all)"
+        lines.append(
+            "Who this material is about -- every record carries `metadata.role` naming the person or\n"
+            f"character it belongs to: {shown}.\n"
+            "When the question names a person, the fact must be about THAT person: grep the name,\n"
+            "and keep the name in the record you write -- a record whose subject is \"she\" or\n"
+            "\"user\" does not answer a question that asks about someone by name."
+        )
+    if kinds:
+        lines.append(
+            "Records whose `role` is one of "
+            f"{', '.join(repr(k) for k in kinds[:6])} have no speaker. "
+            "A \"session\" here may be a document,\n"
+            "a set of `Subject | relation | object` facts (read it as: the subject's relation is the\n"
+            "object), or an agent trajectory. Use the material as it is and never invent a speaker."
+        )
+    return "\n".join(lines)
+
+
+@lru_cache(maxsize=8)
+def _cached_participants(inputs_dir_str: str) -> str:
+    return render_participants(Path(inputs_dir_str))
+
+
+def participants_for(inputs_dir: Path) -> str:
+    """带缓存的入口（与 ``tag_index_for`` 同款）。"""
+    try:
+        key = str(Path(inputs_dir).resolve())
+    except OSError:
+        key = str(inputs_dir)
+    return _cached_participants(key)
 
 
 @dataclass
@@ -924,6 +1000,7 @@ async def run_phases(
         {"role": "system", "content": scripted_prompt},
         {"role": "user", "content": catalog.prompt_text(
             "user_begin", sessions=session_index, tags=tag_index_for(inputs_dir),
+            participants=participants_for(inputs_dir),
         )},
     ]
 

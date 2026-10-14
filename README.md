@@ -113,15 +113,18 @@ python -m codemem.api --recover             # 只跑一次启动自愈（补完�
 ```
 configs/            add / search / answer / eval / api 的配置 + tool.json（search agent 上下文的事实源）
 data/               原始数据 + 各步骤的产物（三层记忆、证据、运行轨迹）
-docs/               文档：add.md / search.md（分步骤）· core.md（设计）· log.md（实验与手册）
+docs/               文档：add.md / search.md / adapters.md（分主题）· core.md（设计）· log.md（实验与手册）
 src/codemem/
   io.py llm.py log.py dataset.py    共享层
+  adapters.py                       报文形态适配层（平台的多样数据集 → 三层记忆能吃的消息）
   prompts.py                        所有 prompt 常量
   add/ search/ answer/ eval/        四个步骤
   api/                              Add / Search 的 HTTP 封装
 scripts/
   run_eval.py                       一条命令跑通 search → answer → eval
   test_search.py test_api.py        纯 CPU 自测（假模型 + 真工具）
+  analyze_api_formats.py            普查 api_store 里各数据集的报文形态
+  rebuild_api_store.py              按新适配层重跑存量语料
   eval_baseline.py eval_rag.py      历史对照链路：全上下文 baseline / embedding RAG
   eval_atommem.py analyze_atommem_results.py   同上，原子记忆检索对照
 ```
@@ -134,7 +137,7 @@ scripts/
 
 ```bash
 python scripts/test_search.py       # 全链路断言（含两项静态检查）
-python scripts/test_api.py          # 封装 API 自测：幂等 / 多用户隔离 / msg_id 与时间 / data 映射 / 请求留痕 / 多模态
+python scripts/test_api.py          # 封装 API 自测：幂等 / 多用户隔离 / msg_id 与时间 / data 映射 / 请求留痕 / 多模态 / 形态适配
 ```
 
 ---
@@ -145,6 +148,7 @@ python scripts/test_api.py          # 封装 API 自测：幂等 / 多用户隔�
 |---|---|
 | [`docs/add.md`](docs/add.md) | **add 步骤**：三层记忆、pipeline（默认）、时间/指代消解 |
 | [`docs/search.md`](docs/search.md) | **search 步骤**：code-agent 取证、`grep`/`date -d` 工具契约、verifier |
+| [`docs/adapters.md`](docs/adapters.md) | **形态适配层**：平台报文的形态普查、八种数据形态的处理规则、存量语料重跑 |
 | [`docs/core.md`](docs/core.md) | **技术设计**：架构、每一步的设计依据、契约与不变量 |
 | [`docs/log.md`](docs/log.md) | **实验日志与运行手册**：逐轮实测数字与失败归因、被取代过的设计、里程碑与待办 |
 | 本文件 | 快速上手与项目导航 |
@@ -176,6 +180,14 @@ python -m codemem.api --host 0.0.0.0 --port 8000 --config configs/api.yaml
 补完，见 `docs/core.md` §4）；**Search 的 `data` 永不为缺失**（无记忆或无证据一律返回
 `{"data": []}`）。
 
+**报文形态适配**：平台的数据集很多样（人机对话、两个真人对话、剧本、文档、知识图谱三元组、
+agent 轨迹、流式评测记录……），它们把"谁说的""什么时候"编码在**报文的各个角落**而不是 `role`
+字段里。`src/codemem/adapters.py` 在落盘前把这些信息**无损地搬到该在的字段**（`role` / `time`），
+并摘掉平台自己的记账标签（`[数据集][session_1][D1:21][text]`）。不做这一步，`atommem` 里会全是
+`"user said …"` —— 而查询问的是具体人名，直接 grep 不到。普查与规则见
+[`docs/adapters.md`](docs/adapters.md)，重新普查用 `scripts/analyze_api_formats.py`。
+
 **每个 `user_id` 的目录里都留痕了原始请求**：`requests.jsonl` 记下每一次 `/add`（原始 messages）
 与 `/search`（原始 query），每次检索的运行目录里还有 `request.json`。方便事后复盘"这条请求/这条
-QA 到底问了什么"。详细设计与存储布局见 [`docs/core.md` §4](docs/core.md)。
+QA 到底问了什么"，也是**存量语料重跑**（`scripts/rebuild_api_store.py`）的输入。详细设计与存储
+布局见 [`docs/core.md` §4](docs/core.md)。

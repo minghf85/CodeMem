@@ -18,6 +18,7 @@
 不互相 import，整条链路**零外部依赖**（没有向量索引 / embedding 服务）。
 
 - add 细节 → [`add.md`](add.md)；search 细节 → [`search.md`](search.md)；
+  平台报文形态与预处理 → [`adapters.md`](adapters.md)；
   过程与实测 → [`log.md`](log.md)。
 - **add 的逐 message code agent 变体在 `add-agent` 分支**；本分支（主分支）的 add **只有 pipeline**。
 
@@ -75,6 +76,7 @@ data/
   api_store/{slug(user_id)}/   # 封装 API 的多用户语料（见 §4）
 src/codemem/
   io.py llm.py log.py dataset.py    # 共享层：四个步骤都依赖，自身不依赖任何步骤
+  adapters.py                       # 报文形态适配层：平台编码 → 三层记忆能吃的消息（§4.2）
   prompts.py                        # 所有 prompt 常量（answer / judge / verifier / EVIDENCE_STANDARD / summem）
   add/    msgmem.py summem.py atommem.py memory.py __main__.py
   search/ runner.py agent.py tools.py toolcfg.py verifier.py evidence.py
@@ -85,7 +87,9 @@ src/codemem/
 scripts/
   run_eval.py                        # 一条命令跑通 search → answer → eval 并打印摘要
   test_search.py                     # 纯 CPU 自测（假模型 + 真工具，零模型成本）
-  test_api.py                        # 封装 API 的纯 CPU 自测（幂等 / 隔离 / data 映射）
+  test_api.py                        # 封装 API 的纯 CPU 自测（幂等 / 隔离 / data 映射 / 形态适配）
+  analyze_api_formats.py             # 普查 data/api_store 里各数据集的报文形态（§4.2）
+  rebuild_api_store.py               # 按新适配层重跑存量 msgmem / 记忆（§4.2）
   eval_baseline.py eval_rag.py eval_atommem.py analyze_atommem_results.py  # baseline 对照（见 §6）
 ```
 
@@ -97,6 +101,7 @@ scripts/
 | `llm.py` | chat completion：退避/重试/截断检测/qwen3 关思考 |
 | `log.py` | 分级日志（终端 + 落盘，支持 `bind` 加前缀） |
 | `dataset.py` | LoCoMo 数据模型：sample/QA/evidence 映射（`D1:3` → `session_1_3` 的唯一实现） |
+| `adapters.py` | **报文形态适配**：把平台编码的"谁说的/什么时候"搬回 `role`/`time`，摘掉平台记账标签（§4.2） |
 | `prompts.py` | 各步骤的 prompt 常量。search 的**证据标准**（`EVIDENCE_STANDARD`）、answer / judge / verifier / summem 的 prompt 都在这里 |
 
 ### 环境
@@ -127,7 +132,7 @@ python -m codemem.add --stage atommem --limit-messages 20   # 只跑前 20 条 m
 
 | 文件 | `type` | 内容 | 生成方式 |
 |---|---|---|---|
-| `msgmem.jsonl` | `msg` | 每条原始消息（**原话**）；`time` 是会话时间戳，`role` 是说话人真名 | 纯 CPU，由 dataset 直接转换 |
+| `msgmem.jsonl` | `msg` | 每条原始消息（**原话**）；`time` 是会话时间戳，`role` 是说话人真名 | 纯 CPU：离线由 dataset 直接转换；在线由**形态适配层**归一化后落盘（§4.2） |
 | `summem.jsonl` | `summary` | 每个会话一份总结 | LLM，**逐 session 一次** |
 | `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **pipeline 逐 message 抽取**（单次 LLM + 代码级后处理，整目录并行） |
 
@@ -932,6 +937,9 @@ uvicorn codemem.api.server:app --port 8000
   （由 `meta.applied_request_ids` 记录）。响应的三个 id 原样回显。
 - **Add 返回即"立即可检索"**。写入原始消息后，**在返回前**同步重建该会话的 `summem`（一次 LLM
   总结）与 `atommem`（逐 message 的 **pipeline** 抽取），所以返回 `success:true` 时消息已消解、可直接检索。
+- **Add 先过形态适配层**（§4.2）。平台把"谁说的""什么时候"编码在报文的各个角落，不是一个
+  `role` 字段能承载的 —— 落盘前先归一化，否则 `atommem` 里全是 `"user said …"`，
+  而查询问的是具体人名，`grep` 直接落空。
 - **Add 可中断续跑**。写入走**写前日志（WAL）**：先把意图（`request_id` + 待写 msg 记录）记进
   `meta.pending`，再落 `msgmem`、再刷新记忆，最后才把 `request_id` 移进 `applied_request_ids`
   落定。所以进程在**任意时刻**被 kill（SIGKILL / OOM / 重启），重启后都能凭 `pending` 把这次 Add
@@ -1000,6 +1008,65 @@ python scripts/test_api.py     # 49 项断言：幂等 / 多 user 隔离 / msg_i
 - **`server.py`**：FastAPI app，协程级 `asyncio.Semaphore` 限流；`create_app(config)` 供测试注入。
 - 一处实测踩坑：agent 的 cwd 是 `qa/`、prompt 里所有检索示例写的是 `inputs/...`（相对 cwd），
   所以 `qa/inputs` 必须**也**存在一份链接（与 `runner.run_qa` 一致），否则 grep 永远空。
+
+### 4.2 形态适配层：平台的报文不是一个 `role` 字段能承载的
+
+平台喂进来的语料来自很多个数据集，**"谁说的""什么时候"被编码在报文的各个角落**，而不是
+`role` 字段里：
+
+```json
+{"role": "user", "timestamp": 1704153600000,
+ "content": "[beam_100k][session_1][D1:21][text] Christina Baker: I'm trying to implement …"}
+```
+
+真实说话人是 **Christina Baker**；`role: "user"` 只表示"这条是用户侧发的"。全量 **7268 条**
+message 里 **6396 条（88%）** 的 `role` 是 `user` —— 照原样落盘，`atommem` 里就全是
+`"user is trying to implement …"`，而查询问的是 `"What fields would Caroline be likely to
+pursue?"`：**这个名字一条原子记忆里都没有，grep 直接落空**。同一层里还夹着平台自己的记账标签
+（`[beam_100k][session_1][D1:21][text]`），它们进了正文之后 `grep "session_1"` 命中全库。
+
+`codemem/adapters.py` 就是 add 之前的这一道：**只做无损换位**（信息搬进 `role` / `time`，
+摘掉平台记账标签），**正文一字不改**。它认八种形态 —— `dialogue`（340 个 add）/ `plain`（170）/
+`narration`（50）/ `triples`（26）/ `qa-feedback`（20）/ `trajectory`（8）/ `document`（5）/
+`facts`（5）—— 三元组渲染成 `Subject | relation | object`，轨迹展开成逐条消息，
+流式 QA 反馈的转义 JSON 摊成多行，`[Time: …]` 标签里的时间搬进 `timestamp`（这一类旧管线里
+时间锚点是空的）。
+
+**三条判据值得单独记**（都会静默毁掉检索）：
+
+- **剥标签只剥认得出的**。正文里本来就有方括号（`user: [part 1/2] Background`），
+  所以只剃 `session_N` / `D1:1` / `Time: …` / 类型词 / **无空格的 slug**。
+- **认说话人时判错的代价不对称**：漏认只是 `role` 退化成 `user`，误认却会**从正文里删掉前缀**。
+  所以黑名单命中的一律不认（`Corpus` / `document` / `NARRATION` / `CLOSE UP` / `Wait`…），
+  且**只做整词匹配** —— 改成前缀匹配时 `Andrew:` 会被 `and` 吃掉、`Henry:` 会被 `he` 吃掉
+  （真踩过，`Audrey`/`Andrew` 那两份语料整批丢说话人）。
+- **看正文判形态，不看协议 role、也不看数据集名**。前者恒为 `user`，后者是平台内部 key。
+
+**适配之后信息一路流到三处下游**（这也是它必须做在 `add` 之前的原因）：
+
+| 下游 | 改了什么 |
+|---|---|
+| `msgmem.role` | 真名 / 剧本角色 / `user` / `corpus` / `document` / `narration` / `feedback` |
+| summem + atommem 的 prompt | `{speakers}` 槽填**本会话真实的说话人名单**（`speakers_of` 从落盘的 msgmem 推，所以恢复重跑也一致）。旧版硬替换成 `speaker_a`→`user`、`speaker_b`→`assistant`；剧本语料有 14 个角色，写成两个人是错的 |
+| search 的 `user_begin` | `runner.render_participants(inputs_dir)` 把**这份语料真实的 `role`** 渲染成一段说明（人名清单 + "三元组/文档没有说话人，别编造"）。与 `render_tag_index` 同一个理由：小模型不会因为被**描述**就采用一个它没见过的字段，把真实的值摆出来它就会用。全是 `user`/`assistant` 的语料整段不渲染 |
+
+atommem 的 prompt 里还多了一条规则：**不是每条记录都是人在说话** —— 文档、数据库三元组、
+旁白、评测记录都没有说话人，照记录本身陈述事实、`role` 用它自己的值、**不要发明一个说话人**。
+
+**存量语料要重跑。** `msgmem.jsonl` 是已经落盘的产物，修好适配层不会让它自己变好。拿
+`requests.jsonl`（原始报文留痕）重放：
+
+```bash
+python scripts/rebuild_api_store.py --all --dry-run --only-with-adds   # 先看
+python scripts/rebuild_api_store.py --all --stage msgmem --only-with-adds   # 纯 CPU，秒级
+python scripts/rebuild_api_store.py --all --stage memories --only-with-adds # 再刷 summem/atommem
+```
+
+id 与时间戳重放后逐条一致（`session_1_1` 还是 `session_1_1`），下游 `source` 全不用改；
+覆盖前自动备份，**重放条数少于现有条数时一律拒写**（留痕是尽力而为的，真会少一整批）。
+
+普查与细节见 [`adapters.md`](adapters.md)；普查脚本 `scripts/analyze_api_formats.py`
+用的是适配层**自己的**判据，所以统计口径与预处理行为不会两套各说各话。
 
 ---
 
@@ -1129,6 +1196,7 @@ sglang serve \
 | 每一步的完整设计（本文） | §1 add / §2 search / §3 answer / §4 API / §5 eval / §6 baseline |
 | add 的三层记忆与 pipeline | [`add.md`](add.md) |
 | search 的 code-agent、工具契约、两种策略 | [`search.md`](search.md) |
+| **平台报文的形态普查、适配规则、存量语料重跑** | [`adapters.md`](adapters.md) |
 | **每一轮的实测数字、失败归因、被取代过的设计、里程碑与待办、运行手册** | [`log.md`](log.md) |
 | 快速上手与项目导航 | [`../README.md`](../README.md) |
 

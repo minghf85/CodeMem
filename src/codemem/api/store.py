@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .. import adapters
 from ..add import summem as summem_mod
 from ..add.memory import (
     ATOMMEM_NAME,
@@ -269,18 +270,31 @@ class UserStore:
             start = int(entry.get("count", 0))
 
             # ---- 构建本批 msg 记录（msg_id 接在已预留条数之后）----
+            #
+            # **先过形态适配层**（``codemem/adapters.py``）：平台把"谁说的""什么时候"编码在
+            # 报文的各个角落（真名在 content 前缀里、时间在 ``[Time: ...]`` 标签里、三元组糊在
+            # JSON 里），直接落 msgmem 会让 atommem 全变成"user said ..."，而查询问的是
+            # "Caroline …"，grep 直接落空。适配层只做**无损换位**：把信息搬进 ``role`` /
+            # ``time``，摘掉平台记账标签，正文一字不改。
+            #
+            # ``normalize_content`` 在这里再兜一次（``server`` 已经做过多模态降级）：适配层
+            # 只认字符串，而 ``append`` 也可能被别的调用方直接喂 ``ContentPart[]``。
+            batch = adapters.adapt_messages([
+                {**message, "content": normalize_content(message.get("content"))}
+                for message in messages
+            ])
             records = [
                 make_memory(
-                    memory=normalize_content(message.get("content")),
+                    memory=message.content,
                     memory_type="msg",
                     mem_id=f"session_{session_index}_{start + offset}",
-                    time=_iso_from_ms(message.get("timestamp")),
-                    role=str(message.get("role") or ""),
+                    time=_iso_from_ms(message.timestamp),
+                    role=message.role,
                     tag=[],
                     source=[],
                     changelog=[{"time": now_iso(), "content": "created"}],
                 )
-                for offset, message in enumerate(messages, start=1)
+                for offset, message in enumerate(batch.messages, start=1)
             ]
 
             # ---- WAL：先记意图并预留 id 空间，原子写 meta（在碰 msgmem 之前）----
@@ -310,7 +324,9 @@ class UserStore:
             if log is not None:
                 log.info(
                     f"Add 写入 {len(records)} 条 -> session {session_index}"
-                    f"（共 {entry['count']} 条）记忆刷新={'成功' if refreshed else '待续跑'}"
+                    f"（共 {entry['count']} 条）形态={batch.family}"
+                    f"{' 说话人=' + '/'.join(batch.speakers) if batch.speakers else ''}"
+                    f" 记忆刷新={'成功' if refreshed else '待续跑'}"
                 )
             return {
                 "written": len(records),
@@ -426,21 +442,25 @@ class UserStore:
 
         summem 见 ``add/summem.py``；atommem 见 ``add/atommem_pipeline.py``（与离线
         ``add --mode pipeline`` 同一条路径）。
+
+        **说话人名单从已落盘的 msgmem 里取**（``adapters.speakers_of``），不使用硬编码的
+        ``user``/``assistant``：这份语料里真名在正文前缀里（``Christina Baker:``），适配层已经
+        把它搬进了 ``role``，这里照读即可。名单取自落盘数据而不是内存变量，所以**恢复
+        （``recover``）重跑时算出来的名单与首次完全一致**。
         """
-        speaker_a, speaker_b = "user", "assistant"
         add_cfg = _add_config(config)
         try:
             # --- summem：替换该会话那一条 ---
             sess_records = self.session_records(session_index)
             if sess_records:
+                speakers = adapters.speakers_of(sess_records)
                 summary = await summem_mod.summarize_session(
                     session_index=session_index,
                     session_time=str((sess_records[0].get("metadata") or {}).get("time") or ""),
                     records=sess_records,
                     client=client,
                     config=add_cfg,
-                    speaker_a=speaker_a,
-                    speaker_b=speaker_b,
+                    speakers=speakers,
                 )
                 existing = read_jsonl(self.summem_path)
                 summary_id = f"session_{session_index}_summary"
@@ -475,6 +495,7 @@ class UserStore:
         if not msg_records:
             return
         msgmem = read_jsonl(self.msgmem_path)
+        session_speakers = adapters.speakers_of(msg_records)
         my_ids = {memory_id(r) for r in msg_records}
         existing = read_jsonl(self.atommem_path)
         # 保留"本会话之外"的 atom（其 source 与本会话的 message id 不相交）。
@@ -491,7 +512,7 @@ class UserStore:
                     return await run_message_pipeline(
                         target=target, msgmem=msgmem, existing_atoms=[], client=client,
                         config=config, log=log or llm_quiet_logger(),
-                        speaker_a="user", speaker_b="assistant",
+                        speakers=session_speakers,
                     )
                 except Exception as exc:  # noqa: BLE001 - 单条失败不该让整个 add 失败
                     if log is not None:

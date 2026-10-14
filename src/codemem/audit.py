@@ -36,6 +36,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from . import adapters
 from .io import memory_id, memory_text, read_jsonl
 
 # 与 ``search/runner.CORPUS_FILES`` 一致。这里另起一份而不是 import：runner 会 import
@@ -49,8 +50,10 @@ _DATE_WORDS = frozenset(
     "monday tuesday wednesday thursday friday saturday sunday "
     "mon tue tues wed thu thur thurs fri sat sun".split()
 )
-# 非说话人的 role 值（这些不是人名）。
-_NON_SPEAKER_ROLES = frozenset({"summary", "atom", "unknown", "", "none"})
+# 非说话人的 role 值（这些不是人名）。来自 ``adapters`` 的单一事实源 —— 适配层会产出
+# ``corpus`` / ``document`` / ``narration`` / ``feedback`` 这些**记录类型**角色，它们一样不是人名，
+# 混进来的话"专名核对"会把 ``document`` 当成一个说话人，白白放宽对它的检查。
+_NON_SPEAKER_ROLES = adapters.NON_PERSON_ROLES
 # 一个词的"较短前缀"至少要这么长才算昵称匹配（"mel" ⊂ "melanie"）。
 _NICKNAME_MIN = 3
 

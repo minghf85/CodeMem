@@ -1298,3 +1298,81 @@ step tool=None  reply='{"tool": "edit", "args": {"append": "{\"content\": \"Caro
 4. **"抗噪声"这一轮真正拿到的是"少丢东西"**：空产物 18 → 0、弃答率 20.0% → 5.1–13.0%、
    每轮救回 25 条被丢掉的工具调用、分母不再说谎。这些是**确定性的**改善，
    和上面那些还在噪声里的分数不是一回事。
+
+---
+
+## S23: 平台报文形态 —— 88% 的消息"说话人"是丢的（2026-10-14）
+
+### 起因
+
+平台的数据是**多个数据集混着灌进来的**。抽查 `/add` 报文发现同一个 `role` 字段承载不了它要
+承载的信息：
+
+```json
+{"role": "user", "timestamp": 1704153600000,
+ "content": "[beam_100k][session_1][D1:21][text] Christina Baker: I'm trying to implement …"}
+```
+
+### 普查（`scripts/analyze_api_formats.py`，全量快照）
+
+| 事实 | 数字 |
+|---|---|
+| 有 `requests.jsonl` 的 user / add 请求 / search 请求 | 100 / 624 / 216 |
+| message 总数 | 7268 |
+| 其中协议 `role == "user"` | 6396（**88%**） |
+| 正文前缀带**真名**的 add | 320 / 624（**51%**） |
+| 记账标签排列 | 无标签 215、`[Time: …]` 170、`[数据集][session_N][Dx:y][text]` 125、`[…][dialogue]` 50、`[…][narration]` 45 |
+
+八种形态：`dialogue` 340 / `plain` 170 / `narration` 50 / `triples` 26 / `qa-feedback` 20 /
+`trajectory` 8 / `document` 5 / `facts` 5。
+
+### 两个会静默毁掉检索的故障
+
+1. **说话人丢失**。旧代码把协议 `role` 原样写进 `msgmem`，于是 atommem 全是
+   `"user is trying to implement city autocomplete …"`。而平台问的是
+   `"What fields would Caroline be likely to pursue?"` —— **这个名字一条原子记忆里都没有**，
+   agent grep `atommem`（首选语料）整个落空，只能退到 `msgmem` 里那句被标签裹着的原话。
+   **一半的语料是这种情况。**
+2. **记账标签进正文**。`[beam_100k][session_1][D1:21][text]` 让 `grep "session_1"` 命中全库，
+   还在正文里塞了第二份与 `source` 对不上的 id。
+3. （附带）**`[Time: Sep 04, 2025, 09:05:32]` 这一类语料 `timestamp` 是 `None`** ——
+   整份语料 `msgmem.time` 是空串，**没有任何时间锚点**，`date -d` 折算无从谈起。
+
+### 做了什么
+
+新增 `src/codemem/adapters.py`：**只做无损换位**（平台编码 → `role` / `time`），摘掉平台记账
+标签，**正文一字不改**。接在 `api.store.append` 建 msg 记录之前。
+
+下游跟着改了三处（这是它必须做在 add 之前的原因）：
+
+- `msgmem.role` 变成真名 / 剧本角色 / `corpus` / `document` / `narration` / `feedback`；
+- summem + atommem 的 prompt 用 `{speakers}` 槽吃**本会话真实的说话人名单**
+  （旧版硬替换成 `speaker_a`→`user`、`speaker_b`→`assistant`；剧本有 14 个角色，写成两个人是错的），
+  并新增一条"不是每条记录都是人在说话 —— 不要发明说话人"；
+- search 的 `user_begin` 加了一段由 `runner.render_participants` 从**这份语料真实的 `role`**
+  渲染的说明（人名清单 + 三元组记法 + 别编造说话人）。
+
+### 踩到的坑（两个都真出现过）
+
+- **前缀匹配吃掉真名**：黑名单 `NON_SPEAKER_PREFIXES` 里短词（`and` / `he` / `no`）用
+  `startswith` 判，`Andrew:` 被 `and` 吃掉、`Henry:` 被 `he` 吃掉 —— `Audrey`/`Andrew` 那两份
+  语料整批丢说话人。改成**只做整词匹配**。判错的代价不对称：漏认只是 `role` 退化成 `user`，
+  误认会**从正文里删掉前缀**。
+- **无脑剥前导方括号**：`user: [part 1/2] Background` 里的 `[part 1/2]` 是正文。所以只剥
+  `session_N` / `D1:1` / `Time: …` / 类型词 / **无空格的 slug**，剥到第一个不合格的就停手。
+
+### 存量语料
+
+`msgmem.jsonl` 是已落盘的产物，修适配层不会让它自己变好。`scripts/rebuild_api_store.py`
+拿 `requests.jsonl`（原始报文留痕）重放：id 与时间戳**逐条一致**（已验证 3 个 user），
+覆盖前备份；**重放条数少于现有条数时一律拒写** —— 实测真有这种 user（留痕是尽力而为的，
+写失败不阻断请求），重放会比语料少整整一批。
+
+### 数字
+
+尚无端到端 judge 数字（这一轮改的是**输入层**，跑分要等重跑完存量语料 + 端点)。
+可确定的是两件**决定性**的事：`atommem` 里终于有真名可 grep（此前 51% 的 add 没有），
+以及 `[Time: …]` 那 170 个请求终于有了时间锚点。
+
+普查口径与适配层**共用同一套判据**（`analyze_api_formats.py` 直接 import
+`adapters.split_speaker`），不会出现"统计说 50 份对话、实际只认出 40 份"这种两套各说各话。

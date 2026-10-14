@@ -26,6 +26,7 @@ import openai
 import yaml
 
 from .. import llm
+from ..adapters import speakers_of, speakers_phrase
 from ..io import DATA_DIR, PROJECT_ROOT, memory_id, memory_role, memory_text, now_iso
 from ..log import Logger
 from ..prompts import SUMMEM_SYSTEM_PROMPT, SUMMEM_USER_PROMPT, salvage_json_object
@@ -100,11 +101,19 @@ def render_messages(records: list[dict[str, Any]]) -> str:
 
 def build_messages(
     *, session_index: int, session_time: str, records: list[dict[str, Any]],
-    speaker_a: str, speaker_b: str,
+    speakers: list[str] | None = None,
+    speaker_a: str = "user", speaker_b: str = "assistant",
 ) -> list[dict[str, str]]:
+    """渲染一次总结的 prompt。
+
+    **参与者名单是 ``speakers``（本次会话真实出现的角色），不是硬编码的两个人。** 离线语料
+    里 ``speaker_a``/``speaker_b`` 由目录名给出；在线语料（尤其是剧本、多人语料、文档）
+    只有一份 ``user``/``assistant`` 就写死了 —— 那会让总结把 14 个陪审员说成两个人。
+    """
+    names = list(speakers) if speakers else [speaker_a, speaker_b]
     return [
         {"role": "system", "content": SUMMEM_SYSTEM_PROMPT
-            .replace("{speaker_a}", speaker_a).replace("{speaker_b}", speaker_b)},
+            .replace("{speakers}", speakers_phrase(names))},
         {"role": "user", "content": SUMMEM_USER_PROMPT
             .replace("{session_index}", str(session_index))
             .replace("{session_time}", session_time or "(unknown)")
@@ -132,13 +141,20 @@ async def summarize_session(
     records: list[dict[str, Any]],
     client: openai.AsyncOpenAI,
     config: dict[str, Any],
-    speaker_a: str,
-    speaker_b: str,
+    speaker_a: str = "user",
+    speaker_b: str = "assistant",
+    speakers: list[str] | None = None,
 ) -> dict[str, Any]:
-    """对一个 session 跑一次总结，返回 summem 记录。失败保留空 memory（不写坏）。"""
+    """对一个 session 跑一次总结，返回 summem 记录。失败保留空 memory（不写坏）。
+
+    ``speakers`` 缺省时退回 ``[speaker_a, speaker_b]``（离线语料走这条）。
+    """
+    if speakers is None:
+        # 调用方没给名单 —— 从消息自身的 role 推一份（在线语料有真名，离线语料没有）。
+        speakers = speakers_of(records)
     messages = build_messages(
         session_index=session_index, session_time=session_time, records=records,
-        speaker_a=speaker_a, speaker_b=speaker_b,
+        speakers=speakers, speaker_a=speaker_a, speaker_b=speaker_b,
     )
     summary = ""
     try:
