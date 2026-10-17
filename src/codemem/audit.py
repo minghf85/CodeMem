@@ -32,16 +32,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Sequence
 
 from . import adapters
-from .io import memory_id, memory_text, read_jsonl
-
-# 与 ``search/runner.CORPUS_FILES`` 一致。这里另起一份而不是 import：runner 会 import
-# agent，而 agent 要 import 本模块 —— 反向 import 会成环。
-CORPUS_FILES = ("msgmem.jsonl", "summem.jsonl", "atommem.jsonl")
+from .io import CORPUS_FILES, FingerprintCache, corpus_fingerprint, memory_id, memory_text, read_jsonl
 
 # 月份/星期：正文里出现月份是**正常的时间表达**（"25 May 2023"），不该当成"编造的实体"。
 _DATE_WORDS = frozenset(
@@ -133,23 +128,22 @@ def build_corpus_index(inputs_dir: Path) -> CorpusIndex:
     )
 
 
-@lru_cache(maxsize=8)
-def _cached_index(inputs_dir_str: str) -> CorpusIndex:
-    return build_corpus_index(Path(inputs_dir_str))
+#: 语料索引的缓存：键是**语料指纹**（见 ``io.corpus_fingerprint``）。
+_CORPUS_INDEX_CACHE = FingerprintCache(maxsize=8)
 
 
 def corpus_index_for(inputs_dir: Path) -> CorpusIndex:
     """带缓存的入口。
 
     一次跑里所有 QA 指向的是**同一份** ``inputs/``（每条 QA 目录下的 ``inputs`` 是软链接到
-    同一目标），文件在整轮运行期间不会变 —— 所以**先 resolve 解析掉软链接**再当缓存键，
-    否则 138 条 QA 会各建一次索引（每条都要重读 1.5MB 语料）。
+    同一目标），文件在整轮运行期间不会变。键取**语料指纹**而不是路径：在线形态下每条 query
+    都是一个新的运行目录（路径次次不同），按路径缓存等于不缓存 —— 同一份语料会被 32 路并发
+    各解析一遍，而且都在同一个事件循环里（见 ``io.FingerprintCache``）。
     """
-    try:
-        key = str(Path(inputs_dir).resolve())
-    except OSError:
-        key = str(inputs_dir)
-    return _cached_index(key)
+    return _CORPUS_INDEX_CACHE.get(
+        corpus_fingerprint(inputs_dir, CORPUS_FILES),
+        lambda: build_corpus_index(inputs_dir),
+    )
 
 
 def _named_entities(text: str) -> set[str]:

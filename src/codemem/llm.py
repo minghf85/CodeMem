@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -52,7 +53,15 @@ CALL_KEYS = (
 
 
 class TruncatedCompletion(RuntimeError):
-    """模型输出因达到 ``max_tokens`` 而被截断（``finish_reason == 'length'``）。"""
+    """模型输出因达到 ``max_tokens`` 而被截断（``finish_reason == 'length'``）。
+
+    ``content`` 是**被截断的那段正文** —— 调用方可以按对象边界抢救出前面完整的记录
+    （见 ``io.salvage_json_records``），而不是把整轮产出当作没发生。
+    """
+
+    def __init__(self, message: str, content: str = "") -> None:
+        super().__init__(message)
+        self.content = content
 
 
 def merge_call_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -77,20 +86,52 @@ def make_client(config: dict[str, Any]) -> openai.AsyncOpenAI:
     16 并发时约一半失败，而串行复用连接几乎不失败）。若不单独限时，一次连接失败要等内核
     SYN 重传超时（~60s）才轮到重试 —— 既慢，又把重试预算耗在"等超时"上。短 connect
     超时让失败**快速**发生，退避后重试才有意义。
+
+    **连接池按并发配**（``max_connections`` / ``max_keepalive_connections``）：默认池只留
+    少量 keep-alive 连接，32 路并发时每批请求都要**新建**连接 —— 而那正是远程端点会丢的
+    东西（同上）。把 keep-alive 上限设成并发量，池里的连接就能被下一批直接复用，
+    新建连接数降到接近 0（``llm.max_connections`` / ``llm.max_keepalive_connections`` 可覆盖，
+    ``max_keepalive_connections`` 缺省取 ``concurrency``）。
+
+    连接池这一段是**加速件**，不是依赖：拿不到 ``httpx`` 时退回 SDK 自建客户端（超时照旧），
+    功能一模一样，只是池子不能用并发量去调。**绝不能因为一个可选优化让整条链路起不来。**
     """
     merged = merge_call_config(config)
     read_timeout = float(merged.get("timeout", 300))
     connect_timeout = float(merged.get("connect_timeout", 10.0))
+
+    try:
+        import httpx
+    except ImportError:                     # pragma: no cover - 取决于运行环境
+        return openai.AsyncOpenAI(
+            base_url=merged["base_url"],
+            api_key=merged.get("api_key") or "not-needed",
+            timeout=openai.Timeout(
+                connect=connect_timeout, read=read_timeout,
+                write=read_timeout, pool=read_timeout,
+            ),
+            max_retries=0,
+        )
+
+    concurrency = max(1, int(config.get("concurrency", 8) or 8))
+    max_connections = int(config.get("max_connections", max(32, concurrency * 2)) or 0)
+    keepalive = int(config.get("max_keepalive_connections", concurrency) or 0)
+    # 超时**建在 http_client 上**：传了 http_client 时，SDK 直接用它（不再另建一个默认客户端），
+    # 所以这里的 Timeout 就是生效的那一份 —— 不要再给 AsyncOpenAI 传 timeout，免得两处各说各话。
+    timeout = httpx.Timeout(
+        connect=connect_timeout, read=read_timeout, write=read_timeout, pool=read_timeout,
+    )
     return openai.AsyncOpenAI(
         base_url=merged["base_url"],
         api_key=merged.get("api_key") or "not-needed",
-        timeout=openai.Timeout(
-            connect=connect_timeout,
-            read=read_timeout,
-            write=read_timeout,
-            pool=read_timeout,
-        ),
         max_retries=0,          # 重试由 chat_completion 自己管，避免两层退避相乘
+        http_client=httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=max_connections or None,
+                max_keepalive_connections=keepalive or None,
+            ),
+            timeout=timeout,
+        ),
     )
 
 
@@ -205,7 +246,8 @@ async def _complete_choice(
                     raise RuntimeError("empty completion content")
                 if getattr(choice, "finish_reason", None) == "length":
                     raise TruncatedCompletion(
-                        f"completion truncated by max_tokens (tail: {content[-80:]!r})"
+                        f"completion truncated by max_tokens (tail: {content[-80:]!r})",
+                        content=content,
                     )
             else:
                 # 原生工具调用：有 tool_calls 就成功；都没有才算失败。
@@ -213,7 +255,8 @@ async def _complete_choice(
                     raise RuntimeError("empty completion content (no tool_calls)")
                 if not tool_calls and getattr(choice, "finish_reason", None) == "length":
                     raise TruncatedCompletion(
-                        f"completion truncated by max_tokens (tail: {content[-80:]!r})"
+                        f"completion truncated by max_tokens (tail: {content[-80:]!r})",
+                        content=content,
                     )
             return choice
         except openai.APIStatusError as exc:
@@ -234,6 +277,104 @@ async def _complete_choice(
     if isinstance(last_error, TruncatedCompletion):
         raise TruncatedCompletion(f"chat completion failed after retries: {last_error}")
     raise RuntimeError(f"chat completion failed after retries: {describe_error(last_error)}")
+
+
+#: 宽字符（CJK 等）范围：这些字一个≈一个 token，不能按"4 字符≈1 token"折算。
+_WIDE_RE = re.compile(r"[⺀-鿿豈-﫿가-힯＀-￯]")
+
+
+def estimate_tokens(text: str) -> int:
+    """粗估 token 数：宽字符一字算一个，其余按 4 字符一个。
+
+    **宁高勿低**：估多了只是把输入切小一点（多一次调用），估少了就是 400 报错、整条 message
+    一条 atom 都拿不到。所以 ASCII 也按 4 字符/token 而不是更乐观的 5~6。
+
+    放在 ``llm`` 而不是某个步骤里：add 的两条路（atommem 的抽取、summem 的总结）都要按它
+    给 prompt 定预算，两边必须用同一把尺子。
+    """
+    if not text:
+        return 0
+    wide = len(_WIDE_RE.findall(text))
+    return wide + (len(text) - wide + 3) // 4
+
+
+#: 端点抱怨"输入太长"时正文里的典型措辞。各家措辞不一，故按关键词匹配而不是精确串：
+#: vLLM/sglang 是 ``maximum context length``、OpenAI 是 ``context_length_exceeded``、
+#: 另一些网关写 ``too long`` / ``reduce the length``。
+_CONTEXT_LENGTH_HINTS = (
+    "context length", "context_length", "maximum context", "max context",
+    "reduce the length", "too many tokens", "token limit", "too long",
+)
+
+#: 端点**内容策略**拦截时正文里的典型措辞（实测：OpenAI 系网关的
+#: ``The response was filtered due to the prompt triggering content management policy``，
+#: Azure 用 ``content_filter``，另一些写 ``safety system`` / ``flagged``）。
+_CONTENT_FILTER_HINTS = (
+    "content management policy", "content_filter", "content filter", "content policy",
+    "safety system", "moderation", "was filtered", "flagged",
+)
+
+#: 这些状态码下**重发同一个 prompt 也是同样结果**：请求非法 / 权限 / 找不到 / 太大 / 内容被拦。
+_PERMANENT_STATUS = frozenset({400, 401, 403, 404, 413, 422})
+
+
+def _walk_causes(exc: BaseException | None):
+    """沿 ``__cause__`` / ``__context__`` 走一遍异常链（SDK 常把细节埋在底层）。"""
+    seen: set[int] = set()
+    node = exc
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        yield node
+        node = node.__cause__ or node.__context__
+
+
+def _matches(exc: BaseException | None, hints: tuple[str, ...]) -> bool:
+    """异常链里有没有节点是 4xx（或没有状态码）且正文里带某个关键词。"""
+    for node in _walk_causes(exc):
+        status = getattr(node, "status_code", None)
+        if status is not None and status not in _PERMANENT_STATUS:
+            continue
+        text = f"{node}".lower()
+        if any(hint in text for hint in hints):
+            return True
+    return False
+
+
+def is_context_length_error(exc: BaseException | None) -> bool:
+    """判断这次失败是不是"输入超出模型上下文"。
+
+    为什么要单独认出来：**它和网络抖动不是一类问题** —— 重试解决不了，缩输入才能解决。
+    调用方（atommem 的抽取）据此把 prompt 预算砍半再试，而不是把一个超大 prompt 原样重发
+    ``max_retries`` 次（那只会把 4xx 烧成几分钟的空转，最后整条 message 一条 atom 都没有）。
+    """
+    return _matches(exc, _CONTEXT_LENGTH_HINTS)
+
+
+def is_content_filter_error(exc: BaseException | None) -> bool:
+    """判断这次失败是不是被端点的**内容策略**拦下的（``code: content_filter``）。
+
+    它对我们的意义和"超上下文"正好相反：**缩输入救不回来**（拦的不是长度，是内容），
+    所以重试是纯浪费 —— 但值得试一次"把上下文去掉、只抽这一条"（触发词常常在**前文**里）。
+    """
+    return _matches(exc, _CONTENT_FILTER_HINTS)
+
+
+def is_permanent_prompt_error(exc: BaseException | None) -> bool:
+    """这次失败是不是"重发同一个 prompt 也不会有不同结果"。
+
+    内容策略、非法请求、模型不存在、认证失败……都属于这一类。**别重试**：原地重试、补漏重试
+    都只会把同一份 prompt 再烧一遍（实测：一次内容策略拦截会在补漏里被反复重试到天荒地老）。
+    调用方据此把它记成 ``blocked``（不自动重试、但留痕可见），而**不是** ``failed``。
+
+    "输入超上下文"**不算**这一类 —— 它虽然也是 400，但那是"缩一缩就能过"的。
+    """
+    if is_context_length_error(exc):
+        return False
+    for node in _walk_causes(exc):
+        status = getattr(node, "status_code", None)
+        if status in _PERMANENT_STATUS:
+            return True
+    return False
 
 
 def describe_error(exc: Exception | None) -> str:

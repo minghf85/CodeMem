@@ -37,9 +37,9 @@ from ..io import DATA_DIR, PROJECT_ROOT, memory_id, memory_text, read_jsonl
 from ..log import Logger
 # 相似度判据统一在 ``codemem.similarity``（search 侧也要用同一套 —— 见该模块说明）。
 from ..similarity import (
-    NEAR_DUP_JACCARD,
     dedup_key as _dedup_key,
-    is_same_fact as _is_same_fact,
+    same_fact as _same_fact,
+    signature as _signature,
 )
 from .memory import (
     ATOMMEM_NAME,
@@ -245,46 +245,90 @@ def _merge_ids(*groups: Any) -> list[str]:
 # codemem.similarity —— search 侧判断“这一步有没有真正新增事实”要用同一套。顶部 import 后直接用。
 
 
-def _dedup_atoms(atoms: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """CPU 侧去重兜底：同一事实只留一条，``source`` 取并集、``changelog`` 取更全的。
+def merge_atoms(
+    existing: list[dict[str, Any]], incoming: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """把**新抽出来的** atom 并进已有集合：``existing`` 原样保留（就地吸收来源），返回合并结果。
 
-    两遍扫描 ——
-    1. **精确去重**（归一化后完全相同）：抓大小写/标点/尾句号差异，O(n)。
-    2. **近义去重**：模型仍会用**不同措辞**重写同一事实（"values self-expression" /
-       "appreciates self-expression" / 同一 turn 里一口气吐 7 条 community/inclusivity）。
-       prompt 拦不全，所以这里用 token 集合 Jaccard（≥ ``NEAR_DUP_JACCARD``）再并一轮。
-    保留**第一次**出现的那条（它带最原始的措辞与时间）。合并是 O(n²)，但 n 是"逐 message
-    增量"的单条 message 产出 + 全库，实测几十~几百条，可接受。
+    与 ``_dedup_atoms(existing + incoming)`` 结果一致，但**只比该比的那些对**：
+
+    - ``existing`` 里"两两之间"的配对，在它们各自被并进来时就已经比过了（``_absorb`` 只动
+      ``source`` / ``changelog``，**不改正文**，所以比较结果不会变），再比一遍是纯重复劳动；
+    - 每次 Add 都拿**整个库**重跑一遍 O(n²) 的那版，库里几千条时一次 Add 要几十秒、上万条要
+      几分钟 —— 服务看起来就是"卡住了"：写锁被这一步占着，同 user 的其它 Add 与 ``/search``
+      的请求留痕全在排队（实测见 ``docs/log.md`` S25）。
+
+    候选筛选用 **token 倒排索引**：两条 atom 被判为"同一事实"的必要条件就是**共享实词**
+    （Jaccard ≥ 阈值，或去情绪动词后共享核心词 ≥3），所以只比"至少共享一个实词"的那些对，
+    与逐条暴力比较**结论完全一致**。
     """
-    # 第一遍：精确去重（同时按归一化键归并 source/changelog）。
+    merged: list[dict[str, Any]] = []
     exact: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
-    for atom in atoms:
-        key = _dedup_key(memory_text(atom))
+    index: dict[str, list[int]] = {}
+    # 每句的特征只算一次（分词 / 主语 / 专名 / 情绪动词），别在"一对一对地比"里重复算 ——
+    # 一句话要被拿去和几百个候选比，这才是这一段的真正开销（见 similarity.FactSignature）。
+    signatures: list[Any] = []
+
+    def _register(atom: dict[str, Any], key: str, text: str) -> None:
+        sign = _signature(text)
+        position = len(merged)
+        merged.append(atom)
+        signatures.append(sign)
+        exact[key] = atom
+        for token in sign.tokens:
+            index.setdefault(token, []).append(position)
+
+    for atom in existing:                       # 已有集合：只做精确去重（近义早比过了）
+        text = memory_text(atom)
+        key = _dedup_key(text)
         if not key:
             continue
         kept = exact.get(key)
         if kept is None:
-            exact[key] = atom
-            order.append(key)
-            continue
-        _absorb(kept, atom)
+            _register(atom, key, text)
+        else:
+            _absorb(kept, atom)
 
-    # 第二遍：近义去重 —— 每条与已保留的比，命中就并进去（source 并集）。
-    merged: list[dict[str, Any]] = []
-    for key in order:
-        atom = exact[key]
+    for atom in incoming:                       # 新来的：与已有 + 已收下的新 atom 比
         text = memory_text(atom)
+        key = _dedup_key(text)
+        if not key:
+            continue
+        kept = exact.get(key)
+        if kept is not None:
+            _absorb(kept, atom)
+            continue
+        sign = _signature(text)
+        candidates: set[int] = set()
+        for token in sign.tokens:
+            postings = index.get(token)
+            if postings:
+                candidates.update(postings)
         target = None
-        for kept in merged:
-            if _is_same_fact(text, memory_text(kept)):
-                target = kept
+        for position in sorted(candidates):     # 从小到大：与"保留最早那条"的语义一致
+            if _same_fact(sign, signatures[position]):
+                target = merged[position]
                 break
         if target is None:
-            merged.append(atom)
+            _register(atom, key, text)
         else:
             _absorb(target, atom)
     return merged
+
+
+def _dedup_atoms(atoms: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把**一整份**列表去重（一次性用；等价于 ``merge_atoms([], atoms)``）。
+
+    两遍扫描 ——
+    1. **精确去重**（归一化后完全相同）：抓大小写/标点/尾句号差异。
+    2. **近义去重**：模型仍会用**不同措辞**重写同一事实（"values self-expression" /
+       "appreciates self-expression"），prompt 拦不全，所以用 token 集合 Jaccard 再并一轮。
+    保留**第一次**出现的那条（它带最原始的措辞与时间）。
+
+    **别拿它对"整个库 + 少量新增"反复调用**（每次 Add 都做一遍就会把服务拖死）——
+    那种场景用 ``merge_atoms(existing, incoming)``。
+    """
+    return merge_atoms([], atoms)
 
 
 def _absorb(kept: dict[str, Any], atom: dict[str, Any]) -> None:
@@ -329,7 +373,10 @@ async def run_dir(
     speaker_a, speaker_b = parse_dir_label(label)
     targets = messages if not limit_messages else messages[:limit_messages]
 
-    from .atommem_pipeline import run_message_pipeline
+    from .atommem_pipeline import msg_positions, run_message_pipeline
+
+    # 位置表建一次（每条 message 各扫一遍 msgmem 是几十万次查找，见 msg_positions 的注释）。
+    positions = msg_positions(messages)
 
     # 幂等：先移除**本次要处理的每个 message** 最初产出的 atom（重跑不累积）。
     target_ids = {memory_id(t) for t in targets}
@@ -347,16 +394,22 @@ async def run_dir(
         async with gate:
             node_log = log.bind(f"{label}:{memory_id(target)}")
             try:
-                return await run_message_pipeline(
+                # **闸门套在这一条任务外面，就不再往下传** —— 传下去会自我嵌套：任务占着一个
+                # 名额、再去等另一个名额，几十路并发时会僵住（见 store._refresh_atoms 的相反做法：
+                # 那里没有外层闸门，改由 pipeline 自己按"每次调用"排队）。
+                extraction = await run_message_pipeline(
                     target=target, msgmem=messages, existing_atoms=[], client=client,
                     config=config, log=node_log, speaker_a=speaker_a, speaker_b=speaker_b,
+                    positions=positions,
                 )
+                return extraction.atoms
             except Exception as exc:  # noqa: BLE001 - 单条失败不该让整目录没有输出
                 node_log.warn(f"处理失败：{type(exc).__name__}: {exc}")
                 return []
 
     groups = await asyncio.gather(*(extract(t) for t in targets))
-    merged = _dedup_atoms(kept + [a for group in groups for a in group])
+    # 同上：只把**本次新抽的**并进已有集合，不要拿整个库重跑 O(n²) 的两两比较。
+    merged = merge_atoms(kept, [a for group in groups for a in group])
     write_memories(atommem_path, merged)
     return {"dir": label, "status": "OK", "messages": len(targets), "atoms": len(merged)}
 

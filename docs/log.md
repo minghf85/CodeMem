@@ -1376,3 +1376,205 @@ step tool=None  reply='{"tool": "edit", "args": {"append": "{\"content\": \"Caro
 
 普查口径与适配层**共用同一套判据**（`analyze_api_formats.py` 直接 import
 `adapters.split_speaker`），不会出现"统计说 50 份对话、实际只认出 40 份"这种两套各说各话。
+
+---
+
+## S24: 封装 API 的并发、增量与输入预算（2026-10-15）
+
+目标：**Add 与 Search 各自按 32 路并发扛负载**，且 Add 一条超长消息不能让客户端的请求卡死或
+整条 message 静默归零。改的都是 `api/` 与 add 的抽取路径，**判据不变、产物格式不变**。
+
+### 四处真正的瓶颈（按影响排序）
+
+1. **锁的作用域太大**。`store.append` 把"WAL + 落 msgmem + **重建整个会话的 summem/atommem**"
+   全包在同一把写锁里，而模型调用占了 99% 的时间 —— 同一个 user 的并发 Add **完全串行**
+   （32 路进来 1 路在跑，31 路排队），连 `/search` 末尾那行请求留痕（只写一行）都被堵住。
+   → 拆成"锁内纯 CPU 段"与"锁外模型段"：写锁只管 `meta`/`msgmem`/`requests` 与 `summem`/`atommem`
+   的读—改—写；同一会话另有一把**刷新锁**（可以跨模型调用持有，同一会话的两次 Add 共用一次重建）。
+2. **没有进程级的模型闸门**。`add_sem` 限的是"接几个 Add 请求"，而一次 Add 会**按 message 并发
+   抽取**（几十条消息的会话就是几十次调用）—— 只看它，真实并发放大几十倍。
+   → 新增 `ApiState.add_gate`：按**每次 chat completion** 计数，summem + atommem 整条链路共用，
+   额度 = `add_concurrency`。闸门只包住单次调用（见下一条坑）。
+3. **每次重抽整个会话**。追加一条消息，旧实现把该会话**所有** message 重抽一遍（O(n²) 次调用）。
+   → `atom_state.json` 记进度，只抽没抽过的。成立的前提是 add 的追加语义：一条 message 的抽取
+   只依赖它**之前**的原文（`recall_context` 只往前看）。
+4. **阻塞活排在事件循环里**。整文件读写、JSON 解析、`_dedup_atoms`（O(n²) 的近义去重）都同步跑在
+   协程里 —— 单进程多协程，事件循环是共享的，一个 user 的一次全量重写会卡住**所有**请求的响应。
+   → 一律 `asyncio.to_thread`。
+
+Search 侧对应一处：每条 query 都新建运行目录，而开场那三段 prompt（会话清单 / tag 索引 / 说话人
+名单）与审计索引都要**读整份语料**，旧实现按**路径**缓存 —— 路径次次不同，等于不缓存，32 条 query
+各读一遍 1.5MB 语料、还都排在同一个事件循环里。→ 缓存键改成 `io.corpus_fingerprint`
+（三个记忆文件的 dev/ino/size/mtime；`inputs/*` 是硬链，与原文件同 inode），同一份语料只建一次，
+构建本身也进线程（`io.FingerprintCache`，同键只建一次，不同语料不互相排队）。语料一变指纹就变。
+
+### 新测试抓出来的两个真 bug（都不是"跑一遍看看"能发现的）
+
+- **`atom_state.json` 的整份覆盖**：各会话并发刷新，各自"读—改—写"整份文件，互相把对方刚写进去的
+  进度冲掉 → 被冲掉的会话下次重抽。实测 8 路并发 Add 的抽取调用 **14 次**（应为 8 次）。
+  改成锁内**按下标并进去**。测试断言 `atom_calls == 8` 现在钉着它。
+- **把"在飞的 Add"当成"被中断的 Add"**：WAL 到落定之间，`request_id` 一直躺在 `meta.pending` 里。
+  并发 Add 请求各自在开头"恢复"别人的 pending，于是同一批 message 被抽 N 遍。
+  → 进程内 `_in_flight` 集合，正在跑的 pending 不当遗留处理（重启后集合为空，恢复语义不变）。
+
+### 输入预算：一条消息装不进模型上下文时
+
+平台喂进来的"一条 message"可能是**一整篇文档**（`document`/`narration` 形态见过几万字），
+`context_window` 条前文也可能是长消息。整段塞进去的结果不是"抽得糙"，而是**一条 atom 都没有**：
+端点回 400 `maximum context length`，`llm.py` 把 4xx 判成不可重试 → 整条 message 静默归零。
+
+`atommem_pipeline` 现在按 `max_input_tokens` 给 prompt 硬预算（system + user 一起算）：
+上下文按**行**从最新往回留（消解指代靠最近几轮），目标消息**切块**（按行切、单行太长按字符硬切、
+块间重叠 10%），仍放不下就把预算**砍半重切**（识别 `is_context_length_error`，最多 3 次）。
+输出被 `max_tokens` 截断时先按对象边界**抢救**已吐出的记录再把该块切细（`TruncatedCompletion`
+现在带上被截断的正文）。token 数是估的（CJK 一字一个、其余 4 字符一个，宁高勿低），所以硬切时
+**逐块二分量**而不是按开头估一个固定步长 —— 中英混排下后者会切超（CJK 的字符/token 比是 ASCII 的 4 倍）。
+
+失败的那条**不记进度**（`ok=False`）→ 下次刷新重试，而不是把它永久钉成 0 条；抽成的那几块照记。
+
+### 真机第一次跑出来的失败：`ConnectTimeout`（2026-10-15，服务在跑时观察到）
+
+```
+WARN [session_6_106] session_6_106: 抽取失败 RuntimeError: chat completion failed after retries:
+     APITimeoutError: Request timed out. (cause: ConnectTimeout: ConnectTimeout(TimeoutError()))
+```
+
+**建连超时**，不是读超时 —— 远程端点在高并发下丢 SYN（`llm.py` 的 `connect_timeout` 注释里早记着
+"16 并发时约一半失败"）。它暴露了一个设计空洞：**抽取失败不影响 Add 成功**（消息已可检索、只是少
+几条 atom），所以这条 Add 会被正常落定成 `applied` —— 它**不在 pending 里，重启的续跑捞不到它**，
+只在"同会话的下一次 Add"时才可能补上。语料如果再也不来 Add，那几条 atom 就永远缺着。
+
+补了两层（都在 `store.py`，前一层治抖动、后一层治"这一轮怎么都抽不出来"）：
+
+1. **就地重试**：一次刷新里失败的那几条，等 `atom_retry_backoff`（默认 2s）再抽一遍，最多
+   `atom_retry_rounds`（默认 2）轮 —— 比 `llm.py` 那层退避多给端点几次机会。但重试**有时间上界**
+   （`atom_retry_budget`，默认 30s，按整个刷新算、含第一次尝试）：一次彻底失败的调用本身就要
+   `connect_timeout × max_retries + 退避` ≈ 36s，慢失败直接落到账上交给补漏，而不是把这次 Add
+   磨到客户端超时 —— 只有**快失败**（瞬时抖动）才配得上就地重试。重试时**每个 message 只留一份
+   atom**（id 是 `{msg_id}_{k}`、每次尝试都从 `_1` 编号，两次尝试的产出一起留下会撞 id）。
+2. **补漏**：失败显式记进 `atom_state.json` 的 `failed`（总结为空记 `summary_failed`），
+   `repair_all` 把欠账的会话重刷一遍 —— 启动时**后台**跑一次（不阻塞启动、不占 `/health`），
+   也可以 `python -m codemem.api --repair` 手动跑（**请在服务没在跑时用**：它是另一个进程、
+   有自己的锁，同库双写会互相覆盖）。**只认显式记账的失败**：拿"覆盖名单的差集"去推的话，
+   旧版语料（根本没有记账文件）会在启动时被整库重抽 —— 差集**只对"记账里有该会话的条目、
+   但条目还是旧格式（没有 `failed` 键）"的会话**兜一次，那正是升级场景要救的。常态下补漏
+   一个模型调用都不发。
+
+同时确认了**关服务是安全的**：消息在刷新之前就落盘（WAL），被 kill 的 Add 留在 `meta.pending`、
+重启自动补完；`summem`/`atommem`/`atom_state` 都是原子整文件替换，中途断电只会是新旧二者之一。
+
+配套加了个**只读体检** `scripts/check_api_store.py`（补漏前后各跑一次）：列出哪些 user / 会话欠
+atom、缺哪些 msg_id、是"记账说失败"还是"旧记账按差集推"。它的判据**故意与补漏共用一套**（都是
+`failed` 优先、旧格式才回退差集），否则会出现"体检说干净、补漏还在干活"。有一点踩过：**不能拿
+`atommem` 反推覆盖** —— 一条 message 完全可以合法地产出 0 条 atom（寒暄、纯提问），那种消息在
+`atommem` 里当然找不到，用它是会把它们全报成"缺"的噪音。
+
+### 真机第二批失败：内容策略 400 与 summem 超上下文（同日稍晚）
+
+```
+WARN [session_3_145] 抽取失败 BadRequestError: Error code: 400 - {'error': {'message': 'The response
+     was filtered due to the prompt triggering content management policy...', 'code': 'content_filter'}}
+[summem] session 1 总结失败：BadRequestError: 400 ... This model's maximum context length is 128000
+     tokens. However, your messages resulted in 152777 tokens.
+```
+
+两个新形态，都在"我们的重试策略"上各戳一个洞：
+
+- **内容策略 400**：它不是抖动，重发同一个 prompt 还是同样结果。但当时的代码把"非超上下文"的
+  失败一律当抖动 → ① 就地重试白烧 2 轮；② 记账进 `failed` 之后，**每一轮补漏都会把它再烧一遍**
+  （永远不可能成功）。而且还发现一条：触发词常常不在目标消息里，而在**前文上下文**里 ——
+  那种情况下"去掉上下文重抽一次"是能救回来的。
+- **summem 完全没有输入预算**：atommem 有（`max_input_tokens`），summem 是**整段塞**，于是
+  一个 15 万 token 的会话直接 400、那个会话一条总结都没有 —— 而 summem 是检索用的**路标**。
+  顺带发现：失败时"写一条空总结"还会把上一版（过时但可用）的总结冲掉。
+
+改法：
+
+1. **失败分三类**（判据在 `llm.py`）：能缩输入救的（超上下文）→ 缩；**端点不接受这个 prompt**
+   的（4xx，含内容策略）→ 记 `blocked`，**不自动重试**（`--repair --retry-blocked` 才重来，
+   换端点后用）；其余（超时 / 建连 / 5xx）→ 记 `failed`，照旧重试。
+2. **内容策略先做一次降级**：去掉前文上下文重试一次（unit.context 清空后若仍被拦就走 permanent）。
+3. **summem 用与 atommem 同一个预算键、同一把尺子**（`llm.estimate_tokens` 现在是唯一实现）：
+   超出就**分段总结再拼起来**（连续切、段间重叠一条消息、段首标 `(part k/n)`）；单条消息本身就
+   超预算时按"保头保尾"截断；端点仍判超长就砍半重切。
+4. **总结失败不再冲掉旧总结**：只有写得出字才落盘；进度记账区分 `summary_failed`（重试）与
+   `summary_blocked`（不重试）。
+
+体检脚本跟着报了新的一类：`被端点拒绝（不自动重试）` / `总结被端点拒绝（不自动重试）` ——
+一眼能分清"补漏会补"和"补漏不会补"。测试里钉住了：触发词在前文时**降级救回**、在目标消息里时
+**只试两次就记 blocked**、`--retry-blocked` 才重来、长会话**分段总结**、被拦的总结**不再被碰**。
+
+### 数字与状态
+
+- `scripts/test_api.py`：**122 → 208 项断言**，全绿（新增输入预算、并发与增量、跨运行缓存、
+  配置优先级、失败重试与补漏、内容策略与 summem 预算、CLI 七组）；`scripts/test_search.py`
+  511 项全绿（缓存与线程化改动没动到 search 的行为）。
+- 关键断言：8 个不同 session 的 Add 并发打同一 user，模型调用**真正重叠**（旧实现峰值恒为 1）、
+  **恰好 8 次**；同一 session 的 4 条并发消息**各抽一次**；追加一条消息只多 1 次调用；
+  语料派生结果跨运行目录只建一次、语料一变就重建；抖动失败**就地补全**、一直失败**记账**、
+  慢失败**不磨请求**、端点恢复后**补漏补上**、旧格式记账（升级场景）**靠差集也能补上**、
+  没欠账时一个调用都不发；内容策略**先降级再判死**、长会话**分段总结**。
+- **本环境没有 `httpx`**（`import httpx` 直接 ModuleNotFoundError），所以 `llm.make_client` 的连接池
+  分支在本机走的是退路（`openai.AsyncOpenAI(...)` 自建客户端）；线上装了 httpx 才会真的按并发配
+  keep-alive 池。uvloop 同理：装了就用，没装跳过。
+- **没有端到端 judge 数字** —— 这一轮改的是服务侧的并发/预算路径，判据与 prompt 一字未动。
+
+---
+
+## S25: 服务"卡住"——每次 Add 都在重跑 O(n²) 的去重（2026-10-15）
+
+**现象**：日志里还在正常产出 atom（`session_39_2: 产出 14 条 atom`、`session_39_8: 产出 20 条 atom`），
+然后就没有然后了；Ctrl-C 按了二十次进程也退不掉。
+
+### 根因：合并是"把整个库两两比一遍"，而且**每次 Add 都做一遍**
+
+`store._refresh_atoms` 的收尾合并原来是：
+
+```python
+write_memories(atommem_path, _dedup_atoms(kept + atoms))   # kept = 库里除本会话外的**全部** atom
+```
+
+而 `_dedup_atoms` 的第二遍是"每条与已保留的**逐条**比一遍" —— `is_same_fact` 每次都现算两条正文的
+分词 / 主语 / 专有名词 / 情绪动词（4 次正则）。于是每次 Add 的代价是 **O(库²)**：
+
+| 库里 atom 数 | 一次 Add 的合并（实测/外推） |
+|---|---|
+| 300 | **1.58s**（实测，见 `python scripts/test_api.py`） |
+| 2 000 | ≈ 70s（平方外推） |
+| 5 000 | ≈ 7 分钟 |
+| 20 000 | ≈ 2 小时 |
+
+用户的库是 33 个 user、会话号已经到 `session_39`，几千到上万条 atom —— 所以**每个 Add 都要跑几十秒
+到几分钟**，而这一步**持着该 user 的写锁**（还占着一个线程）：同 user 的其它 Add 全在排队，
+`/search` 末尾那行请求留痕（只写一行）也要等这把锁 → **整个服务看起来就是卡住了**。
+
+Ctrl-C 退不掉是**两件事**叠出来的：① uvicorn 默认**无限等**在飞的请求（一个卡在模型调用或
+几分钟合并里的请求就能把优雅关闭拖住任意久）；② 如果服务是 `nohup ... &` 起的，终端里的 Ctrl-C
+根本到不了它。
+
+### 改了什么
+
+1. **`merge_atoms(已有, 新增)`**（`add/atommem.py`）：只把**新抽出来的**并进去 —— 库里那些两两
+   配对在它们各自被并进来时就已经比过了（`_absorb` 不改正文，比较结果不会变）。候选靠 **token
+   倒排索引**筛（两条 atom 被判为同一事实的必要条件就是共享实词），逐对的比较也从"每次重算两句
+   特征"改成"每句算一次、缓存复用"（`similarity.FactSignature` / `same_fact`）。
+   **结果与暴力版逐条一致**（`test_api.py` [19] 有等价性断言），实测 **300 条：1.58s → 0.019s（85×）**，
+   且随库增长是线性而不是平方。`_dedup_atoms` 保留为"拿一整份列表去重"的特例
+   （= `merge_atoms([], atoms)`），别再拿它对"整个库 + 少量新增"反复调用。
+2. **每条 message 不再各扫一遍 msgmem**：`recall_context` 要找 target 的位置，原来每条 O(库)、
+   现在用预建的位置表 O(1)（`msg_positions`，一个会话建一次）。
+3. **线程池按并发调大**：整文件读写 / 去重 / 语料派生结果都在 `asyncio.to_thread` 里，而默认池只有
+   `min(32, CPU+4)` 个工人**且全局共享** —— 32 路并发时一排队，所有请求都跟着慢。
+4. **补漏用自己的一把小闸门**（`repair_concurrency`，缺省 = 模型额度的 1/4）：它是后台活又跑得久，
+   占用主额度会让服务刚起来那几分钟的前台请求全在排队等它。
+5. **收尾有上界**：`timeout_graceful_shutdown: 15`（uvicorn 默认无限等），lifespan 里等补漏任务
+   也加了 5 秒上限 —— Ctrl-C / SIGTERM 之后进程一定退得掉（长请求被切断，客户端按 `request_id`
+   重试即可，Add 幂等）。
+
+### 顺带的两条运维提醒（都在 `configs/add.yaml`）
+
+- `connect_timeout: 60` 是**反的**：它让"建连失败"从秒级变成分钟级，而 llm 层还要重试 3 次
+  （60+2+60+4+60 ≈ 3 分钟/条）。`llm.py` 的设计意图是**短 connect 超时 + 快速失败 + 退避重试**，
+  建议 5~10s。
+- 服务如果用 `nohup ... &` 起的，Ctrl-C 发的是**前台进程组**，到不了它 —— 用
+  `kill -INT <pid>` 或 `kill -TERM <pid>`，或者 `fg` 到前台再按。

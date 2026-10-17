@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
@@ -248,6 +249,88 @@ def write_jsonl(path: Path, items: Iterable[dict[str, Any]]) -> None:
         except OSError:
             pass
         raise
+
+
+# ---------------------------------------------------------------------------
+# 语料指纹与派生结果缓存
+# ---------------------------------------------------------------------------
+
+#: 语料：一个目录下的三个记忆文件（``data/{dir}/`` 与运行目录的 ``inputs/`` 同名）。
+#: 定义在这里而不是某个步骤里 —— add / search / api 都要按同一份清单算指纹。
+CORPUS_FILES = ("msgmem.jsonl", "summem.jsonl", "atommem.jsonl")
+
+
+def file_fingerprint(path: Path) -> tuple[Any, ...]:
+    """一个文件的**廉价恒等**：``(dev, ino, size, mtime_ns)``。不存在返回 ``size=-1``。
+
+    用 inode 而不是路径：运行目录里的 ``inputs/*.jsonl`` 是**硬链**，与原文件同一个 inode，
+    所以"同一份语料"在任意运行目录下算出同一个指纹 —— 这正是跨运行复用派生结果（tag 索引 /
+    说话人名单 / 审计索引）需要的性质。语料一改（Add 落盘新消息），mtime 变，键就变。
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return (0, 0, -1, 0)
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def corpus_fingerprint(
+    directory: Path, names: Sequence[str] = CORPUS_FILES
+) -> tuple[Any, ...]:
+    """三个记忆文件指纹合成的一个键（见 ``file_fingerprint``）。"""
+    return tuple(file_fingerprint(directory / name) for name in names)
+
+
+class FingerprintCache:
+    """按**语料指纹**缓存一份纯 CPU 派生结果，同一份语料只建一次。
+
+    为什么不用 ``lru_cache(path)``：在 API 里每条 query 都新建一个运行目录
+    （``runs/{ts}/inputs``），路径次次不同 → 缓存**永远不命中**，于是同一份语料被反复解析；
+    32 路并发时这 32 次解析还都排在**同一个事件循环**里，把别的请求一起卡住。
+
+    指纹（见 ``corpus_fingerprint``）在硬链下与原文件一致，所以「同一 user、语料未变」
+    落在同一个键上 —— N 路并发只建一次，后续命中是纯字典查找。
+
+    **同一键并发只建一次**：``build`` 在**按键的锁**里跑（而不是全局锁），所以不同语料
+    不会互相排队。调用方通常还会把它放进线程（``asyncio.to_thread``），于是构建期间事件
+    循环照常处理别的请求。
+    """
+
+    def __init__(self, maxsize: int = 8) -> None:
+        self.maxsize = max(1, int(maxsize))
+        self._data: dict[Any, Any] = {}
+        self._order: list[Any] = []
+        self._guard = threading.Lock()
+        self._gates: dict[Any, Any] = {}
+
+    def get(self, key: Any, build: Callable[[], Any]) -> Any:
+        with self._guard:
+            if key in self._data:
+                return self._data[key]
+            gate = self._gates.get(key)
+            if gate is None:
+                gate = threading.Lock()
+                self._gates[key] = gate
+        with gate:
+            with self._guard:
+                if key in self._data:
+                    return self._data[key]
+            value = build()          # 锁外构建：不同键并行，别的请求不受阻
+            with self._guard:
+                if key not in self._data:
+                    self._data[key] = value
+                    self._order.append(key)
+                    while len(self._order) > self.maxsize:
+                        stale = self._order.pop(0)
+                        self._data.pop(stale, None)
+                        self._gates.pop(stale, None)
+            return value
+
+    def clear(self) -> None:
+        with self._guard:
+            self._data.clear()
+            self._order.clear()
+            self._gates.clear()
 
 
 # ---------------------------------------------------------------------------

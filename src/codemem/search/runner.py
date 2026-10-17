@@ -48,7 +48,6 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -67,13 +66,19 @@ from ..log import Logger, block
 
 # 从 io 导入**唯一**的 PROJECT_ROOT，不要自己 parents[N] 推 ——
 # 本文件在子包里深度不同，重算会落到 src/ 而不是项目根。
-from ..io import PROJECT_ROOT, read_jsonl
+from ..io import (
+    CORPUS_FILES,
+    PROJECT_ROOT,
+    FingerprintCache,
+    corpus_fingerprint,
+    read_jsonl,
+)
 DATA_DIR = PROJECT_ROOT / "data"
 CONFIG_FILE = PROJECT_ROOT / "configs" / "search.yaml"
 TOOL_CONFIG_FILE = PROJECT_ROOT / "configs" / "tool.json"
 
-#: 语料：一个目录下的三个记忆文件（见 ``add/memory.py``）。search 用同一套 grep 检索它们。
-CORPUS_FILES = ("msgmem.jsonl", "summem.jsonl", "atommem.jsonl")
+# ``CORPUS_FILES``（语料：一个目录下的三个记忆文件）定义在 ``io`` —— add / search / api 都按
+# 同一份清单算指纹，别处不要再抄一份。
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "generator": {"base_url": "http://127.0.0.1:30000/v1", "api_key": "sglang", "model": "local",
@@ -837,18 +842,17 @@ def render_tag_index(inputs_dir: Path, per_key: int = 3, max_atoms: int = 20,
     return header + "\n" + "\n".join(lines)
 
 
-@lru_cache(maxsize=8)
-def _cached_tag_index(inputs_dir_str: str) -> str:
-    return render_tag_index(Path(inputs_dir_str))
+#: 这两份 prompt 片段（tag 索引 / 说话人名单）的缓存：键是**语料指纹**，不是路径。
+#: 在线形态下每条 query 都是新的运行目录，按路径缓存等于不缓存（见 ``io.FingerprintCache``）。
+_TAG_INDEX_CACHE = FingerprintCache(maxsize=8)
+_PARTICIPANTS_CACHE = FingerprintCache(maxsize=8)
 
 
 def tag_index_for(inputs_dir: Path) -> str:
-    """带缓存的入口（``inputs`` 是软链接，先 resolve 再当键，138 条 QA 只建一次）。"""
-    try:
-        key = str(Path(inputs_dir).resolve())
-    except OSError:
-        key = str(inputs_dir)
-    return _cached_tag_index(key)
+    """带缓存的入口（同一份语料只渲染一次，跨运行目录、跨并发请求共享）。"""
+    return _TAG_INDEX_CACHE.get(
+        corpus_fingerprint(inputs_dir), lambda: render_tag_index(inputs_dir),
+    )
 
 
 # ``metadata.role`` 里**不是人名**的那些值来自 ``adapters.NON_PERSON_ROLES``（与 ``audit`` 共用
@@ -912,18 +916,11 @@ def render_participants(inputs_dir: Path, max_names: int = 24) -> str:
     return "\n".join(lines)
 
 
-@lru_cache(maxsize=8)
-def _cached_participants(inputs_dir_str: str) -> str:
-    return render_participants(Path(inputs_dir_str))
-
-
 def participants_for(inputs_dir: Path) -> str:
     """带缓存的入口（与 ``tag_index_for`` 同款）。"""
-    try:
-        key = str(Path(inputs_dir).resolve())
-    except OSError:
-        key = str(inputs_dir)
-    return _cached_participants(key)
+    return _PARTICIPANTS_CACHE.get(
+        corpus_fingerprint(inputs_dir), lambda: render_participants(inputs_dir),
+    )
 
 
 @dataclass
@@ -966,7 +963,21 @@ async def run_phases(
     **verifier 在最后判一次**：独立 auditor 只看 ``(question, evidence)``，判"能否回答"；
     不足则把 ``missing[]`` 作为新一轮 user 消息喂回去再跑（≤ ``max_verify_rounds``）。
     """
-    roster = load_session_roster(inputs_dir)
+    # 开场那几段 prompt 片段（会话清单 / tag 索引 / 说话人名单）与审计用的语料索引都要**读整份
+    # 语料**，全是 CPU。**放到线程里并发做**：它们只建一次（按语料指纹缓存），但首建那一刻
+    # （1.5MB 语料 + 分词）会占住事件循环几百毫秒 —— 在线形态下 32 条 query 同时首建，
+    # 就是一个"大家都没法响应"的雪崩点。
+    async def _corpus_index():  # noqa: ANN202
+        if not config.get("evidence_audit", True):
+            return None
+        return await asyncio.to_thread(audit.corpus_index_for, inputs_dir)
+
+    roster, tag_index, participants, corpus_index = await asyncio.gather(
+        asyncio.to_thread(load_session_roster, inputs_dir),
+        asyncio.to_thread(tag_index_for, inputs_dir),
+        asyncio.to_thread(participants_for, inputs_dir),
+        _corpus_index(),
+    )
     session_index = render_session_index(roster)
 
     max_steps = int(config.get("max_steps", 30))
@@ -986,10 +997,7 @@ async def run_phases(
     forget_keep_recent_turns = max(0, int(config.get("forget_keep_recent_turns", 2)))
     tool_failure_notice_after = max(0, int(config.get("tool_failure_notice_after", 2)))
     # 确定性证据审计：核对"正文里的专名在不在被引来源里"。默认开；关掉它只影响提示，
-    # 不影响产物（见 codemem/audit.py）。
-    corpus_index = (
-        audit.corpus_index_for(inputs_dir) if config.get("evidence_audit", True) else None
-    )
+    # 不影响产物（见 codemem/audit.py）。索引已在上面的 gather 里建好。
     audit_max_notices = max(0, int(config.get("audit_max_notices", 3)))
     broad_grep_lines = max(0, int(config.get("broad_grep_lines", 80)))
 
@@ -999,8 +1007,7 @@ async def run_phases(
     messages: list[dict[str, str]] = [
         {"role": "system", "content": scripted_prompt},
         {"role": "user", "content": catalog.prompt_text(
-            "user_begin", sessions=session_index, tags=tag_index_for(inputs_dir),
-            participants=participants_for(inputs_dir),
+            "user_begin", sessions=session_index, tags=tag_index, participants=participants,
         )},
     ]
 

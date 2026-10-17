@@ -87,7 +87,8 @@ src/codemem/
 scripts/
   run_eval.py                        # 一条命令跑通 search → answer → eval 并打印摘要
   test_search.py                     # 纯 CPU 自测（假模型 + 真工具，零模型成本）
-  test_api.py                        # 封装 API 的纯 CPU 自测（幂等 / 隔离 / data 映射 / 形态适配）
+  test_api.py                        # 封装 API 的纯 CPU 自测（幂等 / 隔离 / data 映射 / 形态适配 / 并发与补漏）
+  check_api_store.py                 # **只读体检**：哪些 user / 会话欠着 atom（补漏前后各跑一次）
   analyze_api_formats.py             # 普查 data/api_store 里各数据集的报文形态（§4.2）
   rebuild_api_store.py               # 按新适配层重跑存量 msgmem / 记忆（§4.2）
   eval_baseline.py eval_rag.py eval_atommem.py analyze_atommem_results.py  # baseline 对照（见 §6）
@@ -108,6 +109,7 @@ scripts/
 
 ```bash
 pip install openai pyyaml tqdm fastapi uvicorn
+# 可选加速件（缺了照跑，见 §4.3）：httpx（按并发配 keep-alive 连接池）与 uvloop（更快的事件循环）
 ```
 
 Python 3.12+。`grep` / `date` 是系统自带命令，agent 直接通过 `bash` 用它们。
@@ -127,13 +129,17 @@ python -m codemem.add --stage atommem --limit-messages 20   # 只跑前 20 条 m
 > 那一版。逐 message 的 code agent 变体（`--mode agent` / `agent-v2`）更灵活，但弱模型在 loop 里
 > **不稳定**（同一条消息多次跑产出 0/2/4 不等），故不作默认 —— **其实现已迁至 `add-agent` 分支，
 > 本分支的 add 只有 pipeline**。细节见 [`add.md`](add.md)。
+>
+> **"单次 LLM" 是有条件的**：prompt 超过 `max_input_tokens` 就**切成多次**（上下文按行截、目标
+> 消息切块、放不下再砍半重切）。平台喂进来的"一条 message"可能是一整篇文档，整段塞进去的结果不是
+> 抽得糙，而是**一条 atom 都没有**（400 超上下文，4xx 不可重试）。见 [`add.md`](add.md) 的"输入预算"。
 
 **三层，产出三种记忆文件**（都在 `data/{speaker_a}_{speaker_b}/` 下，JSONL 一行一条）：
 
 | 文件 | `type` | 内容 | 生成方式 |
 |---|---|---|---|
 | `msgmem.jsonl` | `msg` | 每条原始消息（**原话**）；`time` 是会话时间戳，`role` 是说话人真名 | 纯 CPU：离线由 dataset 直接转换；在线由**形态适配层**归一化后落盘（§4.2） |
-| `summem.jsonl` | `summary` | 每个会话一份总结 | LLM，**逐 session 一次** |
+| `summem.jsonl` | `summary` | 每个会话一份总结 | LLM，**逐 session 一次**（会话超长则**分段总结再拼起来**，见 [`add.md`](add.md) 的输入预算） |
 | `atommem.jsonl` | `atom` | 逐 message 抽出的**原子事实**（≤20 词、自足、单一事实） | **pipeline 逐 message 抽取**（单次 LLM + 代码级后处理，整目录并行） |
 
 记录格式对齐 `memory_template.jsonl`：
@@ -931,6 +937,11 @@ uvicorn codemem.api.server:app --port 8000
 | `POST /search` | `{query, options?, user_id, top_k?}` | `{data:[{id, content, score, created_at}]}` |
 | `GET /health` | —— | `{status:"ok"}` |
 
+**并发上限：Add 32 / Search 32**（`configs/api.yaml`），且**这两个数是这里的最终解释权** ——
+离线 `search.yaml` / `add.yaml` 里同名/同类的键只用来填 `api.yaml` 没写的缺省（见 §4.3）。
+背负这两条负载的是四件事：**锁的作用域**、**进程级模型闸门**、**增量抽取**、**把阻塞活挪出事件
+循环**。
+
 四条贯穿全局的约定：
 
 - **Add 幂等**。`request_id` 是幂等键 —— 重试时同一个 `request_id` **不会再写一遍**
@@ -960,6 +971,7 @@ uvicorn codemem.api.server:app --port 8000
 
 ```
 meta.json                 session_id -> 会话号、每会话消息数、已应用的 request_id、pending（写前日志）
+atom_state.json           抽取进度：每会话"总结到第几条消息 / 哪些 message 已抽过 atom / 还欠着哪些"（§4.3）
 msgmem.jsonl              逐条原始消息（type=msg；会话时间戳是锚点）
 summem.jsonl              每会话一条总结（type=summary）
 atommem.jsonl             逐消息抽出的原子事实（type=atom）
@@ -984,29 +996,38 @@ QA 到底问了什么"，而不只是推导后的产物。
 自测（纯 CPU、零模型成本、零网络 —— 假模型 + 真工具 / 真存储）：
 
 ```bash
-python scripts/test_api.py     # 49 项断言：幂等 / 多 user 隔离 / msg_id 与时间 / data 映射 / 请求留痕 / 多模态
+python scripts/test_api.py     # 217 项断言：幂等 / 多 user 隔离 / msg_id 与时间 / data 映射 / 请求留痕 /
+                               # 多模态 / 中断续跑 / 配置优先级 / 输入预算（切块与抢救）/ CLI /
+                               # 并发与增量 / 失败重试与补漏 / 内容策略拦截 / 闸门 / 去重等价性 / 跨运行缓存
+                               # （`--bench` 会多跑几档去重量级：几千条那一档用暴力版要几十秒）
 ```
 
-配置在 `configs/api.yaml`：它只留 API 自有项（`store_dir` / `concurrency` / `top_k` /
-`tool_config`），**模型与行为直接复用离线配置** —— `search_config: configs/search.yaml`
-（Search，agent loop）与 `add_config: configs/add.yaml`（Add，pipeline），加载时并进来。
-离线改那两份，API 自动跟着改（`server._merge_offline_configs`）。
+配置在 `configs/api.yaml`：它只留 API 自有项（`store_dir` / `concurrency` / `add_concurrency` /
+`top_k` / `tool_config` / `server`），**模型与行为直接复用离线配置** ——
+`search_config: configs/search.yaml`（Search，agent loop）与 `add_config: configs/add.yaml`
+（Add，pipeline），加载时并进来。离线改那两份，API 自动跟着改（`server._merge_offline_configs`）。
+
+**唯一的例外是显式写下的键**：`api.yaml` 里写了的，离线配置不再覆盖它。理由很实际 ——
+`search.yaml` 的 `concurrency` 是"跑一次评测时几条 QA 并发"，与"服务同时接多少条 query"是两件事，
+只是恰好同名；不设这条规则的话，"把 API 并发调到 32"就永远说不出口（会被离线那份盖回去）。
 
 ### 4.1 实现要点
 
 - **`models.py`**：协议模型（pydantic）+ `ContentPart[]` → 文本的归一化（唯一实现，
   Add 与 Search 共用）。
-- **`store.py`**：每 `user_id` 一个目录；`UserStore.append` 在**写锁**内按**写前日志**顺序完成
-  崩溃一致的写入 —— "先补完遗留 pending → 查幂等键 → 分配 `msg_id` → **WAL** 记意图到
-  `meta.pending`（并预留 id 空间）→ 追加消息到 `msgmem.jsonl` → 重建该会话的 `summem`（一次 LLM）
-  与 `atommem`（逐 message 的 **pipeline**）→ 成功才移进 `applied_request_ids` 落定"，各文件原子写回。
-  恢复入口 `UserStore.recover` / 模块级 `recover_all`：按 `memory_id` 幂等补齐 msgmem、重跑刷新、
-  落定；刷新失败则保留 pending 待下次续跑。
+- **`store.py`**：每 `user_id` 一个目录；`UserStore.append` 按**写前日志**顺序完成崩溃一致的写入 ——
+  "**锁内（纯 CPU）**：补完遗留 pending 的消息部分 → 查幂等键 → 分配 `msg_id` → **WAL** 记意图到
+  `meta.pending`（并预留 id 空间）→ 追加消息到 `msgmem.jsonl`；**锁外（模型调用）**：重建该会话的
+  `summem`（一次 LLM）与 `atommem`（逐 message 的 **pipeline**）；**锁内**：成功才移进
+  `applied_request_ids` 落定"，各文件原子写回。恢复入口 `UserStore.recover` / 模块级 `recover_all`：
+  按 `memory_id` 幂等补齐 msgmem、重跑刷新、落定；刷新失败则保留 pending 待下次续跑。
+  **模型调用一律在锁外** —— 这是本文件唯一重要的并发纪律，见 §4.3。
 - **`retriever.py`**：直接调 `search.runner.run_phases`（与离线 search 同一套编排），
   复用现成的 `ModelRunner` / `build_shell_prefix` / `link_dir_or_copy` / `validate_file`。
   **不另写一套**：在线与离线的检索行为必须一致，否则"本地调好的 prompt 上线就不准了"。
-- **`server.py`**：FastAPI app，协程级 `asyncio.Semaphore` 限流；`create_app(config)` 供测试注入。
-- 一处实测踩坑：agent 的 cwd 是 `qa/`、prompt 里所有检索示例写的是 `inputs/...`（相对 cwd），
+- **`server.py`**：FastAPI app，三个协程级 `asyncio.Semaphore` 分工限流（Search / Add 请求 /
+  add 侧模型调用，见 §4.3）；`create_app(config)` 供测试注入。
+  一处实测踩坑：agent 的 cwd 是 `qa/`、prompt 里所有检索示例写的是 `inputs/...`（相对 cwd），
   所以 `qa/inputs` 必须**也**存在一份链接（与 `runner.run_qa` 一致），否则 grep 永远空。
 
 ### 4.2 形态适配层：平台的报文不是一个 `role` 字段能承载的
@@ -1067,6 +1088,95 @@ id 与时间戳重放后逐条一致（`session_1_1` 还是 `session_1_1`），�
 
 普查与细节见 [`adapters.md`](adapters.md)；普查脚本 `scripts/analyze_api_formats.py`
 用的是适配层**自己的**判据，所以统计口径与预处理行为不会两套各说各话。
+
+### 4.3 并发与负载：Add 32 / Search 32 靠什么扛住
+
+服务在**一个事件循环**里跑。要让 32 路 Add 与 32 路 Search 同时在线而不互相拖死，四件事缺一不可。
+
+**① 锁的作用域 = "不调模型的那些行"。** 每 user 一把**语料写锁**，只管 `meta.json` /
+`msgmem.jsonl` / `requests.jsonl`，以及 `summem` / `atommem` 的读—改—写（微秒~毫秒级）。
+**持有它的时候一次模型都不许调。** 每 `(user, session)` 另有一把**刷新锁**，它**可以**跨模型调用
+持有 —— 同一会话的两次 Add 本来就该共用一次重建，而不是各抽一遍。旧实现把整段刷新放在写锁里，
+于是同一 user 的并发 Add 全部退化成串行：32 路进来只有 1 路在跑、另 31 路在锁上排队，连
+`/search` 末尾那行请求留痕（只写一行）都被堵住。
+
+**② 进程级模型闸门。** `add_sem` 只限制"同时接几个 Add 请求"，而一次 Add 会**按 message 并发
+抽取**（一条几十消息的会话就是几十次调用）—— 只看它会把这个数字放大几十倍。所以另有一个
+`add_gate`：按**每次 chat completion** 计数，Add 侧的 summem / atommem 整条链路共用，
+额度 = `model_concurrency`（缺省 = `add_concurrency`）。两者分开是有用的：`add_concurrency`
+决定"接得住多少并发请求"，`add_gate` 决定"同时开几条到端点的连接" —— 端点在建连阶段丢 SYN 时
+把后者调小即可，不必牺牲前者。**补漏另有自己的一把小闸门**（`repair_concurrency`，缺省是
+模型额度的四分之一）：它是后台活又跑得久，占用主额度就会让服务刚起来那几分钟的请求全在排队。
+闸门**只包住单次调用**，不套在整条 pipeline 外面 —— 否则一份 prompt 被切成 N 块时就成了
+"占着一个名额去等另一个名额"，几十路并发下直接僵住。Search 侧每个 agent loop 一次只发一个请求，
+所以 `concurrency` 本身就是上限。
+
+**③ 增量抽取 + 两层重试。** 每个会话的抽取进度记在 `atom_state.json`
+（`{会话: {总结到第几条, 已抽过的 msg_id, 还欠着哪些 failed}}`），重刷一个会话只处理**还没抽过**的
+message。成立的前提是 add 的追加语义：一条 message 的抽取只依赖它**之前**的原文
+（`recall_context` 只往前看），所以后来追加的消息不会改变早先抽出的结论。
+
+**抽取失败必须被当回事**，因为它**不影响 Add 成功**（消息已可检索、只是少了几条 atom），
+于是它既不会留在 `pending` 里、重启的"续跑"也捞不到它。三层兜住，按"还能不能救"分开：
+
+| 层 | 做什么 | 管什么失败 |
+|---|---|---|
+| **就地重试**（`atom_retry_rounds` / `atom_retry_backoff`） | 一次 Add 的刷新里，失败的那几条等 2s / 4s 再抽一遍（默认 2 轮，总耗时受 `atom_retry_budget` 约束） | 抖动：**建连超时**（远程端点在并发新建连接时丢 SYN，一批里十几条一起中），而 `llm.py` 那层的 3 次退避 2s/4s 不够 |
+| **补漏**（`repair_all` / `--repair` / 启动后台任务） | 把记账里 `failed` / `summary_failed` 的会话重刷一遍 | 端点长时间不通、进程中途被杀等"这一轮怎么都抽不出来"的情况 |
+| **blocked**（不重试，只留痕） | 记账里单独记 `blocked` / `summary_blocked`，**排除在自动重试之外**，`--repair --retry-blocked` 才重来 | 端点**不接受这个 prompt**：内容策略拦截（`400 content_filter`）、非法请求 —— 重发同一个 prompt 还是同样结果，自动重试只会把同一份 prompt 一轮轮烧下去 |
+
+失败分类的**判据在 `llm.py`**（`is_context_length_error` / `is_content_filter_error` /
+`is_permanent_prompt_error`）：能缩输入救的（超上下文）缩；触发词常常在**前文上下文**里的
+内容策略，先**去掉上下文重试一次**再判死；其余 4xx 一律算"重发也没用"。被拦下的那条 message
+会用**自己的**抽取结果（可能为空）记账，运维用 `scripts/check_api_store.py` 就能看到
+"哪几条是端点拒绝的、为什么不重试"。
+
+补漏**只认显式记账的失败**，不拿"覆盖名单的差集"去推：差集分不清"抽失败了"和"这台机器上还没
+轮到抽"（旧版语料根本没有记账文件），后者一旦被当成前者，启动补漏就会把整库重抽一遍。**例外是
+旧格式记账**（有该会话的条目、但没有 `failed` 键，即早先版本写的）—— 那种条目回退到差集，正是
+升级场景要救的那批。常态下补漏只读各 user 的 `atom_state.json`，**一个模型调用都不发**；启动时
+它是**后台任务**（不阻塞启动，也不占着 `/health`），关闭服务时先取消它再关客户端。手动补漏
+（`python -m codemem.api --repair`）**要在服务没在跑时用** —— 它是另一个进程、有自己的锁，
+同库双写会让两边互相覆盖；服务在跑时直接重启即可，重启会自动补。
+
+补漏前后各看一眼欠账（**只读、不写文件、不调模型**，服务在跑时也能查）：
+
+```bash
+python scripts/check_api_store.py            # 哪些 user / 会话欠 atom、缺哪些 msg_id、为什么
+```
+
+两个细节是真踩过的坑：进度记账必须**锁内"并"、不能整份覆盖**（各会话并发刷新，覆盖会把别人刚写
+进去的进度冲掉 —— 实测 8 路并发 Add 的抽取调用从 8 次涨到 14 次）；**本进程正在跑的** pending
+不能当"被中断的 Add"去恢复（`_in_flight`），否则同时进来的 Add 会互相恢复、把同一批消息抽 N 遍。
+
+**④ 把阻塞活挪出事件循环。** 整文件读写、JSON 解析、去重一律 `asyncio.to_thread` —— 单进程多
+协程里事件循环是**共享**的，一个 user 的一次全量重写会卡住**所有**请求的响应。
+
+**⑤ 别在请求路径上做 O(n²) 的事。** 去重原来是"把**整个库**两两比一遍"（每次 Add 都跑一次），
+库里几千条时一次 Add 就是几十秒、上万条要几分钟 —— 写锁被这一步占着，同 user 的其它 Add 与
+`/search` 的请求留痕全在排队，**服务看起来就是卡住了**。现在改成
+`merge_atoms(已有, 新增)`：**只把新抽出来的**并进去（库里那些两两配对在它们各自被并进来时就
+比过了），候选靠 **token 倒排索引**筛（两条 atom 被判为同一事实的必要条件就是共享实词），
+每句话的特征（分词 / 主语 / 专名 / 情绪动词）也算一次就缓存 —— 结果与暴力版逐条一致
+（`test_api.py` 里有等价性断言），300 条库时快 85×、且随库增长是**线性**而不是平方
+（数字见 [`log.md`](log.md) S25）。同一处还有两个小 O(n)：每条 message 各扫一遍 `msgmem`
+找位置（改成预建位置表）、以及线程池默认只有 32 个工人全局共享（启动时按并发调大）。
+
+Search 侧对应的一条：每条 query 都新建运行目录，而 `inputs/*.jsonl` 是**硬链**（与原文件同 inode）。
+开场那三段 prompt（会话清单 / tag 索引 / 说话人名单）与审计用的语料索引都要读整份语料，若按**路径**
+缓存就等于不缓存（路径次次不同）—— 32 条 query 会各读一遍 1.5MB 语料，还都排在同一个事件循环里。
+所以缓存键改成**语料指纹**（`io.corpus_fingerprint`：三个记忆文件的 dev/ino/size/mtime），同一份语料
+只建一次；构建本身也在线程里，且同一指纹只建一次、不同语料不互相排队（`io.FingerprintCache`）。
+语料一变指纹就变，不会给出过期结果。
+
+外加两个纯加速件（都不改变行为，缺了也能跑）：`llm.make_client` 把 **keep-alive 连接池按并发配**
+（远程端点正是靠丢"新建连接"扼杀吞吐的，见 `llm.py` 的 `connect_timeout` 注释），启动时能拿到
+`uvloop` 就用。前者需要 `httpx`（openai 的常规依赖），拿不到就退回 SDK 自建客户端。
+
+**被测试钉住的行为**（`scripts/test_api.py`）：8 个不同 session 的 Add 同时打同一个 user，模型调用
+必须**真正重叠**（旧实现峰值并发恒为 1）、**恰好 8 次**（不重抽）、追加一条消息只多 1 次调用；
+"语料派生结果跨运行目录只建一次、语料一变就重建"的缓存用例；以及抽取失败时"就地重试补全 →
+一直失败就记账 → 端点恢复后补漏补上"的整条链路。
 
 ---
 

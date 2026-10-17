@@ -185,14 +185,19 @@ async def rebuild_user(
     store.root.mkdir(parents=True, exist_ok=True)
     write_memories(store.msgmem_path, records)
     store_mod._atomic_write_json(store.meta_path, {**store.meta(), **meta})
+    # 重放改变了语料，"哪些 message 已经抽过"的记账（atom_state.json）跟着作废 ——
+    # 留着它，下一次增量刷新就会跳过这些 message，重建出来的 atom 反而是旧的。
+    store.atom_state_path.unlink(missing_ok=True)
 
     if stage == "memories":
-        # 逐会话重刷 summem / atommem（复用 add 的写入路径，逐会话并发由 store 管）。
+        # 逐会话重刷 summem / atommem（复用 add 的写入路径）。
+        # ``force=True``：跳过 ``atom_state.json`` 的增量记账，**整会话重抽** —— 重建的
+        # 全部意义就是"换一套规则重算已抽过的消息"，增量在这里正好是反的。
         refreshed = 0
         for session_index in sorted(meta["sessions"].values(), key=lambda e: int(e["index"])):
             await store._refresh_memories(          # noqa: SLF001 - 就是它的写入路径
                 session_index=int(session_index["index"]), config=config,
-                client=client, log=log,
+                client=client, log=log, force=True,
             )
             refreshed += 1
         result["sessions_refreshed"] = refreshed

@@ -28,6 +28,7 @@ import yaml
 from .. import llm
 from ..adapters import speakers_of, speakers_phrase
 from ..io import DATA_DIR, PROJECT_ROOT, memory_id, memory_role, memory_text, now_iso
+from ..llm import estimate_tokens
 from ..log import Logger
 from ..prompts import SUMMEM_SYSTEM_PROMPT, SUMMEM_USER_PROMPT, salvage_json_object
 from .memory import MSGMEM_NAME, SUMMEM_NAME, group_by_session, parse_dir_label, write_memories
@@ -37,6 +38,18 @@ CONFIG_FILE = PROJECT_ROOT / "configs" / "add.yaml"
 # 收尾补跑空总结：最多几轮、每轮之间停多久。见 ``run_dir`` 里的说明。
 REPAIR_ROUNDS = 3
 REPAIR_PAUSE = 5.0
+
+#: 一次总结的 prompt 预算（system + user）。超出就**把会话分段分别总结**再拼起来。
+#: 实测有的语料"一个 session"就是 15 万 token（一整篇文档），整段塞进去的结果是端点回 400
+#: ``context_length_exceeded``，这个 session 一条总结都没有 —— 而它正是**路标**，缺了会让
+#: 检索少一条线索。
+DEFAULT_MAX_INPUT_TOKENS = 12000
+#: 端点仍判超长（估算偏乐观）时预算砍半重切，最多几次。
+MAX_SHRINK_ATTEMPTS = 2
+#: 单组消息的 token 下限（再切也没意义）。
+MIN_GROUP_TOKENS = 400
+#: 一个会话最多切几段（兜底，防"切了又错、错了又切"）。
+MAX_GROUPS = 32
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "local",
@@ -99,25 +112,88 @@ def render_messages(records: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def clip_middle(text: str, budget_tokens: int) -> str:
+    """太长就保留**开头 + 结尾**（会话总结要的是"从头聊到哪"，中段丢一点可以接受）。"""
+    if budget_tokens <= 0 or estimate_tokens(text) <= budget_tokens:
+        return text
+    marker = "\n…(middle of this part omitted)…\n"
+    low, high = 0, len(text) // 2
+    while low < high:
+        middle = (low + high + 1) // 2
+        piece = text[:middle] + marker + text[len(text) - middle:]
+        if estimate_tokens(piece) <= budget_tokens:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low] + marker + text[len(text) - low:]
+
+
+def plan_groups(
+    records: list[dict[str, Any]], budget_tokens: int,
+    max_groups: int = MAX_GROUPS, overlap: int = 1,
+) -> list[list[dict[str, Any]]]:
+    """按 token 预算把会话的消息切成若干组（每组渲染后都放得下）。
+
+    **连续切、不跳着分**：会话是有时间线的，跳着分组会让总结读不出先后。相邻两组之间留一条
+    重叠（``overlap``），免得一句话正好被切在边界上、两边都不完整。
+    """
+    if budget_tokens <= 0 or len(records) <= 1:
+        return [list(records)]
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    used = 0
+    index = 0
+    while index < len(records):
+        record = records[index]
+        cost = estimate_tokens(render_messages([record])) + 1
+        if current and used + cost > budget_tokens:
+            groups.append(current)
+            if len(groups) >= max_groups:      # 到上限：剩下的全塞进最后一段
+                groups[-1].extend(records[index:])
+                return groups
+            carry = records[max(0, index - overlap):index]
+            current = list(carry)
+            used = sum(estimate_tokens(render_messages([r])) + 1 for r in carry)
+            continue                            # 同一条 record 在新组里重来
+        current.append(record)
+        used += cost
+        index += 1
+    if current:
+        groups.append(current)
+    return groups
+
+
 def build_messages(
     *, session_index: int, session_time: str, records: list[dict[str, Any]],
     speakers: list[str] | None = None,
     speaker_a: str = "user", speaker_b: str = "assistant",
+    part: tuple[int, int] | None = None, max_body_tokens: int = 0,
 ) -> list[dict[str, str]]:
     """渲染一次总结的 prompt。
 
     **参与者名单是 ``speakers``（本次会话真实出现的角色），不是硬编码的两个人。** 离线语料
     里 ``speaker_a``/``speaker_b`` 由目录名给出；在线语料（尤其是剧本、多人语料、文档）
     只有一份 ``user``/``assistant`` 就写死了 —— 那会让总结把 14 个陪审员说成两个人。
+
+    ``part`` 是"这一段是一个长会话的第几段"（分段总结时给），``max_body_tokens`` 是正文预算
+    （单条消息本身就超预算时的兜底，见 ``clip_middle``）。
     """
     names = list(speakers) if speakers else [speaker_a, speaker_b]
+    body = render_messages(records)
+    if part is not None and part[1] > 1:
+        body = (
+            f"(this is part {part[0]} of {part[1]} of ONE long session -- summarize only what "
+            f"appears in this part, and do not write an overall conclusion)\n{body}"
+        )
+    if max_body_tokens > 0:
+        body = clip_middle(body, max_body_tokens)
     return [
         {"role": "system", "content": SUMMEM_SYSTEM_PROMPT
             .replace("{speakers}", speakers_phrase(names))},
         {"role": "user", "content": SUMMEM_USER_PROMPT
             .replace("{session_index}", str(session_index))
             .replace("{session_time}", session_time or "(unknown)")
-            .replace("{messages}", render_messages(records))},
+            .replace("{messages}", body)},
     ]
 
 
@@ -145,37 +221,83 @@ async def summarize_session(
     speaker_b: str = "assistant",
     speakers: list[str] | None = None,
 ) -> dict[str, Any]:
-    """对一个 session 跑一次总结，返回 summem 记录。失败保留空 memory（不写坏）。
+    """对一个 session 跑一次总结，返回 summem 记录。**失败不抛**，在 ``metadata.error`` 里说明。
 
-    ``speakers`` 缺省时退回 ``[speaker_a, speaker_b]``（离线语料走这条）。
+    **prompt 有预算**（``max_input_tokens``，与 atommem 同一个键、同一把尺子）：会话太长就
+    **分段总结再拼起来**（段间重叠一条消息），而不是把整段塞进去 —— 实测有的语料"一个 session"
+    就是 15 万 token，整塞的结果是端点回 400 ``context_length_exceeded``，这个 session 一条总结
+    都没有。端点仍判超长（估算偏乐观）就把预算砍半重切，最多 ``MAX_SHRINK_ATTEMPTS`` 次。
+
+    失败时的两种类别（调用方据此决定"还自动重试吗"，见 ``store._refresh_memories``）：
+
+    - ``error="permanent"``：端点**不接受这个 prompt**（内容策略 / 非法请求）—— 重发也一样；
+    - ``error="transient"``：超时、建连失败、5xx —— 值一顿饭再试。
+
+    memory 为空**或只有一部分**（前几段成了、后面某段没成）都会带上 ``error``；部分总结照样有用，
+    所以照写。
     """
     if speakers is None:
         # 调用方没给名单 —— 从消息自身的 role 推一份（在线语料有真名，离线语料没有）。
         speakers = speakers_of(records)
-    messages = build_messages(
-        session_index=session_index, session_time=session_time, records=records,
-        speakers=speakers, speaker_a=speaker_a, speaker_b=speaker_b,
-    )
+    names = list(speakers) if speakers else [speaker_a, speaker_b]
+    system_prompt = SUMMEM_SYSTEM_PROMPT.replace("{speakers}", speakers_phrase(names))
+    call_config = gen_call_config(config, "summem")
+
+    total_budget = int(config.get("max_input_tokens", DEFAULT_MAX_INPUT_TOKENS) or 0)
+    payload = 0
+    if total_budget > 0:
+        skeleton = (SUMMEM_USER_PROMPT.replace("{session_index}", "")
+                    .replace("{session_time}", "").replace("{messages}", ""))
+        payload = total_budget - estimate_tokens(system_prompt) - estimate_tokens(skeleton) - 32
+        payload = max(MIN_GROUP_TOKENS, payload)
+
     summary = ""
-    try:
-        raw = await llm.chat_completion(client, gen_call_config(config, "summem"), messages)
-        summary = parse_summary(raw)
-    except Exception as exc:  # noqa: BLE001 - 一个 session 失败不该让整目录没有输出
-        print(f"  [summem] session {session_index} 总结失败：{llm.describe_error(exc)}",
-              file=sys.stderr)
+    error = ""
+    for attempt in range(MAX_SHRINK_ATTEMPTS + 1):
+        groups = plan_groups(records, payload)
+        parts: list[str] = []
+        error = ""
+        shrink = False
+        for index, group in enumerate(groups, 1):
+            messages = build_messages(
+                session_index=session_index, session_time=session_time, records=group,
+                speakers=names, part=(index, len(groups)), max_body_tokens=payload,
+            )
+            try:
+                raw = await llm.chat_completion(client, call_config, messages)
+                text = parse_summary(raw)
+            except Exception as exc:  # noqa: BLE001 - 一个 session 失败不该让整目录没有输出
+                if (llm.is_context_length_error(exc) and payload > MIN_GROUP_TOKENS
+                        and attempt < MAX_SHRINK_ATTEMPTS):
+                    shrink = True
+                    break
+                error = "permanent" if llm.is_permanent_prompt_error(exc) else "transient"
+                print(f"  [summem] session {session_index} 总结失败：{llm.describe_error(exc)}",
+                      file=sys.stderr)
+                break
+            if text:
+                parts.append(text if len(groups) == 1 else f"(part {index}/{len(groups)}) {text}")
+        if shrink:
+            payload = max(MIN_GROUP_TOKENS, payload // 2)
+            continue
+        summary = " ".join(parts)
+        break
+
     source = [memory_id(record) for record in records if memory_id(record)]
-    return {
-        "memory": summary,
-        "metadata": {
-            "id": f"session_{session_index}_summary",
-            "type": "summary",
-            "time": session_time,
-            "role": "summary",
-            "tag": [],
-            "source": source,
-            "changelog": [{"time": now_iso(), "content": "created"}],
-        },
+    metadata: dict[str, Any] = {
+        "id": f"session_{session_index}_summary",
+        "type": "summary",
+        "time": session_time,
+        "role": "summary",
+        "tag": [],
+        "source": source,
+        "changelog": [{"time": now_iso(), "content": "created"}],
     }
+    if error:
+        # 让下游（与运维）能一眼看出"这不是总结得不好，是这次没成"，并区分要不要重试。
+        metadata["status"] = "error"
+        metadata["error"] = error
+    return {"memory": summary, "metadata": metadata}
 
 
 async def run_dir(
@@ -225,7 +347,13 @@ async def run_dir(
     # 所以隔几秒重跑，最多 ``REPAIR_ROUNDS`` 轮；没有空的了就提前收手。
     repaired = 0
     for round_index in range(REPAIR_ROUNDS):
-        pending = [p for p, s in enumerate(summaries) if not (s.get("memory") or "").strip()]
+        # 只补"可能只是抖动"的空总结：``error=permanent``（内容策略 / 非法请求）重跑同一份
+        # prompt 也是同样结果，补三轮纯属白烧调用。
+        pending = [
+            position for position, summary in enumerate(summaries)
+            if not (summary.get("memory") or "").strip()
+            and (summary.get("metadata") or {}).get("error") != "permanent"
+        ]
         if not pending:
             break
         if round_index:

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
 # 阈值与词表
@@ -138,22 +139,52 @@ def is_same_fact(a: str, b: str) -> bool:
     2. **两句话都含情绪动词，且去动词核心后 ≥ 3 个实词、共享率 ≥ 0.25**：反复犯的
        "同一事实换情绪动词"。**情绪动词前提是硬性的**（事故记录见模块顶部）。
     """
-    ta, tb = tokens(a), tokens(b)
-    if not ta or not tb:
+    return same_fact(signature(a), signature(b))
+
+
+@dataclass(frozen=True)
+class FactSignature:
+    """一句话的**预计算特征**（分词 / 主语 / 专名 / 情绪动词 / 核心词各算一次）。
+
+    为什么要它：``is_same_fact`` 每比一对就要把这些都算一遍（4 次正则），而批量去重时
+    **同一句话会被拿出去比很多次**（它要跟库里的候选逐一比）。API 每次 Add 的合并就是这种
+    形状：几条新的 × 几千条已有的。把"每句算一次"提出来之后，一对的比较只剩集合运算。
+    """
+
+    tokens: frozenset[str]
+    subject: str
+    proper: frozenset[str]
+    has_sentiment: bool
+    core: frozenset[str]
+
+
+def signature(text: str) -> FactSignature:
+    """算一句文本的特征（见 ``FactSignature``）。"""
+    return FactSignature(
+        tokens=frozenset(tokens(text)),
+        subject=subject(text),
+        proper=frozenset(proper_nouns(text)),
+        has_sentiment=has_sentiment_verb(text),
+        core=frozenset(core_tokens(text)),
+    )
+
+
+def same_fact(a: FactSignature, b: FactSignature) -> bool:
+    """两个**特征**是否同一事实 —— 与 ``is_same_fact`` 判据一字不差，只是不重复分词。"""
+    if not a.tokens or not b.tokens:
         return False
-    if subject(a) and subject(b) and subject(a) != subject(b):
+    if a.subject and b.subject and a.subject != b.subject:
         return False
     # **专有名词不同 = 不同事实。** 名字正是区分枚举成员的关键，措辞再像也不能并。
-    if proper_nouns(a) != proper_nouns(b):
+    if a.proper != b.proper:
         return False
     # 路径 1：措辞近乎一致。
-    if jaccard(ta, tb) >= NEAR_DUP_JACCARD:
+    if jaccard(set(a.tokens), set(b.tokens)) >= NEAR_DUP_JACCARD:
         return True
     # 路径 2：仅当两句话都在表达情绪/态度时才适用（具体动作不适用）。
-    if not (has_sentiment_verb(a) and has_sentiment_verb(b)):
+    if not (a.has_sentiment and b.has_sentiment):
         return False
-    ca, cb = core_tokens(a), core_tokens(b)
-    if not ca or not cb:
+    if not a.core or not b.core:
         return False
-    shared = ca & cb
-    return len(shared) >= SHARED_CORE_MIN and len(shared) / len(ca | cb) >= SHARED_CORE_RATIO
+    shared = a.core & b.core
+    return len(shared) >= SHARED_CORE_MIN and len(shared) / len(a.core | b.core) >= SHARED_CORE_RATIO
